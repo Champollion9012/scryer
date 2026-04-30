@@ -1,0 +1,13 @@
+[
+  {
+    "chain_id": 56,
+    "address": "0x3358758d8E362e4672fF2c63D65bdb35A7824451",
+    "follow_proxy": true
+  },
+  {
+    "chain_id": 56,
+    "address": "0x0aF45fbf083E1739d6689CAc8eBD168a98c7c700",
+    "follow_proxy": true
+  }
+]
+

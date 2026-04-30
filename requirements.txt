@@ -1,0 +1,12 @@
+httpx
+httpx-socks[asyncio]  # SOCKS proxy support
+orjson
+sentence-transformers
+chromadb
+torch
+web3
+cbor2
+eth-abi
+python-dotenv
+flask
+google-cloud-bigquery  # Optional: for BigQuery contract fetching
