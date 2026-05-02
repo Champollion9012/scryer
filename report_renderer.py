@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import html
+import re
 from typing import Any
-
 
 SEVERITY_ORDER = {
     "Critical": 0,
@@ -92,7 +93,9 @@ def render_markdown(report: dict) -> str:
     if findings:
         lines.append("| ID | Severity | Title | Affected Component | Impact |")
         lines.append("|---:|:---------|:------|:-------------------|:-------|")
-        for f in sorted(findings, key=lambda x: SEVERITY_ORDER.get(_normalize_severity(_as_str((x or {}).get("severity"))), 99)):
+        for f in sorted(
+            findings, key=lambda x: SEVERITY_ORDER.get(_normalize_severity(_as_str((x or {}).get("severity"))), 99)
+        ):
             if not isinstance(f, dict):
                 continue
             fid = _as_str(f.get("id") or "")
@@ -177,13 +180,131 @@ def render_markdown(report: dict) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
+_SEVERITY_CSS_CLASS = {
+    "Critical": "sev-critical",
+    "High": "sev-high",
+    "Medium": "sev-medium",
+    "Low": "sev-low",
+    "Informational": "sev-info",
+}
+
+_INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
+_TABLE_SEP_RE = re.compile(r"^\s*\|[\s|:\-]+\|\s*$")
+_LIST_ITEM_RE = re.compile(r"^(\s*)- (.*)$")
+
+
+def _inline_md(text: str) -> str:
+    """Escape HTML, then turn ``backtick`` spans into ``<code>`` and tag severity values."""
+    escaped = html.escape(text, quote=False)
+
+    def _wrap_code(m: re.Match[str]) -> str:
+        inner = m.group(1)
+        css = _SEVERITY_CSS_CLASS.get(inner)
+        if css:
+            return f'<code class="{css}">{inner}</code>'
+        return f"<code>{inner}</code>"
+
+    return _INLINE_CODE_RE.sub(_wrap_code, escaped)
+
+
+def _markdown_to_html(md: str) -> str:
+    """Minimal Markdown → HTML converter, scoped to the subset that
+    :func:`render_markdown` produces (headings, paragraphs, bullet lists with
+    one level of nesting, GFM-style tables, inline backticks, ``---`` rules).
+
+    A general-purpose Markdown library would bring a runtime dependency just
+    for this one render path; the dialect we emit is small enough to handle
+    inline.
+    """
+    lines = md.splitlines()
+    n = len(lines)
+    out: list[str] = []
+    list_stack: list[int] = []  # indentation levels of currently open <ul>s
+
+    def close_lists(target_indent: int = -1) -> None:
+        while list_stack and list_stack[-1] > target_indent:
+            out.append("</ul>")
+            list_stack.pop()
+
+    i = 0
+    while i < n:
+        raw = lines[i]
+        stripped = raw.strip()
+
+        if not stripped:
+            close_lists()
+            i += 1
+            continue
+
+        if stripped == "---":
+            close_lists()
+            out.append("<hr/>")
+            i += 1
+            continue
+
+        for level, prefix in ((3, "### "), (2, "## "), (1, "# ")):
+            if stripped.startswith(prefix):
+                close_lists()
+                out.append(f"<h{level}>{_inline_md(stripped[len(prefix) :].strip())}</h{level}>")
+                i += 1
+                break
+        else:
+            # Table: header row followed by `|---|---|` separator
+            if stripped.startswith("|") and i + 1 < n and _TABLE_SEP_RE.match(lines[i + 1]):
+                close_lists()
+                header = [c.strip() for c in stripped.strip("|").split("|")]
+                i += 2  # skip header + separator
+                rows: list[list[str]] = []
+                while i < n and lines[i].strip().startswith("|"):
+                    rows.append([c.strip() for c in lines[i].strip().strip("|").split("|")])
+                    i += 1
+                out.append("<table>")
+                out.append("<thead><tr>" + "".join(f"<th>{_inline_md(c)}</th>" for c in header) + "</tr></thead>")
+                out.append("<tbody>")
+                for row in rows:
+                    out.append("<tr>" + "".join(f"<td>{_inline_md(c)}</td>" for c in row) + "</tr>")
+                out.append("</tbody></table>")
+                continue
+
+            li_match = _LIST_ITEM_RE.match(raw)
+            if li_match:
+                indent = len(li_match.group(1))
+                text = li_match.group(2)
+                # Open new lists for deeper indents, close any that are deeper than us.
+                while not list_stack or list_stack[-1] < indent:
+                    out.append("<ul>")
+                    list_stack.append(indent)
+                close_lists(indent)
+                out.append(f"<li>{_inline_md(text)}</li>")
+                i += 1
+                continue
+
+            # Paragraph: collect consecutive non-blank, non-special lines.
+            close_lists()
+            para: list[str] = []
+            while i < n:
+                cur = lines[i]
+                cs = cur.strip()
+                if not cs or cs == "---":
+                    break
+                if cs.startswith(("# ", "## ", "### ", "- ")):
+                    break
+                if cs.startswith("|"):
+                    break
+                para.append(cs)
+                i += 1
+            if para:
+                out.append(f"<p>{_inline_md(' '.join(para))}</p>")
+
+    close_lists()
+    return "\n".join(out)
+
+
 def render_html(report: dict, *, title: str = "Smart Contract Audit Report") -> str:
-    """
-    Render audit report as styled HTML with severity chart.
-    """
+    """Render the audit report as styled HTML with a severity summary."""
     md_content = render_markdown(report)
-    
-    # Count findings by severity
+    body_html = _markdown_to_html(md_content)
+
     findings = report.get("findings", []) if isinstance(report, dict) else []
     severity_counts: dict[str, int] = {"Critical": 0, "High": 0, "Medium": 0, "Low": 0, "Informational": 0}
     for f in findings:
@@ -191,26 +312,19 @@ def render_html(report: dict, *, title: str = "Smart Contract Audit Report") -> 
             sev = _normalize_severity(_as_str(f.get("severity")))
             if sev in severity_counts:
                 severity_counts[sev] += 1
-    
-    # Generate mermaid pie chart
-    chart_data = ", ".join(f'"{k}": {v}' for k, v in severity_counts.items() if v > 0)
-    mermaid_chart = f"""
-    <pre class="mermaid">
-    pie title Findings by Severity
-        {chr(10).join(f'"{k}" : {v}' for k, v in severity_counts.items() if v > 0)}
-    </pre>
-    """ if any(severity_counts.values()) else ""
-    
-    # Escape HTML in markdown (basic)
-    import html
-    md_escaped = html.escape(md_content)
-    
-    html_template = f'''<!DOCTYPE html>
+
+    mermaid_chart = ""
+    if any(severity_counts.values()):
+        pie_rows = "\n".join(f'    "{k}" : {v}' for k, v in severity_counts.items() if v > 0)
+        mermaid_chart = f'<pre class="mermaid">\npie title Findings by Severity\n{pie_rows}\n</pre>'
+
+    safe_title = html.escape(title)
+    return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{html.escape(title)}</title>
+    <title>{safe_title}</title>
     <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
     <style>
         :root {{
@@ -234,17 +348,21 @@ def render_html(report: dict, *, title: str = "Smart Contract Audit Report") -> 
             margin: 0 auto;
             padding: 2rem;
         }}
-        h1, h2, h3 {{ color: #fff; border-bottom: 1px solid var(--border-color); padding-bottom: 0.5rem; }}
-        code {{ background: var(--bg-secondary); padding: 0.2em 0.4em; border-radius: 4px; font-size: 0.9em; }}
+        h1, h2, h3 {{ color: #fff; border-bottom: 1px solid var(--border-color); padding-bottom: 0.4rem; }}
+        h2 {{ margin-top: 2rem; }}
+        code {{ background: var(--bg-secondary); padding: 0.15em 0.4em; border-radius: 4px; font-size: 0.9em; }}
         pre {{ background: var(--bg-secondary); padding: 1rem; border-radius: 8px; overflow-x: auto; }}
         table {{ width: 100%; border-collapse: collapse; margin: 1rem 0; }}
-        th, td {{ border: 1px solid var(--border-color); padding: 0.75rem; text-align: left; }}
+        th, td {{ border: 1px solid var(--border-color); padding: 0.6rem 0.75rem; text-align: left; vertical-align: top; }}
         th {{ background: var(--bg-secondary); }}
-        .severity-critical {{ color: var(--critical); font-weight: bold; }}
-        .severity-high {{ color: var(--high); font-weight: bold; }}
-        .severity-medium {{ color: var(--medium); }}
-        .severity-low {{ color: var(--low); }}
-        .severity-info {{ color: var(--info); }}
+        ul {{ padding-left: 1.4rem; }}
+        ul ul {{ margin: 0.2rem 0; }}
+        hr {{ border: 0; border-top: 1px solid var(--border-color); margin: 1.5rem 0; }}
+        .sev-critical {{ color: var(--critical); font-weight: bold; }}
+        .sev-high     {{ color: var(--high); font-weight: bold; }}
+        .sev-medium   {{ color: var(--medium); }}
+        .sev-low      {{ color: var(--low); }}
+        .sev-info     {{ color: var(--info); }}
         .chart-container {{ background: var(--bg-secondary); padding: 1rem; border-radius: 8px; margin: 1rem 0; }}
         .stats {{ display: flex; gap: 1rem; flex-wrap: wrap; margin: 1rem 0; }}
         .stat-card {{ background: var(--bg-secondary); padding: 1rem; border-radius: 8px; min-width: 120px; text-align: center; }}
@@ -253,43 +371,27 @@ def render_html(report: dict, *, title: str = "Smart Contract Audit Report") -> 
     </style>
 </head>
 <body>
-    <h1>{html.escape(title)}</h1>
-    
+    <h1>{safe_title}</h1>
+
     <div class="stats">
-        <div class="stat-card">
-            <div class="stat-value severity-critical">{severity_counts["Critical"]}</div>
-            <div class="stat-label">Critical</div>
-        </div>
-        <div class="stat-card">
-            <div class="stat-value severity-high">{severity_counts["High"]}</div>
-            <div class="stat-label">High</div>
-        </div>
-        <div class="stat-card">
-            <div class="stat-value severity-medium">{severity_counts["Medium"]}</div>
-            <div class="stat-label">Medium</div>
-        </div>
-        <div class="stat-card">
-            <div class="stat-value severity-low">{severity_counts["Low"]}</div>
-            <div class="stat-label">Low</div>
-        </div>
-        <div class="stat-card">
-            <div class="stat-value severity-info">{severity_counts["Informational"]}</div>
-            <div class="stat-label">Info</div>
-        </div>
+        <div class="stat-card"><div class="stat-value sev-critical">{severity_counts["Critical"]}</div><div class="stat-label">Critical</div></div>
+        <div class="stat-card"><div class="stat-value sev-high">{severity_counts["High"]}</div><div class="stat-label">High</div></div>
+        <div class="stat-card"><div class="stat-value sev-medium">{severity_counts["Medium"]}</div><div class="stat-label">Medium</div></div>
+        <div class="stat-card"><div class="stat-value sev-low">{severity_counts["Low"]}</div><div class="stat-label">Low</div></div>
+        <div class="stat-card"><div class="stat-value sev-info">{severity_counts["Informational"]}</div><div class="stat-label">Info</div></div>
     </div>
-    
+
     <div class="chart-container">
         {mermaid_chart}
     </div>
-    
-    <div class="content">
-        <pre>{md_escaped}</pre>
-    </div>
-    
+
+    <main class="content">
+{body_html}
+    </main>
+
     <script>
         mermaid.initialize({{ startOnLoad: true, theme: 'dark' }});
     </script>
 </body>
-</html>'''
-    
-    return html_template
+</html>
+"""

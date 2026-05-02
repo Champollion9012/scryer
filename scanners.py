@@ -1,13 +1,13 @@
 from __future__ import annotations
 
+import json
 import re
 import shutil
 import subprocess
 import tempfile
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
-import json
 
 
 @dataclass(frozen=True)
@@ -21,33 +21,82 @@ class RegexRule:
 DEFAULT_REGEX_RULES: list[RegexRule] = [
     # === Critical ===
     RegexRule("DEPRECATED_SUICIDE", "Critical", "Deprecated suicide() function", re.compile(r"\bsuicide\s*\(")),
-    RegexRule("UNPROTECTED_SELFDESTRUCT", "Critical", "selfdestruct may lack access control", re.compile(r"\bselfdestruct\s*\(")),
-    
+    RegexRule(
+        "UNPROTECTED_SELFDESTRUCT",
+        "Critical",
+        "selfdestruct may lack access control",
+        re.compile(r"\bselfdestruct\s*\("),
+    ),
     # === High ===
     RegexRule("TX_ORIGIN", "High", "Use of tx.origin for authorization", re.compile(r"\btx\.origin\b")),
-    RegexRule("REENTRANCY_PATTERN", "High", "Potential reentrancy (external call before state change)", re.compile(r"\.call\s*\{[^}]*\}\s*\([^)]*\)")),
-    RegexRule("DELEGATECALL", "High", "Use of delegatecall (storage collision risk)", re.compile(r"\.delegatecall\s*\(")),
-    RegexRule("UNSAFE_TRANSFER", "High", "transfer()/send() may fail silently on contracts", re.compile(r"\.(transfer|send)\s*\(")),
+    RegexRule(
+        "REENTRANCY_PATTERN",
+        "High",
+        "Potential reentrancy (external call before state change)",
+        re.compile(r"\.call\s*\{[^}]*\}\s*\([^)]*\)"),
+    ),
+    RegexRule(
+        "DELEGATECALL", "High", "Use of delegatecall (storage collision risk)", re.compile(r"\.delegatecall\s*\(")
+    ),
+    RegexRule(
+        "UNSAFE_TRANSFER",
+        "High",
+        "transfer()/send() may fail silently on contracts",
+        re.compile(r"\.(transfer|send)\s*\("),
+    ),
     RegexRule("ARBITRARY_JUMP", "High", "Arbitrary jump in assembly", re.compile(r"\bjump\s*\(")),
-    RegexRule("WEAK_RANDOMNESS", "High", "Weak randomness source (blockhash/prevrandao)", re.compile(r"\b(blockhash|block\.prevrandao|block\.difficulty)\b")),
-    RegexRule("SIGNATURE_REPLAY", "High", "ecrecover without nonce (replay attack risk)", re.compile(r"\becrecover\s*\(")),
-    RegexRule("STORAGE_COLLISION", "High", "delegatecall with storage access", re.compile(r"delegatecall.*storage|storage.*delegatecall", re.IGNORECASE)),
-    
+    RegexRule(
+        "WEAK_RANDOMNESS",
+        "High",
+        "Weak randomness source (blockhash/prevrandao)",
+        re.compile(r"\b(blockhash|block\.prevrandao|block\.difficulty)\b"),
+    ),
+    RegexRule(
+        "SIGNATURE_REPLAY", "High", "ecrecover without nonce (replay attack risk)", re.compile(r"\becrecover\s*\(")
+    ),
+    RegexRule(
+        "STORAGE_COLLISION",
+        "High",
+        "delegatecall with storage access",
+        re.compile(r"delegatecall.*storage|storage.*delegatecall", re.IGNORECASE),
+    ),
     # === Medium ===
     RegexRule("CALL_VALUE", "Medium", "Low-level call with value", re.compile(r"\.call\s*\{[^}]*\bvalue\s*:")),
-    RegexRule("TIMESTAMP_DEPENDENCE", "Medium", "Timestamp used in condition (miner manipulation)", re.compile(r"(if|require|while|for).*block\.timestamp")),
-    RegexRule("UNCHECKED_RETURN", "Medium", "Unchecked return value from low-level call", re.compile(r"\.call\s*\{[^}]*\}\s*\([^)]*\)\s*;")),
-    RegexRule("DOS_UNBOUNDED_LOOP", "Medium", "Potentially unbounded loop", re.compile(r"for\s*\([^;]*;\s*[^;]*\.length\s*;")),
-    RegexRule("FRONT_RUNNING", "Medium", "Price-sensitive operation without slippage protection", re.compile(r"(swap|exchange|trade).*amount(?!.*slippage|.*minOut|.*deadline)", re.IGNORECASE)),
+    RegexRule(
+        "TIMESTAMP_DEPENDENCE",
+        "Medium",
+        "Timestamp used in condition (miner manipulation)",
+        re.compile(r"(if|require|while|for).*block\.timestamp"),
+    ),
+    RegexRule(
+        "UNCHECKED_RETURN",
+        "Medium",
+        "Unchecked return value from low-level call",
+        re.compile(r"\.call\s*\{[^}]*\}\s*\([^)]*\)\s*;"),
+    ),
+    RegexRule(
+        "DOS_UNBOUNDED_LOOP", "Medium", "Potentially unbounded loop", re.compile(r"for\s*\([^;]*;\s*[^;]*\.length\s*;")
+    ),
+    RegexRule(
+        "FRONT_RUNNING",
+        "Medium",
+        "Price-sensitive operation without slippage protection",
+        re.compile(r"(swap|exchange|trade).*amount(?!.*slippage|.*minOut|.*deadline)", re.IGNORECASE),
+    ),
     RegexRule("HARDCODED_ADDRESS", "Medium", "Hardcoded address in code", re.compile(r"=\s*0x[a-fA-F0-9]{40}\b")),
-    
     # === Low / Informational ===
     RegexRule("INLINE_ASSEMBLY", "Info", "Inline assembly usage", re.compile(r"\bassembly\s*\{")),
     RegexRule("UNCHECKED_BLOCK", "Info", "Unchecked arithmetic block", re.compile(r"\bunchecked\s*\{")),
-    RegexRule("FLASH_LOAN_INDICATOR", "Info", "Flash loan pattern detected", re.compile(r"\b(flashLoan|onFlashLoan|executeOperation)\b")),
-    RegexRule("TODO_FIXME", "Info", "TODO/FIXME comment in code", re.compile(r"//\s*(TODO|FIXME|XXX|HACK)", re.IGNORECASE)),
+    RegexRule(
+        "FLASH_LOAN_INDICATOR",
+        "Info",
+        "Flash loan pattern detected",
+        re.compile(r"\b(flashLoan|onFlashLoan|executeOperation)\b"),
+    ),
+    RegexRule(
+        "TODO_FIXME", "Info", "TODO/FIXME comment in code", re.compile(r"//\s*(TODO|FIXME|XXX|HACK)", re.IGNORECASE)
+    ),
 ]
-
 
 
 def _iter_lines(text: str):
@@ -178,11 +227,7 @@ def _slither_summarize(json_text: str, *, max_detectors: int = 50) -> dict:
     except Exception:
         return {"parsed": False, "raw_json_tail": json_text[-20000:]}
 
-    detectors = (
-        data.get("results", {}).get("detectors", [])
-        if isinstance(data, dict)
-        else []
-    )
+    detectors = data.get("results", {}).get("detectors", []) if isinstance(data, dict) else []
     summarized: list[dict] = []
     if isinstance(detectors, list):
         for det in detectors[:max_detectors]:
@@ -211,7 +256,9 @@ def _slither_summarize(json_text: str, *, max_detectors: int = 50) -> dict:
     }
 
 
-def run_slither(files: Iterable[Path], *, sources_root: Path, timeout_s: int = 300, keep_workspace: bool = False) -> dict:
+def run_slither(
+    files: Iterable[Path], *, sources_root: Path, timeout_s: int = 300, keep_workspace: bool = False
+) -> dict:
     slither_bin = shutil.which("slither")
     if not slither_bin:
         return {"tool": "slither", "available": False, "reason": "slither not found in PATH"}
@@ -271,7 +318,9 @@ def run_slither(files: Iterable[Path], *, sources_root: Path, timeout_s: int = 3
         "returncode": proc.returncode,
         "command": cmd,
         "workdir": workdir.as_posix() if keep_workspace else None,
-        "json_summary": _slither_summarize(slither_json_text) if slither_json_text else {"parsed": False, "raw_json_tail": ""},
+        "json_summary": _slither_summarize(slither_json_text)
+        if slither_json_text
+        else {"parsed": False, "raw_json_tail": ""},
         "stdout": (proc.stdout or "")[-20000:],
         "stderr": (proc.stderr or "")[-20000:],
         "notes": [
@@ -294,7 +343,7 @@ def run_mythril(
 ) -> dict:
     """
     Run Mythril symbolic execution on Solidity files.
-    
+
     Requires: pip install mythril
     """
     mythril_path = shutil.which("myth")
@@ -304,53 +353,62 @@ def run_mythril(
             "available": False,
             "notes": ["Mythril not found. Install with: pip install mythril"],
         }
-    
+
     results: list[dict] = []
-    
+
     for file_path in files:
         if not file_path.exists() or not file_path.suffix == ".sol":
             continue
-        
+
         try:
             proc = subprocess.run(
                 [
-                    mythril_path, "analyze",
+                    mythril_path,
+                    "analyze",
                     str(file_path),
-                    "--max-depth", str(max_depth),
-                    "-o", "json",
+                    "--max-depth",
+                    str(max_depth),
+                    "-o",
+                    "json",
                 ],
                 capture_output=True,
                 text=True,
                 timeout=timeout,
             )
-            
+
             output = proc.stdout
             try:
                 data = json.loads(output) if output.strip() else {}
             except json.JSONDecodeError:
                 data = {"raw_output": output[:5000]}
-            
-            results.append({
-                "file": file_path.name,
-                "returncode": proc.returncode,
-                "issues": data.get("issues", []) if isinstance(data, dict) else [],
-                "error": proc.stderr[:1000] if proc.returncode != 0 else None,
-            })
-            
+
+            results.append(
+                {
+                    "file": file_path.name,
+                    "returncode": proc.returncode,
+                    "issues": data.get("issues", []) if isinstance(data, dict) else [],
+                    "error": proc.stderr[:1000] if proc.returncode != 0 else None,
+                }
+            )
+
         except subprocess.TimeoutExpired:
-            results.append({
-                "file": file_path.name,
-                "error": f"Timeout after {timeout}s",
-            })
+            results.append(
+                {
+                    "file": file_path.name,
+                    "error": f"Timeout after {timeout}s",
+                }
+            )
         except Exception as e:
-            results.append({
-                "file": file_path.name,
-                "error": str(e),
-            })
-    
+            results.append(
+                {
+                    "file": file_path.name,
+                    "error": str(e),
+                }
+            )
+
     # Summarize issues
     total_issues = sum(len(r.get("issues", [])) for r in results)
-    
+
     return {
         "tool": "mythril",
         "available": True,
@@ -368,7 +426,7 @@ def run_forge_test(
 ) -> dict:
     """
     Run Foundry forge tests if available.
-    
+
     Requires: foundry installed (curl -L https://foundry.paradigm.xyz | bash)
     """
     forge_path = shutil.which("forge")
@@ -378,7 +436,7 @@ def run_forge_test(
             "available": False,
             "notes": ["Foundry not found. Install from: https://getfoundry.sh"],
         }
-    
+
     # Check if this is a Foundry project
     foundry_toml = project_dir / "foundry.toml"
     if not foundry_toml.exists():
@@ -388,7 +446,7 @@ def run_forge_test(
             "ok": False,
             "notes": ["No foundry.toml found. Not a Foundry project."],
         }
-    
+
     try:
         proc = subprocess.run(
             [forge_path, "test", "--json"],
@@ -397,10 +455,10 @@ def run_forge_test(
             text=True,
             timeout=timeout,
         )
-        
+
         output = proc.stdout
         test_results: list[dict] = []
-        
+
         # Parse NDJSON output
         for line in output.splitlines():
             if line.strip().startswith("{"):
@@ -409,11 +467,11 @@ def run_forge_test(
                     test_results.append(data)
                 except json.JSONDecodeError:
                     pass
-        
+
         # Count pass/fail
         passed = sum(1 for r in test_results if r.get("status") == "Success")
         failed = sum(1 for r in test_results if r.get("status") == "Failure")
-        
+
         return {
             "tool": "forge",
             "available": True,
@@ -424,7 +482,7 @@ def run_forge_test(
             "results": test_results[:50],  # Limit results
             "stderr": proc.stderr[:2000] if proc.stderr else None,
         }
-        
+
     except subprocess.TimeoutExpired:
         return {
             "tool": "forge",

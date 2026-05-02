@@ -7,23 +7,19 @@ import datetime as dt
 import json
 import os
 import re
-import sys
+import threading
 import time
+from collections.abc import Iterable
 from pathlib import Path
 from string import Template
-from typing import Iterable
 
-import httpx
-
+import scryer_config
+from llm_providers import get_provider
 from report_renderer import render_markdown
 from scanners import run_regex_scan, run_slither
-from llm_providers import get_provider
+from scryer_logging import get_logger
 
-try:
-    from dotenv import load_dotenv
-except ImportError:  # pragma: no cover
-    load_dotenv = None
-
+_log = get_logger(__name__)
 
 DEFAULT_SOURCES_DIR = "sources"
 DEFAULT_OUTPUT_DIR = "audit_reports"
@@ -52,21 +48,33 @@ def _float_env(name: str) -> float | None:
 
 
 class RateLimiter:
+    """Thread-safe leaky-bucket rate limiter.
+
+    The slot reservation is done under a lock so concurrent threads see a
+    consistent ``_next_ok_at``; the actual ``time.sleep`` happens outside the
+    lock so threads that already hold reservations don't block each other.
+    """
+
     def __init__(self, rpm: float | None):
         self.min_interval_s = (60.0 / rpm) if rpm and rpm > 0 else 0.0
         self._next_ok_at = 0.0
+        self._lock = threading.Lock()
 
     def wait(self):
         if self.min_interval_s <= 0:
             return
-        now = time.time()
-        if self._next_ok_at > now:
-            time.sleep(self._next_ok_at - now)
-        self._next_ok_at = max(now, self._next_ok_at) + self.min_interval_s
+        with self._lock:
+            now = time.time()
+            slot = max(now, self._next_ok_at)
+            self._next_ok_at = slot + self.min_interval_s
+            wait_s = slot - now
+        if wait_s > 0:
+            time.sleep(wait_s)
 
 
 class AsyncRateLimiter:
     """Async-compatible rate limiter for parallel API calls."""
+
     def __init__(self, rpm: float | None):
         self.min_interval_s = (60.0 / rpm) if rpm and rpm > 0 else 0.0
         self._lock = asyncio.Lock()
@@ -82,7 +90,9 @@ class AsyncRateLimiter:
             self._next_ok_at = max(now, self._next_ok_at) + self.min_interval_s
 
 
-def estimate_cost_usd(prompt_tokens: int, completion_tokens: int, *, price_in_per_1k: float | None, price_out_per_1k: float | None) -> float | None:
+def estimate_cost_usd(
+    prompt_tokens: int, completion_tokens: int, *, price_in_per_1k: float | None, price_out_per_1k: float | None
+) -> float | None:
     if price_in_per_1k is None or price_out_per_1k is None:
         return None
     return (prompt_tokens / 1000.0) * price_in_per_1k + (completion_tokens / 1000.0) * price_out_per_1k
@@ -257,21 +267,23 @@ def llm_chat_completion(
         try:
             if rate_limiter:
                 rate_limiter.wait()
-            
+
             # Run async chat_completion synchronously
-            content, usage = asyncio.run(provider.chat_completion(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                temperature=temperature,
-                max_output_tokens=max_output_tokens,
-                timeout_s=timeout_s,
-                json_mode=True
-            ))
+            content, usage = asyncio.run(
+                provider.chat_completion(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    temperature=temperature,
+                    max_output_tokens=max_output_tokens,
+                    timeout_s=timeout_s,
+                    json_mode=True,
+                )
+            )
             return content, usage
 
         except Exception as e:
             last_error = f"{type(e).__name__}: {e}"
-            # Check for rate limits or fatal errors if possible, 
+            # Check for rate limits or fatal errors if possible,
             # but for now we just retry on everything except maybe some obvious ones.
             # Simple retry backoff
             time.sleep(min(2**attempt, 30))
@@ -312,27 +324,45 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Send Solidity sources to OpenAI and generate audit-style reports.")
     parser.add_argument("--sources-dir", default=DEFAULT_SOURCES_DIR, help="Directory containing *.sol files.")
     parser.add_argument("--out-dir", default=DEFAULT_OUTPUT_DIR, help="Output directory for reports.")
-    parser.add_argument("--run-dir", default=None, help="Write a full run folder (manifest + per-group artifacts) to this directory.")
+    parser.add_argument(
+        "--run-dir", default=None, help="Write a full run folder (manifest + per-group artifacts) to this directory."
+    )
     parser.add_argument(
         "--group-by",
         choices=["contract", "chain", "all", "file"],
         default="contract",
         help="Group files per contract, per chain, all-in-one, or per file.",
     )
-    parser.add_argument("--chain-id", type=int, default=None, help="Only audit a specific chain ID (from filename/dir prefix).")
+    parser.add_argument(
+        "--chain-id", type=int, default=None, help="Only audit a specific chain ID (from filename/dir prefix)."
+    )
     parser.add_argument("--address", default=None, help="Only audit a specific address (0x...).")
 
-    parser.add_argument("--audit-prompt", default=str(DEFAULT_AUDIT_PROMPT_PATH), help="Prompt template for single-pass JSON report.")
-    parser.add_argument("--map-prompt", default=str(DEFAULT_MAP_PROMPT_PATH), help="Prompt template for map stage (chunk findings JSON).")
-    parser.add_argument("--reduce-prompt", default=str(DEFAULT_REDUCE_PROMPT_PATH), help="Prompt template for reduce stage (final JSON report).")
+    parser.add_argument(
+        "--audit-prompt", default=str(DEFAULT_AUDIT_PROMPT_PATH), help="Prompt template for single-pass JSON report."
+    )
+    parser.add_argument(
+        "--map-prompt",
+        default=str(DEFAULT_MAP_PROMPT_PATH),
+        help="Prompt template for map stage (chunk findings JSON).",
+    )
+    parser.add_argument(
+        "--reduce-prompt",
+        default=str(DEFAULT_REDUCE_PROMPT_PATH),
+        help="Prompt template for reduce stage (final JSON report).",
+    )
 
     parser.add_argument("--model", default=os.getenv("OPENAI_MODEL", DEFAULT_MODEL), help="OpenAI model name.")
-    parser.add_argument("--base-url", default=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"), help="OpenAI API base URL.")
+    parser.add_argument(
+        "--base-url", default=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"), help="OpenAI API base URL."
+    )
     parser.add_argument("--temperature", type=float, default=0.1, help="Sampling temperature.")
     parser.add_argument("--max-output-tokens", type=int, default=3500, help="Max tokens for the report output.")
     parser.add_argument("--timeout", type=float, default=180.0, help="Request timeout in seconds.")
     parser.add_argument("--retries", type=int, default=5, help="Max retries for transient API errors.")
-    parser.add_argument("--rpm", type=float, default=0.0, help="Rate limit OpenAI requests (requests per minute). 0 disables.")
+    parser.add_argument(
+        "--rpm", type=float, default=0.0, help="Rate limit OpenAI requests (requests per minute). 0 disables."
+    )
     parser.add_argument(
         "--price-in-per-1k",
         type=float,
@@ -348,25 +378,39 @@ def main() -> int:
 
     parser.add_argument("--max-input-chars", type=int, default=200_000, help="Max source bundle size before chunking.")
     parser.add_argument("--max-chunk-chars", type=int, default=120_000, help="Max per-chunk source size for map stage.")
-    parser.add_argument("--force-map-reduce", action="store_true", help="Always use map-reduce, even if under max-input-chars.")
-    parser.add_argument("--no-line-numbers", action="store_true", help="Do not add line numbers to sources (less accurate citations).")
+    parser.add_argument(
+        "--force-map-reduce", action="store_true", help="Always use map-reduce, even if under max-input-chars."
+    )
+    parser.add_argument(
+        "--no-line-numbers", action="store_true", help="Do not add line numbers to sources (less accurate citations)."
+    )
 
     parser.add_argument("--skip-existing", action="store_true", help="Skip if output report already exists.")
     parser.add_argument("--dry-run", action="store_true", help="List what would be audited without calling the API.")
 
-    parser.add_argument("--disable-regex-scan", action="store_true", help="Disable heuristic regex scan in the prompt context.")
-    parser.add_argument("--slither", action="store_true", help="Run slither (if installed) and include results in the prompt context.")
+    parser.add_argument(
+        "--disable-regex-scan", action="store_true", help="Disable heuristic regex scan in the prompt context."
+    )
+    parser.add_argument(
+        "--slither", action="store_true", help="Run slither (if installed) and include results in the prompt context."
+    )
     parser.add_argument("--slither-timeout", type=int, default=300, help="Slither timeout in seconds.")
-    parser.add_argument("--concurrency", type=int, default=1, help="Max parallel API calls (default: 1 = sequential). Set >1 for parallel auditing.")
-    parser.add_argument("--provider", choices=["openai", "claude", "gemini"], default="openai", help="LLM provider to use.")
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=1,
+        help="Max parallel API calls (default: 1 = sequential). Set >1 for parallel auditing.",
+    )
+    parser.add_argument(
+        "--provider", choices=["openai", "claude", "gemini"], default="openai", help="LLM provider to use."
+    )
     parser.add_argument("--no-cache", action="store_true", help="Disable audit caching (always re-run).")
     parser.add_argument("--html", action="store_true", help="Generate HTML report in addition to Markdown.")
     parser.add_argument("--mythril", action="store_true", help="Run Mythril symbolic execution (if installed).")
 
     args = parser.parse_args()
 
-    if load_dotenv:
-        load_dotenv(dotenv_path=Path(__file__).with_name(".env"), override=False)
+    scryer_config.load()
 
     try:
         provider = get_provider(
@@ -375,7 +419,7 @@ def main() -> int:
             base_url=args.base_url,
         )
     except Exception as e:
-        print(f"Error initializing provider: {e}", file=sys.stderr)
+        _log.error("Error initializing provider: %s", e)
         return 2
 
     sources_root = Path(args.sources_dir)
@@ -383,7 +427,7 @@ def main() -> int:
 
     all_files = iter_solidity_files(sources_root)
     if not all_files:
-        print(f"No Solidity files found under: {sources_root}", file=sys.stderr)
+        _log.error("No Solidity files found under: %s", sources_root)
         return 1
 
     want_addr = args.address.lower() if args.address else None
@@ -402,7 +446,7 @@ def main() -> int:
         all_files = selected
 
     if not all_files:
-        print("No matching Solidity files found for the given filters.", file=sys.stderr)
+        _log.error("No matching Solidity files found for the given filters.")
         return 1
 
     groups = group_files(all_files, sources_root=sources_root, group_by=args.group_by)
@@ -414,14 +458,14 @@ def main() -> int:
     system_prompt = "You are a senior smart contract security auditor. Output ONLY valid JSON."
 
     out_root.mkdir(parents=True, exist_ok=True)
-    run_id = dt.datetime.now(dt.timezone.utc).strftime("run_%Y%m%d_%H%M%SZ")
+    run_id = dt.datetime.now(dt.UTC).strftime("run_%Y%m%d_%H%M%SZ")
     run_root = Path(args.run_dir) if args.run_dir else (out_root / run_id)
     groups_root = run_root / "groups"
 
     if args.dry_run:
         for key, files in groups.items():
             group_dir = groups_root / key
-            print(f"DRY-RUN: {key} ({len(files)} files) -> {group_dir}")
+            _log.info("DRY-RUN: %s (%d files) -> %s", key, len(files), group_dir)
         return 0
 
     groups_root.mkdir(parents=True, exist_ok=True)
@@ -431,7 +475,7 @@ def main() -> int:
     cost_enabled = args.price_in_per_1k is not None and args.price_out_per_1k is not None
     manifest: dict = {
         "run_id": run_id,
-        "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "generated_at": dt.datetime.now(dt.UTC).isoformat(),
         "sources_dir": sources_root.as_posix(),
         "run_dir": run_root.as_posix(),
         "model": args.model,
@@ -439,11 +483,21 @@ def main() -> int:
         "group_by": args.group_by,
         "filters": {"chain_id": args.chain_id, "address": args.address},
         "pricing": {"price_in_per_1k": args.price_in_per_1k, "price_out_per_1k": args.price_out_per_1k},
-        "totals": {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "cost_usd_est": 0.0 if cost_enabled else None},
+        "totals": {
+            "calls": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "cost_usd_est": 0.0 if cost_enabled else None,
+        },
         "groups": [],
     }
 
-    for key, files in groups.items():
+    def _audit_one_group(key: str, files: list[Path]) -> dict | None:
+        """Audit a single group. Pure function over per-group state — no shared
+        mutables besides the rate limiter (thread-safe) and the provider object
+        (constructs a fresh httpx client per call inside ``chat_completion``).
+        Returns a manifest entry, or ``None`` if the group was skipped/errored.
+        """
         group_dir = groups_root / key
         prompts_dir = group_dir / "prompts"
         responses_dir = group_dir / "responses"
@@ -460,15 +514,15 @@ def main() -> int:
         error_path = group_dir / "error.txt"
 
         if args.skip_existing and report_md_path.exists():
-            print(f"SKIP (exists): {report_md_path}")
-            continue
+            _log.info("SKIP (exists): %s", report_md_path)
+            return None
 
         chain_id_value = "Unknown"
         address_value = "Unknown"
         if key.startswith("chain_"):
             chain_id_value = key.split("_", 1)[1] or "Unknown"
         else:
-            m = re.match(r"^(\\d+)_0x[0-9a-f]{40}$", key)
+            m = re.match(r"^(\d+)_0x[0-9a-f]{40}$", key)
             if m:
                 chain_id_value, address_value = key.split("_", 1)
 
@@ -482,7 +536,9 @@ def main() -> int:
         else:
             analysis_payload["slither"] = {"disabled": True}
 
-        analysis_json_path.write_text(json.dumps(analysis_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        analysis_json_path.write_text(
+            json.dumps(analysis_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
         analysis_text = json.dumps(analysis_payload, ensure_ascii=False, indent=2)
 
         files_md, blocks = build_file_blocks(
@@ -494,16 +550,28 @@ def main() -> int:
         files_md_path.write_text(files_md + "\n", encoding="utf-8")
         full_sources_text = "\n\n".join(blocks)
 
-        mode = "single_pass" if (not args.force_map_reduce and len(full_sources_text) <= args.max_input_chars) else "map_reduce"
-        print(f"AUDIT: {key} ({len(files)} files, {mode}) -> {report_md_path}")
+        mode = (
+            "single_pass"
+            if (not args.force_map_reduce and len(full_sources_text) <= args.max_input_chars)
+            else "map_reduce"
+        )
+        _log.info("AUDIT: %s (%d files, %s) -> %s", key, len(files), mode, report_md_path)
 
         call_summaries: list[dict] = []
         chunk_outputs: list[dict] = []
         report_obj: dict | None = None
 
         def record_call(call_name: str, *, prompt: str, response: str, usage: dict, duration_s: float) -> None:
-            prompt_tokens = usage.get("prompt_tokens") if isinstance(usage.get("prompt_tokens"), int) else estimate_tokens_rough(system_prompt + prompt)
-            completion_tokens = usage.get("completion_tokens") if isinstance(usage.get("completion_tokens"), int) else estimate_tokens_rough(response)
+            prompt_tokens = (
+                usage.get("prompt_tokens")
+                if isinstance(usage.get("prompt_tokens"), int)
+                else estimate_tokens_rough(system_prompt + prompt)
+            )
+            completion_tokens = (
+                usage.get("completion_tokens")
+                if isinstance(usage.get("completion_tokens"), int)
+                else estimate_tokens_rough(response)
+            )
             cost_est = estimate_cost_usd(
                 int(prompt_tokens),
                 int(completion_tokens),
@@ -522,12 +590,6 @@ def main() -> int:
                     "cost_usd_est": cost_est,
                 }
             )
-
-            manifest["totals"]["calls"] += 1
-            manifest["totals"]["prompt_tokens"] += int(prompt_tokens)
-            manifest["totals"]["completion_tokens"] += int(completion_tokens)
-            if cost_est is not None and manifest["totals"]["cost_usd_est"] is not None:
-                manifest["totals"]["cost_usd_est"] += float(cost_est)
 
         try:
             if mode == "single_pass":
@@ -614,10 +676,10 @@ def main() -> int:
 
         except Exception as e:
             error_path.write_text(f"{type(e).__name__}: {e}\n", encoding="utf-8")
-            print(f"ERROR: {key}: {type(e).__name__}: {e}", file=sys.stderr)
-            continue
+            _log.error("ERROR: %s: %s: %s", key, type(e).__name__, e)
+            return None
 
-        generated_at = dt.datetime.now(dt.timezone.utc).isoformat()
+        generated_at = dt.datetime.now(dt.UTC).isoformat()
 
         chunks_json_path.write_text(json.dumps(chunk_outputs, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         calls_json_path.write_text(json.dumps(call_summaries, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -655,19 +717,48 @@ def main() -> int:
         group_completion_tokens = sum(c.get("completion_tokens", 0) for c in call_summaries)
         group_cost = None if not cost_enabled else float(sum((c.get("cost_usd_est") or 0.0) for c in call_summaries))
 
-        manifest["groups"].append(
-            {
-                "key": key,
-                "dir": group_dir.relative_to(run_root).as_posix(),
-                "files": len(files),
-                "mode": mode,
-                "calls": len(call_summaries),
-                "prompt_tokens": group_prompt_tokens,
-                "completion_tokens": group_completion_tokens,
-                "cost_usd_est": group_cost,
-                "report_md": report_md_path.relative_to(run_root).as_posix(),
-            }
-        )
+        return {
+            "key": key,
+            "dir": group_dir.relative_to(run_root).as_posix(),
+            "files": len(files),
+            "mode": mode,
+            "calls": len(call_summaries),
+            "prompt_tokens": group_prompt_tokens,
+            "completion_tokens": group_completion_tokens,
+            "cost_usd_est": group_cost,
+            "report_md": report_md_path.relative_to(run_root).as_posix(),
+        }
+
+    concurrency = max(1, args.concurrency)
+    if concurrency == 1 or len(groups) <= 1:
+        results: list[dict | None] = [_audit_one_group(k, f) for k, f in groups.items()]
+    else:
+        _log.info("Running %d audits with concurrency=%d", len(groups), concurrency)
+
+        async def _run_all() -> list[dict | None]:
+            sem = asyncio.Semaphore(concurrency)
+
+            async def _run_one(k: str, fs: list[Path]) -> dict | None:
+                async with sem:
+                    return await asyncio.to_thread(_audit_one_group, k, fs)
+
+            return await asyncio.gather(*[_run_one(k, f) for k, f in groups.items()])
+
+        results = asyncio.run(_run_all())
+
+    # Aggregate results into the manifest single-threaded — keeps it simple
+    # and ensures deterministic output ordering (sorted by group key).
+    for entry in results:
+        if entry is None:
+            continue
+        manifest["groups"].append(entry)
+        manifest["totals"]["calls"] += entry["calls"]
+        manifest["totals"]["prompt_tokens"] += entry["prompt_tokens"]
+        manifest["totals"]["completion_tokens"] += entry["completion_tokens"]
+        if entry["cost_usd_est"] is not None and manifest["totals"]["cost_usd_est"] is not None:
+            manifest["totals"]["cost_usd_est"] += float(entry["cost_usd_est"])
+
+    manifest["groups"].sort(key=lambda g: g["key"])
 
     (run_root / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
