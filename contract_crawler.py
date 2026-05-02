@@ -125,7 +125,7 @@ async def fetch_sourcify_verified_contracts(
                         if contract_date.replace(tzinfo=None) < min_date:
                             # Stop if we've gone past the min date (sorted desc)
                             return addresses
-                    except:
+                    except (ValueError, TypeError):
                         pass
 
                 if addr:
@@ -219,7 +219,6 @@ async def fetch_explorer_recent_contracts(
         return []
 
     contracts: list[dict] = []
-    page = 1
 
     # Note: Most Etherscan APIs don't have a "list all verified contracts" endpoint
     # We'll use the "get verified source code" for known addresses instead
@@ -276,7 +275,7 @@ async def fetch_explorer_source(
                 parsed = json.loads(inner)
                 for path, content in parsed.get("sources", {}).items():
                     sources[path] = content.get("content", "")
-            except:
+            except (json.JSONDecodeError, AttributeError, TypeError):
                 sources[f"{contract_name}.sol"] = source_code
         elif source_code.startswith("{"):
             # Single-brace format: {path: {content: ...}}
@@ -287,7 +286,7 @@ async def fetch_explorer_source(
                         sources[path] = content.get("content", "")
                     else:
                         sources[path] = str(content)
-            except:
+            except (json.JSONDecodeError, AttributeError, TypeError):
                 sources[f"{contract_name}.sol"] = source_code
         else:
             # Plain source code
@@ -402,14 +401,14 @@ class ContractCrawler:
         # Limit per chain
         addresses = addresses[: self.max_per_chain]
 
-        # Resume support: filter out already crawled addresses
-        already_crawled = self.registry.get_crawled_addresses(chain_id)
-        if already_crawled:
-            original_count = len(addresses)
-            addresses = [a for a in addresses if a.lower() not in already_crawled]
-            skipped = original_count - len(addresses)
-            if skipped > 0:
-                _log.info("  Resuming: skipped %d already-crawled contracts", skipped)
+        # Resume + multi-process safety: atomically claim each address by
+        # inserting a placeholder row. Anything we don't claim is either
+        # already fully registered or being crawled by another worker.
+        original_count = len(addresses)
+        addresses = self.registry.claim_addresses_for_crawl(chain_id, addresses)
+        skipped = original_count - len(addresses)
+        if skipped > 0:
+            _log.info("  Resume: skipped %d addresses already crawled or claimed by another worker", skipped)
 
         if not addresses:
             _log.info("  All contracts already crawled!")

@@ -56,11 +56,11 @@ class ContractRegistry:
                     crawled_at TEXT DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(chain_id, address)
                 );
-                
+
                 -- Index for fast hash lookups
                 CREATE INDEX IF NOT EXISTS idx_source_hash ON contracts(source_hash);
                 CREATE INDEX IF NOT EXISTS idx_chain_address ON contracts(chain_id, address);
-                
+
                 -- Hash summary table (for quick stats)
                 CREATE TABLE IF NOT EXISTS hash_stats (
                     source_hash TEXT PRIMARY KEY,
@@ -70,7 +70,7 @@ class ContractRegistry:
                     chains TEXT,  -- JSON array of chain_ids
                     sample_name TEXT
                 );
-                
+
                 -- Vulnerability tags (optional, for marking known issues)
                 CREATE TABLE IF NOT EXISTS vulnerability_tags (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -81,7 +81,7 @@ class ContractRegistry:
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(source_hash, tag)
                 );
-                
+
                 -- Scanned blocks tracking (for resume support)
                 CREATE TABLE IF NOT EXISTS scanned_blocks (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -128,7 +128,7 @@ class ContractRegistry:
             # Insert or update contract
             conn.execute(
                 """
-                INSERT INTO contracts (chain_id, address, source_hash, contract_name, 
+                INSERT INTO contracts (chain_id, address, source_hash, contract_name,
                                        compiler_version, source_files_count, total_lines, crawled_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(chain_id, address) DO UPDATE SET
@@ -162,7 +162,7 @@ class ContractRegistry:
         """,
             (source_hash,),
         )
-        chains = list(set(row[0] for row in cursor.fetchall()))
+        chains = list({row[0] for row in cursor.fetchall()})
 
         cursor = conn.execute(
             """
@@ -234,16 +234,79 @@ class ContractRegistry:
         return self.get_hash_by_address(chain_id, address) is not None
 
     def get_crawled_addresses(self, chain_id: int) -> set[str]:
-        """Get all crawled addresses for a chain (for resume support)."""
+        """Get all *successfully* crawled addresses for a chain.
+
+        Placeholder rows inserted by :meth:`claim_addresses_for_crawl` (which
+        carry ``source_hash = ''``) are excluded so resume retries them.
+        """
         conn = sqlite3.connect(self.db_path)
         try:
             cursor = conn.execute(
                 """
-                SELECT address FROM contracts WHERE chain_id = ?
-            """,
+                SELECT address FROM contracts
+                WHERE chain_id = ? AND source_hash IS NOT NULL AND source_hash != ''
+                """,
                 (chain_id,),
             )
             return {row[0].lower() for row in cursor.fetchall()}
+        finally:
+            conn.close()
+
+    def claim_addresses_for_crawl(self, chain_id: int, addresses: list[str]) -> list[str]:
+        """Atomically claim ``addresses`` for crawling.
+
+        Each address is inserted as a placeholder row (empty ``source_hash``);
+        SQLite's ``INSERT OR IGNORE`` makes the claim collision-free, so two
+        crawlers running against the same DB never end up double-fetching the
+        same contract. Returns the subset of addresses that this call newly
+        claimed (lower-cased). Placeholders are filled in by
+        :meth:`register_contract` once the source is fetched.
+        """
+        if not addresses:
+            return []
+
+        now = _utc_now_iso()
+        claimed: list[str] = []
+        conn = sqlite3.connect(self.db_path)
+        try:
+            for addr in addresses:
+                addr_lower = addr.lower()
+                cur = conn.execute(
+                    """
+                    INSERT OR IGNORE INTO contracts
+                      (chain_id, address, source_hash, contract_name, compiler_version,
+                       source_files_count, total_lines, crawled_at)
+                    VALUES (?, ?, '', NULL, NULL, 0, 0, ?)
+                    """,
+                    (chain_id, addr_lower, now),
+                )
+                if cur.rowcount > 0:
+                    claimed.append(addr_lower)
+            conn.commit()
+        finally:
+            conn.close()
+        return claimed
+
+    def release_stale_claims(self, chain_id: int, *, older_than_iso: str | None = None) -> int:
+        """Drop placeholder claims that never got filled in.
+
+        Useful as a periodic cleanup if a crawler dies without registering.
+        Returns the number of placeholder rows deleted.
+        """
+        conn = sqlite3.connect(self.db_path)
+        try:
+            if older_than_iso:
+                cur = conn.execute(
+                    "DELETE FROM contracts WHERE chain_id = ? AND source_hash = '' AND crawled_at < ?",
+                    (chain_id, older_than_iso),
+                )
+            else:
+                cur = conn.execute(
+                    "DELETE FROM contracts WHERE chain_id = ? AND source_hash = ''",
+                    (chain_id,),
+                )
+            conn.commit()
+            return cur.rowcount
         finally:
             conn.close()
 
