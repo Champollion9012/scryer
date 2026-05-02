@@ -312,12 +312,20 @@ def llm_chat_completion(
     use exponential backoff with jitter.
     """
     last_error: str | None = None
+    # Single shared usage dict so the streaming callback's closure isn't bound
+    # to a per-iteration variable (silenced B023).
+    captured_usage: dict = {}
+
+    def _on_usage(u: dict) -> None:
+        captured_usage.update(u)
+
     for attempt in range(1, max_retries + 1):
         try:
             if rate_limiter:
                 rate_limiter.wait()
 
             if stream:
+                captured_usage.clear()
 
                 async def _consume() -> str:
                     parts: list[str] = []
@@ -328,6 +336,7 @@ def llm_chat_completion(
                         max_output_tokens=max_output_tokens,
                         timeout_s=timeout_s,
                         json_mode=True,
+                        on_usage=_on_usage,
                     ):
                         parts.append(chunk)
                         if on_chunk:
@@ -335,7 +344,7 @@ def llm_chat_completion(
                     return "".join(parts)
 
                 content = asyncio.run(_consume())
-                return content, {}
+                return content, dict(captured_usage)
 
             content, usage = asyncio.run(
                 provider.chat_completion(
@@ -377,6 +386,44 @@ def _strip_code_fences(text: str) -> str:
     return s
 
 
+def dedupe_findings_across_chunks(chunk_outputs: list[dict]) -> list[dict]:
+    """Cross-chunk deterministic dedup before LLM reduce.
+
+    Map-reduce often produces the same finding from two chunks (overlap on
+    contract boundaries, identical patterns flagged twice, etc.). The reduce
+    prompt asks the LLM to dedupe, but doing a deterministic pass first
+    cuts prompt size, halves the chance the LLM re-introduces a near-duplicate
+    with slightly different wording, and gives the LLM cleaner input.
+
+    Findings are matched by case-insensitive ``(affected_component, title)``;
+    the first occurrence wins, with ``locations`` lists merged.
+    """
+    seen: dict[tuple[str, str], dict] = {}
+    for chunk in chunk_outputs:
+        if not isinstance(chunk, dict):
+            continue
+        for f in chunk.get("findings") or []:
+            if not isinstance(f, dict):
+                continue
+            key = (
+                str(f.get("affected_component") or "").strip().lower(),
+                str(f.get("title") or "").strip().lower(),
+            )
+            if not key[1]:  # skip findings without a title — can't safely dedupe
+                seen[(str(id(f)), "")] = dict(f)
+                continue
+            if key in seen:
+                merged_locs = list(seen[key].get("locations") or [])
+                for loc in f.get("locations") or []:
+                    if loc not in merged_locs:
+                        merged_locs.append(loc)
+                if merged_locs:
+                    seen[key]["locations"] = merged_locs
+            else:
+                seen[key] = dict(f)
+    return list(seen.values())
+
+
 def make_audit_cache_key(files: list[Path], *, model: str, provider: str) -> str:
     """Combine source-content hash with model+provider identity.
 
@@ -412,6 +459,81 @@ def parse_json_response(text: str) -> dict:
             return value
 
     raise ValueError("Model output is not valid JSON")
+
+
+def _print_cost_estimate(groups: dict[str, list[Path]], *, args, sources_root: Path) -> None:
+    """Walk the same prompt-build path the real audit takes and report tokens.
+
+    Best-effort: real LLM output length is unbounded, so we treat
+    ``--max-output-tokens`` as the upper bound and print a low/high range when
+    pricing is available. Static-analysis blobs are conservatively budgeted.
+    """
+    # Heuristic overhead per call: prompt template + analysis JSON. The
+    # built-in templates are ~3 KB each; bump to 5 KB to stay conservative.
+    PROMPT_OVERHEAD_CHARS = 5_000
+
+    grand_input_chars = 0
+    grand_output_tokens_max = 0
+    per_group: list[dict] = []
+
+    for key, files in groups.items():
+        _, blocks = build_file_blocks(
+            files,
+            sources_root=sources_root,
+            with_line_numbers=not args.no_line_numbers,
+            max_block_chars=args.max_chunk_chars,
+        )
+        full_text = "\n\n".join(blocks)
+
+        if args.force_map_reduce or len(full_text) > args.max_input_chars:
+            chunks = chunk_blocks(blocks, max_chars=args.max_chunk_chars)
+            mode = "map_reduce"
+            calls = len(chunks) + 1  # N map + 1 reduce
+            input_chars = sum(len(c) for c in chunks) + PROMPT_OVERHEAD_CHARS * calls
+            # Reduce input also includes the chunk findings text; bound by
+            # max_output_tokens × N as a worst case.
+            input_chars += args.max_output_tokens * 4 * len(chunks)
+            output_tokens_max = args.max_output_tokens * calls
+        else:
+            mode = "single_pass"
+            calls = 1
+            input_chars = len(full_text) + PROMPT_OVERHEAD_CHARS
+            output_tokens_max = args.max_output_tokens
+
+        in_tokens = max(1, input_chars // 4)
+        grand_input_chars += input_chars
+        grand_output_tokens_max += output_tokens_max
+        per_group.append(
+            {
+                "key": key,
+                "files": len(files),
+                "mode": mode,
+                "calls": calls,
+                "input_tokens_est": in_tokens,
+                "output_tokens_max": output_tokens_max,
+            }
+        )
+
+    grand_in_tokens = max(1, grand_input_chars // 4)
+    print()
+    print(f"Cost estimate ({len(groups)} groups, model={args.model}, provider={args.provider})")
+    print("-" * 72)
+    print(f"  {'group':<40s}  {'mode':<11s}  {'calls':>5s}  {'in_tok':>10s}  {'out_max':>9s}")
+    for g in per_group:
+        print(
+            f"  {g['key'][:40]:<40s}  {g['mode']:<11s}  {g['calls']:>5d}  "
+            f"{g['input_tokens_est']:>10,d}  {g['output_tokens_max']:>9,d}"
+        )
+    print("-" * 72)
+    print(f"  TOTAL input tokens (est):  {grand_in_tokens:,}")
+    print(f"  TOTAL output tokens (max): {grand_output_tokens_max:,}")
+    if args.price_in_per_1k is not None and args.price_out_per_1k is not None:
+        cost_low = (grand_in_tokens / 1000.0) * args.price_in_per_1k
+        cost_high = cost_low + (grand_output_tokens_max / 1000.0) * args.price_out_per_1k
+        print(f"  Projected cost:            ${cost_low:.2f}  –  ${cost_high:.2f} (USD)")
+    else:
+        print("  Projected cost:            (set --price-in-per-1k and --price-out-per-1k)")
+    print()
 
 
 def main() -> int:
@@ -481,6 +603,11 @@ def main() -> int:
 
     parser.add_argument("--skip-existing", action="store_true", help="Skip if output report already exists.")
     parser.add_argument("--dry-run", action="store_true", help="List what would be audited without calling the API.")
+    parser.add_argument(
+        "--estimate-cost",
+        action="store_true",
+        help="Print projected token usage and (if --price-* provided) USD cost; exit without calling the API.",
+    )
 
     parser.add_argument(
         "--disable-regex-scan", action="store_true", help="Disable heuristic regex scan in the prompt context."
@@ -567,6 +694,10 @@ def main() -> int:
         for key, files in groups.items():
             group_dir = groups_root / key
             _log.info("DRY-RUN: %s (%d files) -> %s", key, len(files), group_dir)
+        return 0
+
+    if args.estimate_cost:
+        _print_cost_estimate(groups, args=args, sources_root=sources_root)
         return 0
 
     groups_root.mkdir(parents=True, exist_ok=True)
@@ -812,12 +943,22 @@ def main() -> int:
                     record_call(f"map_{i:02d}", prompt=user_prompt, response=raw, usage=usage, duration_s=duration)
                     chunk_outputs.append(parse_json_response(raw))
 
+                # Deterministic dedup of identical (component, title) pairs
+                # before the LLM sees the chunk findings — cleaner input, fewer
+                # tokens, fewer near-duplicates re-introduced with slightly
+                # different wording.
+                deduped = dedupe_findings_across_chunks(chunk_outputs)
+                chunk_findings_for_reduce: list[dict] = (
+                    [{"chunk_id": "deduped", "chunk_total": len(chunk_outputs), "findings": deduped}]
+                    if len(chunk_outputs) > 1
+                    else chunk_outputs
+                )
                 reduce_prompt = reduce_template.safe_substitute(
                     CHAIN_ID=chain_id_value,
                     ADDRESS=address_value,
                     FILES=files_md,
                     STATIC_ANALYSIS=analysis_text,
-                    CHUNK_FINDINGS=json.dumps(chunk_outputs, ensure_ascii=False, indent=2),
+                    CHUNK_FINDINGS=json.dumps(chunk_findings_for_reduce, ensure_ascii=False, indent=2),
                 )
                 (prompts_dir / "reduce_prompt.txt").write_text(reduce_prompt + "\n", encoding="utf-8")
 

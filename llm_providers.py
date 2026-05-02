@@ -8,10 +8,12 @@ from __future__ import annotations
 import json
 import os
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 import scryer_http
+
+UsageCallback = Callable[[dict], None]
 
 
 class LLMProvider(ABC):
@@ -49,16 +51,17 @@ class LLMProvider(ABC):
         max_output_tokens: int = 4000,
         timeout_s: float = 180.0,
         json_mode: bool = True,
+        on_usage: UsageCallback | None = None,
     ) -> AsyncIterator[str]:
         """Stream completion text as it arrives.
 
-        Default implementation falls back to the non-streaming path and yields
-        the whole content in a single chunk; concrete providers override with a
-        real SSE-based stream. Usage tokens are not surfaced from the stream
-        (the audit pipeline already estimates when the provider doesn't
-        return them).
+        Default implementation falls back to the non-streaming path: yields the
+        whole content in a single chunk and forwards usage to ``on_usage`` so
+        callers don't have to special-case providers that don't override.
+        Concrete providers override with real SSE streaming + per-event usage
+        capture.
         """
-        content, _ = await self.chat_completion(
+        content, usage = await self.chat_completion(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             temperature=temperature,
@@ -66,6 +69,8 @@ class LLMProvider(ABC):
             timeout_s=timeout_s,
             json_mode=json_mode,
         )
+        if on_usage and usage:
+            on_usage(usage)
         yield content
 
 
@@ -132,6 +137,7 @@ class OpenAIProvider(LLMProvider):
         max_output_tokens: int = 4000,
         timeout_s: float = 180.0,
         json_mode: bool = True,
+        on_usage: UsageCallback | None = None,
     ) -> AsyncIterator[str]:
         url = f"{self.base_url}/chat/completions"
         headers = {
@@ -147,6 +153,9 @@ class OpenAIProvider(LLMProvider):
             "temperature": temperature,
             "max_tokens": max_output_tokens,
             "stream": True,
+            # Ask the server to emit a final chunk with token counts so callers
+            # don't have to fall back to a 4-chars-per-token estimate.
+            "stream_options": {"include_usage": True},
         }
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
@@ -166,6 +175,10 @@ class OpenAIProvider(LLMProvider):
                     evt = json.loads(data)
                 except json.JSONDecodeError:
                     continue
+                # The trailing chunk has empty choices and a populated usage block.
+                usage = evt.get("usage")
+                if usage and on_usage:
+                    on_usage(usage)
                 choices = evt.get("choices") or []
                 if not choices:
                     continue
@@ -240,6 +253,7 @@ class ClaudeProvider(LLMProvider):
         max_output_tokens: int = 4000,
         timeout_s: float = 180.0,
         json_mode: bool = True,
+        on_usage: UsageCallback | None = None,
     ) -> AsyncIterator[str]:
         url = f"{self.base_url}/messages"
         headers = {
@@ -256,6 +270,12 @@ class ClaudeProvider(LLMProvider):
             "stream": True,
         }
 
+        # Claude reports input_tokens at message_start and cumulative output
+        # tokens in each message_delta. We accumulate and emit once at the end
+        # so on_usage matches the OpenAI-style "called once" contract.
+        prompt_tokens = 0
+        completion_tokens = 0
+
         async with (
             scryer_http.async_client(timeout=timeout_s, retries=0) as client,
             client.stream("POST", url, headers=headers, json=payload) as resp,
@@ -271,12 +291,24 @@ class ClaudeProvider(LLMProvider):
                     evt = json.loads(data)
                 except json.JSONDecodeError:
                     continue
-                if evt.get("type") == "content_block_delta":
+                etype = evt.get("type")
+                if etype == "content_block_delta":
                     text = evt.get("delta", {}).get("text")
                     if text:
                         yield text
-                elif evt.get("type") == "message_stop":
+                elif etype == "message_start":
+                    msg_usage = evt.get("message", {}).get("usage", {}) or {}
+                    prompt_tokens = int(msg_usage.get("input_tokens", 0))
+                    completion_tokens = int(msg_usage.get("output_tokens", 0))
+                elif etype == "message_delta":
+                    delta_usage = evt.get("usage", {}) or {}
+                    if "output_tokens" in delta_usage:
+                        completion_tokens = int(delta_usage["output_tokens"])
+                elif etype == "message_stop":
                     break
+
+        if on_usage and (prompt_tokens or completion_tokens):
+            on_usage({"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens})
 
 
 class GeminiProvider(LLMProvider):
@@ -344,6 +376,7 @@ class GeminiProvider(LLMProvider):
         max_output_tokens: int = 4000,
         timeout_s: float = 180.0,
         json_mode: bool = True,
+        on_usage: UsageCallback | None = None,
     ) -> AsyncIterator[str]:
         url = (
             f"https://generativelanguage.googleapis.com/v1beta/models/"
@@ -360,6 +393,8 @@ class GeminiProvider(LLMProvider):
         if json_mode:
             payload["generationConfig"]["responseMimeType"] = "application/json"
 
+        last_usage: dict | None = None
+
         async with (
             scryer_http.async_client(timeout=timeout_s, retries=0) as client,
             client.stream("POST", url, headers=headers, json=payload) as resp,
@@ -375,6 +410,11 @@ class GeminiProvider(LLMProvider):
                     evt = json.loads(data)
                 except json.JSONDecodeError:
                     continue
+                # Gemini accumulates usageMetadata across stream chunks and
+                # emits the final totals on the last event.
+                meta = evt.get("usageMetadata")
+                if meta:
+                    last_usage = meta
                 candidates = evt.get("candidates") or []
                 if not candidates:
                     continue
@@ -382,6 +422,14 @@ class GeminiProvider(LLMProvider):
                 chunk = "".join(p.get("text", "") for p in parts)
                 if chunk:
                     yield chunk
+
+        if on_usage and last_usage:
+            on_usage(
+                {
+                    "prompt_tokens": int(last_usage.get("promptTokenCount", 0)),
+                    "completion_tokens": int(last_usage.get("candidatesTokenCount", 0)),
+                }
+            )
 
 
 # Provider registry
