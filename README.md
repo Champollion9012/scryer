@@ -79,7 +79,13 @@ flowchart TB
 ### 1. Python deps
 
 ```bash
+# Minimal runtime
 pip install -r requirements.txt
+
+# Or, editable install + extras (recommended for development)
+pip install -e ".[dev]"           # runtime + dev tools
+pip install -e ".[similarity]"    # heavy similarity stack (torch / chromadb)
+pip install -e ".[bigquery]"      # BigQuery contract fetching
 ```
 
 ### 2. Foundry (for PoC tests)
@@ -242,6 +248,37 @@ Switchable via `--provider` flag on [audit_contracts.py](audit_contracts.py); de
 For codebases > 200K chars the audit pipeline auto-switches to map-reduce: each file is summarized via `prompts/solidity_map_prompt.txt` then merged via `solidity_reduce_prompt.txt`.
 
 ---
+
+## Development
+
+```bash
+pip install -e ".[dev]"          # editable install with dev extras
+
+ruff check .                     # lint (configured in pyproject.toml)
+ruff format .                    # auto-format
+mypy .                           # type-check (incremental, see pyproject.toml)
+pytest                           # run Python unit tests
+pytest --cov=. --cov-report=term # with coverage
+```
+
+Python tests live in `tests/python/` and never hit the network — anything
+that needs network is gated behind `@pytest.mark.network` and excluded by
+default. Foundry exploit PoCs in `tests/*.t.sol` are run with `forge test`,
+not pytest.
+
+CI (`.github/workflows/ci.yml`) runs `ruff check`, `mypy`, and `pytest` on
+Python 3.11 / 3.12 / 3.13 on every push and pull request. See
+[AGENTS.md](AGENTS.md) for full project conventions.
+
+### Shared infrastructure (use in new code)
+
+| Module | Replaces | Purpose |
+|--------|----------|---------|
+| `scryer_config` | direct `load_dotenv()` calls | One-shot, idempotent env loading + typed accessors (`get_int`, `get_bool`, `get_list`). |
+| `scryer_logging` | bare `print()` | Structured logger via `get_logger(__name__)`; supports `plain` / `json` formats and optional file sink. |
+| `scryer_http`    | `httpx.AsyncClient(...)` | Shared client factory with timeouts, retries, default `User-Agent`, and SOCKS-proxy fallback. |
+
+Existing modules will be migrated incrementally — keep changes scoped per PR.
 
 ## ⚠️ Disclaimer
 

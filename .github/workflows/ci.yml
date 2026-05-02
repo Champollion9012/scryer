@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+# Cancel in-progress runs on the same ref when a new commit lands.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+            pyproject.toml
+      - name: Install ruff
+        run: pip install "ruff>=0.6"
+      - name: ruff check
+        run: ruff check .
+      - name: ruff format --check
+        run: ruff format --check .
+
+  typecheck:
+    name: Type check (mypy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+            pyproject.toml
+      - name: Install minimal deps for type checking
+        run: |
+          pip install "mypy>=1.10" types-requests
+          # Install runtime deps without the heavy similarity stack.
+          pip install httpx "httpx-socks[asyncio]" orjson web3 cbor2 eth-abi python-dotenv flask
+      - name: mypy
+        run: mypy scryer_config.py scryer_logging.py scryer_http.py cache.py
+
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+            pyproject.toml
+      - name: Install runtime + dev deps (no similarity stack)
+        run: |
+          pip install --upgrade pip
+          # Install only the lightweight runtime deps so torch/chromadb
+          # don't dominate CI time. Tests must not import them.
+          pip install httpx "httpx-socks[asyncio]" orjson web3 cbor2 eth-abi python-dotenv flask
+          pip install pytest pytest-asyncio pytest-cov
+      - name: Run pytest
+        run: pytest -ra --tb=short -m "not network and not slow"
+      - name: Coverage (3.11 only)
+        if: matrix.python-version == '3.11'
+        run: pytest --cov=. --cov-report=term-missing --cov-report=xml -m "not network and not slow"
+      - name: Upload coverage artifact
+        if: matrix.python-version == '3.11'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml
+          if-no-files-found: ignore
