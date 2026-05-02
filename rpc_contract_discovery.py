@@ -7,7 +7,9 @@ with decompilation fallback for unverified contracts.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -152,8 +154,9 @@ class BlockScanner:
         retries = 3
         base_delay = 10.0
 
-        # Get SOCKS proxy from environment
-        socks_proxy = os.getenv("SOCKS_PROXY") or os.getenv("socks_proxy")
+        # Get SOCKS proxy from environment (env vars are case-sensitive on POSIX,
+        # but in practice users sometimes lowercase it; check both spellings).
+        socks_proxy = os.getenv("SOCKS_PROXY") or os.environ.get("socks_proxy")  # noqa: SIM112
 
         for attempt in range(retries):
             await self.rate_limiter.wait()
@@ -342,9 +345,8 @@ class BlockScanner:
                             await queue.put(contract)
 
                     # Check limit after finding
-                    if limit and contracts_found >= limit:
-                        if stop_event and not stop_event.is_set():
-                            stop_event.set()
+                    if limit and contracts_found >= limit and stop_event and not stop_event.is_set():
+                        stop_event.set()
 
                     if progress_callback and blocks_processed % 10 == 0:
                         progress_callback(blocks_processed, total_blocks, contracts_found)
@@ -389,10 +391,8 @@ class BlockScanner:
     async def close(self):
         """Close any open connections (e.g., proxy client)."""
         if self.proxy_client:
-            try:
+            with contextlib.suppress(Exception):
                 await self.proxy_client.aclose()
-            except Exception:
-                pass
             self.proxy_client = None
 
 
@@ -478,10 +478,22 @@ class ContractDiscovery:
         queue = asyncio.Queue()
         stop_event = asyncio.Event()
 
-        # Progress callback. Stays on print() with `end="\r"` for in-place
-        # CLI updates — logger doesn't support carriage-return progress.
+        # Progress callback. On a TTY, render in-place with `\r` for live
+        # updates; off a TTY (CI logs, file sinks) downsample to ~5% steps via
+        # the structured logger so the output stays grep-friendly.
+        _is_tty = sys.stderr.isatty()
+        _last_pct = [-1]
+
         def progress(current, total, found):
-            print(f"  Progress: {current:,}/{total:,} blocks, {found} contracts found", end="\r")
+            if _is_tty:
+                print(f"  Progress: {current:,}/{total:,} blocks, {found} contracts found", end="\r", file=sys.stderr)
+                return
+            if total <= 0:
+                return
+            pct = int(current * 100 / total)
+            if pct >= _last_pct[0] + 5 or current == total:
+                _last_pct[0] = pct
+                _log.info("Progress: %d%% (%s/%s blocks, %d contracts)", pct, f"{current:,}", f"{total:,}", found)
 
         # Start consumer workers
         workers = []
@@ -506,8 +518,8 @@ class ContractDiscovery:
                 stop_event,
                 limit,
             )
-            print()  # Newline after the carriage-return progress meter
-
+            if _is_tty:
+                print(file=sys.stderr)  # newline after carriage-return progress
             all_contracts.extend(contracts)
 
             # Record this range as scanned
@@ -581,10 +593,9 @@ class ContractDiscovery:
                     self.stats["contracts_saved"] = self.stats.get("contracts_saved", 0) + 1
 
                 # Check limit again after processing
-                if limit and self.stats.get("contracts_saved", 0) >= limit:
-                    if stop_event and not stop_event.is_set():
-                        _log.info("Limit of %d contracts reached. Stopping scan...", limit)
-                        stop_event.set()
+                if limit and self.stats.get("contracts_saved", 0) >= limit and stop_event and not stop_event.is_set():
+                    _log.info("Limit of %d contracts reached. Stopping scan...", limit)
+                    stop_event.set()
 
             except Exception as e:
                 _log.warning("  Worker error: %s", e)

@@ -73,7 +73,7 @@ async def fetch_blockscout_verified_contracts(
                         contract_date = datetime.fromisoformat(verified_at.replace("Z", "+00:00"))
                         if contract_date.replace(tzinfo=None) < min_date:
                             return addresses
-                    except:
+                    except (ValueError, TypeError):
                         pass
 
                 if addr:
@@ -222,7 +222,7 @@ async def fetch_ipfs_metadata(
             resp = await client.get(url, timeout=30.0)
             if resp.status_code == 200:
                 return resp.json()
-        except:
+        except (httpx.RequestError, ValueError):
             continue
     return None
 
@@ -232,12 +232,29 @@ async def fetch_contracts_from_blocks(
     start_block: int,
     end_block: int,
     client: httpx.AsyncClient,
+    *,
+    rps: float = 10.0,
 ) -> list[dict]:
-    """
-    Fetch contract creation transactions from block range.
-    Returns list of {address, bytecode, block_number, tx_hash}.
+    """Fetch contract creation transactions from a block range.
+
+    ``rps`` caps the JSON-RPC request rate (per-call, including receipt
+    lookups) so we don't hammer the upstream endpoint when scanning long
+    ranges. Defaults to 10 requests/second; pass a larger value for
+    privately-owned RPCs or 0 to disable.
     """
     contracts: list[dict] = []
+
+    # Local import to avoid a circular reference: contract_crawler imports
+    # from this module too in some configurations.
+    from contract_crawler import AsyncRateLimiter
+
+    rate_limiter = AsyncRateLimiter(rps) if rps and rps > 0 else None
+
+    async def _rpc_post(payload: dict) -> dict:
+        if rate_limiter:
+            await rate_limiter.wait()
+        resp = await client.post(rpc_url, json=payload, timeout=30.0)
+        return resp.json()
 
     for block_num in range(start_block, end_block + 1):
         # Get block with transactions
@@ -249,8 +266,7 @@ async def fetch_contracts_from_blocks(
         }
 
         try:
-            resp = await client.post(rpc_url, json=payload, timeout=30.0)
-            data = resp.json()
+            data = await _rpc_post(payload)
             block = data.get("result")
 
             if not block:
@@ -267,8 +283,7 @@ async def fetch_contracts_from_blocks(
                         "id": 2,
                     }
 
-                    receipt_resp = await client.post(rpc_url, json=receipt_payload, timeout=30.0)
-                    receipt_data = receipt_resp.json()
+                    receipt_data = await _rpc_post(receipt_payload)
                     receipt = receipt_data.get("result", {})
 
                     contract_address = receipt.get("contractAddress")
@@ -328,7 +343,7 @@ async def fetch_contracts_from_bigquery(
     client = bigquery.Client()
 
     query = f"""
-    SELECT 
+    SELECT
         address,
         bytecode,
         block_timestamp,

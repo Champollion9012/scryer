@@ -50,8 +50,7 @@ def normalize_address(address: str) -> str:
 
 
 def eip1967_slot(tag: str) -> int:
-    slot = int.from_bytes(Web3.keccak(text=tag), "big") - 1
-    return slot
+    return int.from_bytes(Web3.keccak(text=tag), "big") - 1
 
 
 EIP1967_IMPLEMENTATION_SLOT = eip1967_slot("eip1967.proxy.implementation")
@@ -229,9 +228,13 @@ def get_sourcify_source(chain_id: int, address: str):
             if item.get("address", "").lower() == address and item.get("status") in ["perfect", "partial"]:
                 match_type = item.get("status")
                 break
-    elif isinstance(status, dict) and address in status and status[address]:
-        if status[address][0].get("status") in ["perfect", "partial"]:
-            match_type = status[address][0].get("status")
+    elif (
+        isinstance(status, dict)
+        and address in status
+        and status[address]
+        and status[address][0].get("status") in ["perfect", "partial"]
+    ):
+        match_type = status[address][0].get("status")
     if not match_type:
         return None, None, f"Not verified on Sourcify: {status}"
 
@@ -576,7 +579,7 @@ def save_sources(
         for relpath, code in sources.items():
             safe_path = str(relpath).replace("/", "_").replace("\\", "_")
             filename = f"{chain_id}_{address}_{safe_path}"
-            if not os.path.splitext(filename)[1]:
+            if not Path(filename).suffix:
                 filename += ".sol"
             out_path = output_root / filename
             out_path.write_text(code or "", encoding="utf-8")

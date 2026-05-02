@@ -8,6 +8,7 @@ Supports multiple decompilation backends:
 
 from __future__ import annotations
 
+import contextlib
 import os
 import subprocess
 import sys
@@ -97,10 +98,8 @@ def decompile_with_heimdall(bytecode: str, timeout: int = 120) -> str | None:
         )
 
         # Clean up temp file
-        try:
-            os.unlink(temp_path)
-        except OSError:
-            pass
+        with contextlib.suppress(OSError):
+            Path(temp_path).unlink()
 
         if result.returncode == 0 and result.stdout.strip():
             output = result.stdout
@@ -118,10 +117,8 @@ def decompile_with_heimdall(bytecode: str, timeout: int = 120) -> str | None:
 
     except subprocess.TimeoutExpired:
         # Clean up on timeout
-        try:
-            os.unlink(temp_path)
-        except (OSError, NameError):
-            pass
+        with contextlib.suppress(OSError, NameError):
+            Path(temp_path).unlink()
         return None
     except FileNotFoundError:
         # wsl.exe not found
