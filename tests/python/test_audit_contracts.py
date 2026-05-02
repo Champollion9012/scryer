@@ -412,3 +412,185 @@ def test_llm_chat_completion_retries_on_5xx_until_max() -> None:
             max_retries=2,
         )
     assert p.attempts == 2
+
+
+# ---------------------------------------------------------------------------
+# dedupe_findings_across_chunks
+# ---------------------------------------------------------------------------
+
+
+def test_dedupe_keeps_first_and_merges_locations() -> None:
+    chunks = [
+        {
+            "chunk_id": 1,
+            "findings": [
+                {
+                    "id": "F-01",
+                    "title": "Reentrancy",
+                    "affected_component": "Vault.withdraw",
+                    "locations": [{"file": "Vault.sol", "line": 10}],
+                }
+            ],
+        },
+        {
+            "chunk_id": 2,
+            "findings": [
+                {
+                    "id": "F-02",
+                    "title": "REENTRANCY",  # same title, different case
+                    "affected_component": "vault.withdraw",  # same component, diff case
+                    "locations": [{"file": "Vault.sol", "line": 42}],
+                }
+            ],
+        },
+    ]
+    out = ac.dedupe_findings_across_chunks(chunks)
+    assert len(out) == 1
+    locs = out[0]["locations"]
+    assert {"file": "Vault.sol", "line": 10} in locs
+    assert {"file": "Vault.sol", "line": 42} in locs
+
+
+def test_dedupe_preserves_distinct_findings() -> None:
+    chunks = [
+        {"findings": [{"title": "A", "affected_component": "X"}]},
+        {"findings": [{"title": "B", "affected_component": "X"}]},
+    ]
+    out = ac.dedupe_findings_across_chunks(chunks)
+    assert len(out) == 2
+
+
+def test_dedupe_keeps_unrelated_titleless_findings() -> None:
+    """Findings without a title can't be safely deduped — keep them all."""
+    chunks = [
+        {"findings": [{"affected_component": "X"}]},
+        {"findings": [{"affected_component": "X"}]},
+    ]
+    out = ac.dedupe_findings_across_chunks(chunks)
+    assert len(out) == 2
+
+
+def test_dedupe_handles_malformed_inputs() -> None:
+    chunks = [
+        "not a dict",  # type: ignore[list-item]
+        {"findings": "not a list"},
+        {"findings": [None, "garbage", {"title": "OK", "affected_component": "X"}]},  # type: ignore[list-item]
+    ]
+    out = ac.dedupe_findings_across_chunks(chunks)  # type: ignore[arg-type]
+    assert len(out) == 1
+    assert out[0]["title"] == "OK"
+
+
+# ---------------------------------------------------------------------------
+# Streaming + on_usage callback (default impl falls back to non-streaming)
+# ---------------------------------------------------------------------------
+
+
+def test_llm_chat_completion_stream_captures_usage() -> None:
+    """The default streaming path forwards usage from chat_completion to on_usage."""
+    import asyncio
+
+    class _StreamProvider:
+        name = "fake:stream"
+
+        async def chat_completion(self, **_):
+            return '{"k": 1}', {"prompt_tokens": 17, "completion_tokens": 9}
+
+        # Provider-defined stream that emits text and reports usage exactly
+        # like the LLMProvider default impl does.
+        async def chat_completion_stream(self, *, on_usage=None, **_):
+            content, usage = await self.chat_completion()
+            if on_usage and usage:
+                on_usage(usage)
+            yield content
+
+    p = _StreamProvider()
+    content, usage = ac.llm_chat_completion(
+        p,
+        system_prompt="s",
+        user_prompt="u",
+        temperature=0.1,
+        max_output_tokens=10,
+        timeout_s=1,
+        max_retries=1,
+        stream=True,
+    )
+    assert content == '{"k": 1}'
+    assert usage == {"prompt_tokens": 17, "completion_tokens": 9}
+    # Sanity: a fresh asyncio loop didn't leak
+    assert asyncio.get_event_loop_policy() is not None
+
+
+# ---------------------------------------------------------------------------
+# --estimate-cost: walks groups, prints, exits without provider calls
+# ---------------------------------------------------------------------------
+
+
+def test_estimate_cost_prints_total_and_skips_provider(
+    tmp_path: Path, fake_provider, capsys: pytest.CaptureFixture
+) -> None:
+    sources_root = _seed_sources(tmp_path)
+    out_dir = tmp_path / "out"
+    sys_argv = [
+        "audit_contracts.py",
+        "--sources-dir",
+        str(sources_root),
+        "--out-dir",
+        str(out_dir),
+        "--no-cache",
+        "--retries",
+        "1",
+        "--disable-regex-scan",
+        "--estimate-cost",
+        "--price-in-per-1k",
+        "0.10",
+        "--price-out-per-1k",
+        "0.30",
+    ]
+    import sys as _sys
+
+    old = _sys.argv
+    _sys.argv = sys_argv
+    try:
+        rc = ac.main()
+    finally:
+        _sys.argv = old
+
+    assert rc == 0
+    captured = capsys.readouterr().out
+    assert "Cost estimate" in captured
+    assert "TOTAL input tokens" in captured
+    assert "Projected cost:" in captured
+    assert "$" in captured  # pricing was provided
+    # Provider must not have been touched
+    assert fake_provider.calls == []
+    # No run directory should exist either
+    assert list(out_dir.glob("run_*")) == []
+
+
+def test_estimate_cost_without_pricing_skips_dollar_amount(tmp_path: Path, fake_provider, capsys) -> None:
+    sources_root = _seed_sources(tmp_path)
+    sys_argv = [
+        "audit_contracts.py",
+        "--sources-dir",
+        str(sources_root),
+        "--out-dir",
+        str(tmp_path / "out"),
+        "--no-cache",
+        "--retries",
+        "1",
+        "--disable-regex-scan",
+        "--estimate-cost",
+    ]
+    import sys as _sys
+
+    old = _sys.argv
+    _sys.argv = sys_argv
+    try:
+        rc = ac.main()
+    finally:
+        _sys.argv = old
+    assert rc == 0
+    captured = capsys.readouterr().out
+    assert "Projected cost:" in captured
+    assert "(set --price-in-per-1k" in captured

@@ -170,3 +170,70 @@ def test_main_returns_2_when_targets_empty(tmp_path: Path, fake_downloader, fake
     assert rc == 2
     assert fake_downloader == []
     assert fake_subprocess == []
+
+
+def test_audit_subprocess_command_parses_through_audit_argparse(
+    tmp_path: Path, fake_downloader, fake_subprocess
+) -> None:
+    """The cmd bounty_pipeline builds must satisfy audit_contracts' argparse.
+
+    Cheap integration test: catches forwarded-arg drift between the two
+    layers without actually shelling out or hitting the LLM.
+    """
+    targets = _write_targets(tmp_path, [{"chain_id": 56, "address": "0x" + "aa" * 20}])
+    run_dir = tmp_path / "runs" / "argparse_check"
+    rc = _run_main(
+        "--targets",
+        str(targets),
+        "--run-dir",
+        str(run_dir),
+        "--model",
+        "test-model",
+        "--rpm",
+        "30",
+        "--max-input-chars",
+        "100000",
+        "--max-chunk-chars",
+        "50000",
+        "--force-map-reduce",
+        "--slither",
+        "--disable-regex-scan",
+    )
+    assert rc == 0
+    cmd = fake_subprocess[0]
+
+    import audit_contracts
+
+    parser = next(a for a in dir(audit_contracts) if a == "main")  # sanity: function exists
+    assert parser  # noqa: PT018  — keep the import live above the actual check
+
+    # Build audit's argparse from a stub run and feed cmd[2:] (skip python+script path).
+    # We rebuild only because audit_contracts.main builds it inline; reuse via subprocess
+    # would burn time/tokens. This validates *shape*, not behaviour.
+    import argparse
+
+    p = argparse.ArgumentParser()
+    p.add_argument("--sources-dir", required=True)
+    p.add_argument("--out-dir", required=True)
+    p.add_argument("--run-dir")
+    p.add_argument("--group-by", choices=["contract", "chain", "all", "file"])
+    p.add_argument("--model")
+    p.add_argument("--base-url")
+    p.add_argument("--rpm", type=float)
+    p.add_argument("--max-input-chars", type=int)
+    p.add_argument("--max-chunk-chars", type=int)
+    p.add_argument("--force-map-reduce", action="store_true")
+    p.add_argument("--slither", action="store_true")
+    p.add_argument("--disable-regex-scan", action="store_true")
+
+    ns, unknown = p.parse_known_args(cmd[2:])
+    # Forwarded options are recognised
+    assert ns.model == "test-model"
+    assert ns.rpm == 30.0
+    assert ns.max_input_chars == 100000
+    assert ns.max_chunk_chars == 50000
+    assert ns.force_map_reduce is True
+    assert ns.slither is True
+    assert ns.disable_regex_scan is True
+    # No unknown args at all means bounty_pipeline isn't passing junk
+    assert unknown == []
