@@ -5,7 +5,7 @@ import re
 import shutil
 import subprocess
 import tempfile
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -129,7 +129,7 @@ DEFAULT_REGEX_RULES: list[RegexRule] = [
 ]
 
 
-def _iter_lines(text: str):
+def _iter_lines(text: str) -> Iterator[tuple[int, str]]:
     yield from enumerate(text.splitlines(), start=1)
 
 

@@ -155,7 +155,15 @@ exclude = [
 
 # Modules with full type discipline — keep this list short and grow over time.
 [[tool.mypy.overrides]]
-module = ["scryer_config", "scryer_logging", "scryer_http", "cache"]
+module = [
+    "scryer_config",
+    "scryer_logging",
+    "scryer_http",
+    "cache",
+    "scanners",
+    "report_renderer",
+    "bounty_pipeline",
+]
 disallow_untyped_defs = true
 disallow_incomplete_defs = true
 

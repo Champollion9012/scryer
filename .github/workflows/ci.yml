@@ -51,7 +51,7 @@ jobs:
           # Install runtime deps without the heavy similarity stack.
           pip install httpx "httpx-socks[asyncio]" orjson web3 cbor2 eth-abi python-dotenv flask
       - name: mypy
-        run: mypy scryer_config.py scryer_logging.py scryer_http.py cache.py
+        run: mypy scryer_config.py scryer_logging.py scryer_http.py cache.py scanners.py report_renderer.py bounty_pipeline.py
 
   test:
     name: Test (Python ${{ matrix.python-version }})
