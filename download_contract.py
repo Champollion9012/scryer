@@ -1,26 +1,29 @@
-import os
 import argparse
 import atexit
 import datetime as dt
+import os
 import re
 from pathlib import Path
 
-import httpx
-try:
-    from dotenv import load_dotenv
-except ImportError:  # pragma: no cover
-    load_dotenv = None
-from web3 import Web3
 import cbor2  # pip install cbor2 (for metadata parsing)
-from eth_abi import abi  # pip install eth-abi (if needed for deeper parsing)
+import httpx
 import orjson
+from web3 import Web3
 
-if load_dotenv:
-    load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"), override=False)
+import scryer_config
+import scryer_http
+from scryer_logging import get_logger
 
-HTTP = httpx.Client(
-    follow_redirects=True,
-    timeout=httpx.Timeout(20.0),
+_log = get_logger(__name__)
+
+# Loads .env once for the whole process (idempotent, safe in tests).
+scryer_config.load()
+
+# Module-level shared sync client. Preserves the historical 20s timeout
+# and bespoke User-Agent while picking up retries / pool limits from
+# scryer_http.
+HTTP = scryer_http.sync_client(
+    timeout=20.0,
     headers={"User-Agent": "bscscan-contract-downloader/1.0"},
 )
 atexit.register(HTTP.close)
@@ -129,7 +132,9 @@ def resolve_proxy_targets(chain_id: int, address: str, rpc_url: str) -> tuple[li
     if beacon:
         result["proxy"]["eip1967_beacon_slot"] = True
         result["proxy"]["beacon"] = normalize_address(beacon)
-        beacon_impl = try_call_implementation(w3, beacon) or try_get_storage_address(w3, beacon, EIP1967_IMPLEMENTATION_SLOT)
+        beacon_impl = try_call_implementation(w3, beacon) or try_get_storage_address(
+            w3, beacon, EIP1967_IMPLEMENTATION_SLOT
+        )
         if beacon_impl:
             result["proxy"]["implementation"] = normalize_address(beacon_impl)
             return [address, normalize_address(beacon_impl)], result
@@ -200,20 +205,22 @@ def extract_address(value: str) -> str:
     match = re.search(r"0x[a-fA-F0-9]{40}", value)
     return match.group(0) if match else value
 
+
 # 允許使用 BscScan API key (環境變量)
 BSC_SCAN_API_KEY = os.getenv("BSCSCAN_API_KEY") or os.getenv("BSC_SCAN_API_KEY")
+
 
 def get_sourcify_source(chain_id: int, address: str):
     """優先 Sourcify API 抓取源碼"""
     address = address.lower()
-    
+
     # 1. 檢查狀態
-    check_url = f"https://sourcify.dev/server/check-by-addresses"
+    check_url = "https://sourcify.dev/server/check-by-addresses"
     params = {"addresses": address, "chainIds": str(chain_id)}
     response = HTTP.get(check_url, params=params)
     if response.status_code != 200:
         return None, None, "Sourcify check failed"
-    
+
     status = json_loads(response.text) if response.text else None
     match_type = None
     # 新版 API 回傳 list，舊版可能回 dict
@@ -240,10 +247,12 @@ def get_sourcify_source(chain_id: int, address: str):
     if r_sources.status_code == 200 and r_sources.text.strip():
         try:
             sources_data = json_loads(r_sources.text)
-            sources = {path: data["content"] for path, data in sources_data.get("sources", {}).items() if "content" in data}
+            sources = {
+                path: data["content"] for path, data in sources_data.get("sources", {}).items() if "content" in data
+            }
         except Exception:
             pass  # 若解析失敗，退回 metadata 模式
-    
+
     # 2b. 下載 metadata（總會存在），並用其中的檔名去 /sources/{path} 拉檔案
     metadata_url = f"{base_url}/metadata.json"
     metadata_r = HTTP.get(metadata_url)
@@ -273,6 +282,7 @@ def get_sourcify_source(chain_id: int, address: str):
         return sources, metadata, "Sourcify success"
     return None, None, "Sourcify download failed"
 
+
 def get_blockscout_source(chain_id: int, address: str):
     """Fallback: Blockscout BSC 實例 API"""
     # 依序嘗試幾個 Blockscout 實例
@@ -294,7 +304,7 @@ def get_blockscout_source(chain_id: int, address: str):
             sources = {file["name"]: file["source_code"] for file in source_code.get("files", [])}
             metadata = {
                 "compiler": {"version": source_code.get("compiler_version", "")},
-                "settings": {"optimizer": {"runs": source_code.get("optimization_used", False)}}
+                "settings": {"optimizer": {"runs": source_code.get("optimization_used", False)}},
             }
             return sources, metadata, f"Blockscout success ({api_url})"
         errors.append(f"{api_url} -> no verified_source_code")
@@ -407,20 +417,21 @@ def get_bscscan_source(chain_id: int, address: str):
 
     return None, None, " ; ".join(errors) if errors else "BscScan failed"
 
+
 def extract_from_bytecode_metadata(chain_id: int, address: str, rpc_url: str = DEFAULT_RPC_URL):
     """最後手段: 從鏈上 bytecode 解析 metadata → IPFS/Swarm"""
     w3 = Web3(Web3.HTTPProvider(rpc_url))
     bytecode = w3.eth.get_code(Web3.to_checksum_address(address)).hex()
-    
+
     # 提取 metadata (Solidity metadata 在 bytecode 結尾，CBOR 編碼)
     # 最後 2 bytes 是 offset (通常 0x00 0xA1)，然後 CBOR data
     if len(bytecode) < 4:
         return None, None, "Invalid bytecode"
-    
+
     # 移除 0x prefix，轉 bytes
     bytecode_bytes = bytes.fromhex(bytecode[2:])
     # 找 metadata 長度 (最後 2 bytes)
-    metadata_length = int.from_bytes(bytecode_bytes[-2:], 'big')
+    metadata_length = int.from_bytes(bytecode_bytes[-2:], "big")
     if metadata_length <= 0:
         return None, None, "No metadata length marker"
     if metadata_length + 2 > len(bytecode_bytes):
@@ -428,7 +439,7 @@ def extract_from_bytecode_metadata(chain_id: int, address: str, rpc_url: str = D
 
     metadata_start = len(bytecode_bytes) - 2 - metadata_length
     metadata_bytes = bytecode_bytes[metadata_start:-2]
-    
+
     try:
         metadata_decoded = cbor2.loads(metadata_bytes)
         if not isinstance(metadata_decoded, dict):
@@ -508,6 +519,7 @@ def extract_from_bytecode_metadata(chain_id: int, address: str, rpc_url: str = D
     except Exception as e:
         return None, None, f"Metadata parse error: {e}"
 
+
 def sanitize_relpath(relpath: str) -> Path:
     relpath = (relpath or "").strip().replace("\\", "/")
     relpath = relpath.lstrip("/")
@@ -554,7 +566,7 @@ def save_sources(
         meta = {
             "chain_id": chain_id,
             "address": address,
-            "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "generated_at": dt.datetime.now(dt.UTC).isoformat(),
             "files_written": written,
         }
         if extra_metadata:
@@ -573,7 +585,7 @@ def save_sources(
         meta = {
             "chain_id": chain_id,
             "address": address,
-            "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "generated_at": dt.datetime.now(dt.UTC).isoformat(),
             "files_written": written,
         }
         if extra_metadata:
@@ -583,7 +595,8 @@ def save_sources(
             encoding="utf-8",
         )
 
-    print(f"源碼已存到 ./{output_dir}/")
+    _log.info("源碼已存到 ./%s/", output_dir)
+
 
 # 主函數：針對你的合約一鍵抓取
 def fetch_contract_source(
@@ -597,7 +610,7 @@ def fetch_contract_source(
     quiet: bool = False,
 ) -> bool:
     root_address = normalize_address(address)
-    print(f"開始抓取 chainId={chain_id}, 地址={root_address} 的源碼...")
+    _log.info("開始抓取 chainId=%s, 地址=%s 的源碼...", chain_id, root_address)
 
     proxy_info = None
     targets = [root_address]
@@ -606,60 +619,62 @@ def fetch_contract_source(
         targets = [normalize_address(a) for a in targets]
         targets = list(dict.fromkeys(targets))  # preserve order, de-dup
         if len(targets) > 1:
-            print(f"🔎 Proxy detected, will also fetch implementation: {targets[1]}")
+            _log.info("🔎 Proxy detected, will also fetch implementation: %s", targets[1])
         else:
-            print("🔎 Proxy resolution: no implementation detected")
+            _log.info("🔎 Proxy resolution: no implementation detected")
+
+    def _dump_source(path: str, code: str) -> None:
+        # quiet=False mode dumps fetched sources to stdout — this is the
+        # data the user asked for, so it stays on print().
+        print(f"\n{'=' * 60}\n{path}\n{'=' * 60}")
+        print(code[:1000] + "..." if len(code) > 1000 else code)
 
     def fetch_one(target: str):
         # 步驟 1: Sourcify
         sources, metadata, msg = get_sourcify_source(chain_id, target)
         if sources:
-            print(f"✅ {msg}")
+            _log.info("✅ %s", msg)
             if not quiet:
                 metadata_str = json_dumps(metadata, indent=2)
                 print("Metadata:", metadata_str[:500] + "..." if len(metadata_str) > 500 else metadata_str)
                 for path, code in sources.items():
-                    print(f"\n{'='*60}\n{path}\n{'='*60}")
-                    print(code[:1000] + "..." if len(code) > 1000 else code)
+                    _dump_source(path, code)
             return sources, metadata, msg, "sourcify"
-        print(f"Sourcify 失敗: {msg}")
+        _log.warning("Sourcify 失敗: %s", msg)
 
         # 步驟 2: Blockscout
-        print("Sourcify 無，嘗試 Blockscout...")
+        _log.info("Sourcify 無，嘗試 Blockscout...")
         sources, metadata, msg = get_blockscout_source(chain_id, target)
         if sources:
-            print(f"✅ {msg}")
+            _log.info("✅ %s", msg)
             if not quiet:
                 print("Metadata:", json_dumps(metadata, indent=2))
                 for path, code in sources.items():
-                    print(f"\n{'='*60}\n{path}\n{'='*60}")
-                    print(code[:1000] + "..." if len(code) > 1000 else code)
+                    _dump_source(path, code)
             return sources, metadata, msg, "blockscout"
-        print(f"Blockscout 失敗: {msg}")
+        _log.warning("Blockscout 失敗: %s", msg)
 
         # 步驟 2b: BscScan (需 API key)
-        print("嘗試 BscScan API...")
+        _log.info("嘗試 BscScan API...")
         sources, metadata, msg = get_bscscan_source(chain_id, target)
         if sources:
-            print(f"✅ {msg}")
+            _log.info("✅ %s", msg)
             if not quiet:
                 print("Metadata:", json_dumps(metadata, indent=2))
                 for path, code in sources.items():
-                    print(f"\n{'='*60}\n{path}\n{'='*60}")
-                    print(code[:1000] + "..." if len(code) > 1000 else code)
+                    _dump_source(path, code)
             return sources, metadata, msg, "bscscan"
-        print(f"BscScan 失敗: {msg}")
+        _log.warning("BscScan 失敗: %s", msg)
 
         # 步驟 3: Bytecode metadata
-        print("Blockscout 無，嘗試從 bytecode 解析...")
+        _log.info("Blockscout 無，嘗試從 bytecode 解析...")
         sources, metadata, msg = extract_from_bytecode_metadata(chain_id, target, rpc_url=rpc_url)
         if sources:
-            print(f"✅ {msg}")
+            _log.info("✅ %s", msg)
             if not quiet:
                 print("Metadata:", json_dumps(metadata, indent=2))
                 for path, code in sources.items():
-                    print(f"\n{'='*60}\n{path}\n{'='*60}")
-                    print(code[:1000] + "..." if len(code) > 1000 else code)
+                    _dump_source(path, code)
             return sources, metadata, msg, "bytecode_metadata"
 
         return None, None, msg, None
@@ -668,11 +683,11 @@ def fetch_contract_source(
     for target in targets:
         target = normalize_address(target)
         if target != root_address:
-            print(f"\n---\n跟隨下載 implementation: {target}\n---")
+            _log.info("跟隨下載 implementation: %s", target)
 
         sources, metadata, msg, method = fetch_one(target)
         if not sources:
-            print(f"❌ 所有途徑失敗 ({msg})，嘗試保存原始 bytecode...")
+            _log.warning("❌ 所有途徑失敗 (%s)，嘗試保存原始 bytecode...", msg)
             # Save bytecode-only with marker
             try:
                 w3 = Web3(Web3.HTTPProvider(rpc_url))
@@ -711,12 +726,12 @@ def fetch_contract_source(
                             "proxy_resolution": proxy_info,
                         },
                     )
-                    print(f"✅ 已保存 bytecode (標記為 BYTECODE_ONLY)")
+                    _log.info("✅ 已保存 bytecode (標記為 BYTECODE_ONLY)")
                     any_success = True
                 else:
-                    print(f"❌ 無法取得 bytecode (可能是 EOA 或已自毀的合約)")
+                    _log.error("❌ 無法取得 bytecode (可能是 EOA 或已自毀的合約)")
             except Exception as e:
-                print(f"❌ 保存 bytecode 失敗: {e}")
+                _log.error("❌ 保存 bytecode 失敗: %s", e)
             continue
 
         any_success = True
@@ -736,23 +751,28 @@ def fetch_contract_source(
 
     return any_success
 
+
 # 針對你的合約運行（BSC chainId 56）
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Download verified contract source code via Sourcify/Blockscout/BscScan.")
+    parser = argparse.ArgumentParser(
+        description="Download verified contract source code via Sourcify/Blockscout/BscScan."
+    )
     parser.add_argument("address", nargs="?", help="Contract address (0x...)")
     parser.add_argument("--chain-id", type=int, default=56, help="Chain ID (default: 56 for BSC)")
     parser.add_argument("--rpc-url", default=DEFAULT_RPC_URL, help="RPC URL for bytecode/proxy resolution.")
-    parser.add_argument("--follow-proxy", action="store_true", help="If address is a proxy, also download the implementation.")
+    parser.add_argument(
+        "--follow-proxy", action="store_true", help="If address is a proxy, also download the implementation."
+    )
     parser.add_argument("--output-dir", default="sources", help="Output directory (default: sources)")
-    parser.add_argument("--layout", choices=["flat", "tree"], default="flat", help="Save layout: flat filenames or tree per contract.")
+    parser.add_argument(
+        "--layout", choices=["flat", "tree"], default="flat", help="Save layout: flat filenames or tree per contract."
+    )
     parser.add_argument("--quiet", action="store_true", help="Reduce output (do not print sources/metadata previews).")
     args = parser.parse_args()
 
     chain_id = args.chain_id
     address = extract_address(
-        args.address
-        or os.getenv("CONTRACT_ADDRESS")
-        or "0x3358758d8E362e4672fF2c63D65bdb35A7824451"
+        args.address or os.getenv("CONTRACT_ADDRESS") or "0x3358758d8E362e4672fF2c63D65bdb35A7824451"
     )
     fetch_contract_source(
         chain_id,

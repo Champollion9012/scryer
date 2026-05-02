@@ -2,18 +2,19 @@
 Additional Contract Data Sources.
 Provides Blockscout, on-chain traversal, and BigQuery integrations.
 """
+
 from __future__ import annotations
 
 import asyncio
-import json
 import os
-import re
 from dataclasses import dataclass
-from datetime import datetime, timedelta
-from pathlib import Path
-from typing import Any
+from datetime import datetime
 
 import httpx
+
+from scryer_logging import get_logger
+
+_log = get_logger(__name__)
 
 # ============================================================================
 # Blockscout API
@@ -42,30 +43,30 @@ async def fetch_blockscout_verified_contracts(
     base_url = BLOCKSCOUT_CHAINS.get(chain_id)
     if not base_url:
         return []
-    
+
     addresses: list[str] = []
     next_page_params: dict | None = None
-    
+
     while len(addresses) < max_results:
         url = f"{base_url}/smart-contracts"
         if next_page_params:
             url += "?" + "&".join(f"{k}={v}" for k, v in next_page_params.items())
-        
+
         try:
             resp = await client.get(url, timeout=30.0)
             if resp.status_code != 200:
                 break
-            
+
             data = resp.json()
             items = data.get("items", [])
-            
+
             if not items:
                 break
-            
+
             for item in items:
                 addr = item.get("address", {}).get("hash", "")
                 verified_at = item.get("verified_at", "")
-                
+
                 # Filter by date if specified
                 if min_date and verified_at:
                     try:
@@ -74,18 +75,18 @@ async def fetch_blockscout_verified_contracts(
                             return addresses
                     except:
                         pass
-                
+
                 if addr:
                     addresses.append(addr.lower())
-            
+
             next_page_params = data.get("next_page_params")
             if not next_page_params:
                 break
-                
+
         except Exception as e:
-            print(f"  Blockscout error: {e}")
+            _log.warning("  Blockscout error: %s", e)
             break
-    
+
     return addresses
 
 
@@ -98,24 +99,24 @@ async def fetch_blockscout_source(
     base_url = BLOCKSCOUT_CHAINS.get(chain_id)
     if not base_url:
         return {}, None
-    
+
     url = f"{base_url}/smart-contracts/{address}"
-    
+
     try:
         resp = await client.get(url, timeout=30.0)
         if resp.status_code != 200:
             return {}, None
-        
+
         data = resp.json()
-        
+
         sources: dict[str, str] = {}
         contract_name = data.get("name", "Contract")
-        
+
         # Main source
         source_code = data.get("source_code", "")
         if source_code:
             sources[f"{contract_name}.sol"] = source_code
-        
+
         # Additional sources
         additional = data.get("additional_sources", [])
         for item in additional:
@@ -123,7 +124,7 @@ async def fetch_blockscout_source(
             content = item.get("source_code", "")
             if name and content:
                 sources[name] = content
-        
+
         metadata = {
             "ContractName": contract_name,
             "CompilerVersion": data.get("compiler_version"),
@@ -131,11 +132,11 @@ async def fetch_blockscout_source(
             "Runs": data.get("optimization_runs"),
             "EVMVersion": data.get("evm_version"),
         }
-        
+
         return sources, metadata
-        
+
     except Exception as e:
-        print(f"  Blockscout source error for {address}: {e}")
+        _log.warning("  Blockscout source error for %s: %s", address, e)
         return {}, None
 
 
@@ -154,44 +155,59 @@ IPFS_GATEWAYS = [
 
 def extract_ipfs_cid_from_bytecode(bytecode: str) -> str | None:
     """
-    Extract IPFS CID from Solidity bytecode metadata.
-    The metadata is CBOR-encoded at the end of bytecode.
+    Extract IPFS CID (CIDv0, ``Qm...``) from Solidity bytecode metadata.
+
+    Solidity appends a CBOR-encoded metadata blob at the end of bytecode,
+    with the last 2 bytes being the blob's length (big-endian). The blob
+    is a CBOR map that may contain an ``ipfs`` key holding the raw 34-byte
+    multihash (0x12 0x20 + 32 bytes of SHA-256). The CIDv0 is the base58
+    encoding of that multihash.
+
+    Returns ``None`` if bytecode is missing, malformed, or only contains a
+    Swarm hash (bzzr0 / bzzr1) instead of IPFS.
     """
     if not bytecode or len(bytecode) < 4:
         return None
-    
-    # Remove 0x prefix
-    if bytecode.startswith("0x"):
-        bytecode = bytecode[2:]
-    
-    # Solidity appends metadata length as last 2 bytes
-    # Metadata starts with 0xa264 or similar CBOR marker
+
+    # Reuse the canonical implementation from download_contract to avoid
+    # drift between two slightly-different IPFS extractors.
+    from download_contract import ipfs_cid_from_multihash
+
     try:
-        # Look for IPFS marker in CBOR
-        # Pattern: a2 65 62 7a 7a 72 30 58 22 (bzzr0 or ipfs)
-        # Simpler: look for QmXXX pattern after decoding
-        
-        # Try to find 'ipfs' in the hex
-        ipfs_marker = bytecode.find("697066735822")  # "ipfs" + 0x58 0x22 (32 bytes)
-        if ipfs_marker != -1:
-            # Extract 32 bytes CID hash after marker
-            start = ipfs_marker + 12  # Skip marker
-            cid_bytes = bytecode[start:start + 64]  # 32 bytes = 64 hex chars
-            if len(cid_bytes) == 64:
-                # Convert to CIDv0 (Qm...)
-                # This is simplified; real implementation needs multihash parsing
-                import hashlib
-                # For now, return raw hash (not proper CID conversion)
-                return f"bafybe{cid_bytes[:32]}"  # Placeholder
-        
-        # Try bzzr1 (Swarm)
-        bzzr1_marker = bytecode.find("627a7a7231")  # "bzzr1"
-        if bzzr1_marker != -1:
-            return None  # Swarm, not IPFS
-        
+        import cbor2  # local import: data_sources stays import-safe even if cbor2 missing
+    except ImportError:
+        _log.debug("cbor2 not installed; cannot parse bytecode metadata")
+        return None
+
+    hex_str = bytecode[2:] if bytecode.startswith("0x") else bytecode
+    try:
+        raw = bytes.fromhex(hex_str)
+    except ValueError:
+        return None
+
+    if len(raw) < 4:
+        return None
+
+    metadata_length = int.from_bytes(raw[-2:], "big")
+    if metadata_length <= 0 or metadata_length + 2 > len(raw):
+        return None
+
+    blob = raw[-(2 + metadata_length) : -2]
+    try:
+        decoded = cbor2.loads(blob)
     except Exception:
-        pass
-    
+        return None
+
+    if not isinstance(decoded, dict):
+        return None
+
+    ipfs_val = decoded.get("ipfs")
+    if isinstance(ipfs_val, (bytes, bytearray)):
+        return ipfs_cid_from_multihash(bytes(ipfs_val))
+    if isinstance(ipfs_val, str) and ipfs_val:
+        return ipfs_val
+
+    # Swarm-only metadata — caller should fall back to other sources.
     return None
 
 
@@ -222,7 +238,7 @@ async def fetch_contracts_from_blocks(
     Returns list of {address, bytecode, block_number, tx_hash}.
     """
     contracts: list[dict] = []
-    
+
     for block_num in range(start_block, end_block + 1):
         # Get block with transactions
         payload = {
@@ -231,15 +247,15 @@ async def fetch_contracts_from_blocks(
             "params": [hex(block_num), True],
             "id": 1,
         }
-        
+
         try:
             resp = await client.post(rpc_url, json=payload, timeout=30.0)
             data = resp.json()
             block = data.get("result")
-            
+
             if not block:
                 continue
-            
+
             for tx in block.get("transactions", []):
                 # Contract creation: to is None/null
                 if tx.get("to") is None:
@@ -250,27 +266,29 @@ async def fetch_contracts_from_blocks(
                         "params": [tx["hash"]],
                         "id": 2,
                     }
-                    
+
                     receipt_resp = await client.post(rpc_url, json=receipt_payload, timeout=30.0)
                     receipt_data = receipt_resp.json()
                     receipt = receipt_data.get("result", {})
-                    
+
                     contract_address = receipt.get("contractAddress")
                     if contract_address:
-                        contracts.append({
-                            "address": contract_address.lower(),
-                            "bytecode": tx.get("input", ""),
-                            "block_number": block_num,
-                            "tx_hash": tx["hash"],
-                        })
-        
+                        contracts.append(
+                            {
+                                "address": contract_address.lower(),
+                                "bytecode": tx.get("input", ""),
+                                "block_number": block_num,
+                                "tx_hash": tx["hash"],
+                            }
+                        )
+
         except Exception as e:
-            print(f"  Block {block_num} error: {e}")
+            _log.warning("  Block %s error: %s", block_num, e)
             continue
-        
+
         if block_num % 100 == 0:
-            print(f"  Scanned block {block_num}, found {len(contracts)} contracts")
-    
+            _log.info("  Scanned block %s, found %d contracts", block_num, len(contracts))
+
     return contracts
 
 
@@ -291,7 +309,7 @@ async def fetch_contracts_from_bigquery(
 ) -> list[dict]:
     """
     Fetch contract addresses from Google BigQuery public datasets.
-    
+
     Requires:
         pip install google-cloud-bigquery
         GOOGLE_APPLICATION_CREDENTIALS env var or gcloud auth
@@ -299,16 +317,16 @@ async def fetch_contracts_from_bigquery(
     try:
         from google.cloud import bigquery
     except ImportError:
-        print("  BigQuery not available. Install: pip install google-cloud-bigquery")
+        _log.warning("  BigQuery not available. Install: pip install google-cloud-bigquery")
         return []
-    
+
     dataset = BIGQUERY_DATASETS.get(chain_id)
     if not dataset:
-        print(f"  No BigQuery dataset for chain {chain_id}")
+        _log.warning("  No BigQuery dataset for chain %s", chain_id)
         return []
-    
+
     client = bigquery.Client()
-    
+
     query = f"""
     SELECT 
         address,
@@ -320,30 +338,33 @@ async def fetch_contracts_from_bigquery(
     ORDER BY block_timestamp DESC
     LIMIT {max_results}
     """
-    
+
     try:
         query_job = client.query(query)
         results = query_job.result()
-        
+
         contracts = []
         for row in results:
-            contracts.append({
-                "address": row.address.lower() if row.address else "",
-                "bytecode": row.bytecode or "",
-                "block_number": row.block_number,
-                "timestamp": row.block_timestamp.isoformat() if row.block_timestamp else None,
-            })
-        
+            contracts.append(
+                {
+                    "address": row.address.lower() if row.address else "",
+                    "bytecode": row.bytecode or "",
+                    "block_number": row.block_number,
+                    "timestamp": row.block_timestamp.isoformat() if row.block_timestamp else None,
+                }
+            )
+
         return contracts
-        
+
     except Exception as e:
-        print(f"  BigQuery error: {e}")
+        _log.warning("  BigQuery error: %s", e)
         return []
 
 
 # ============================================================================
 # Unified Interface
 # ============================================================================
+
 
 @dataclass
 class DataSourceConfig:
@@ -356,7 +377,7 @@ class MultiSourceCrawler:
     """
     Crawler that uses multiple data sources with fallback.
     """
-    
+
     def __init__(
         self,
         sources: list[str] | None = None,
@@ -365,7 +386,7 @@ class MultiSourceCrawler:
         # Default source order: sourcify -> blockscout -> explorer
         self.sources = sources or ["sourcify", "blockscout", "explorer"]
         self.rpc_url = rpc_url or os.getenv("RPC_URL")
-    
+
     async def get_verified_contracts(
         self,
         chain_id: int,
@@ -375,35 +396,32 @@ class MultiSourceCrawler:
     ) -> list[str]:
         """Get verified contract addresses from multiple sources."""
         all_addresses: set[str] = set()
-        
+
         for source in self.sources:
             if source == "sourcify":
                 # Import from contract_crawler
-                from contract_crawler import fetch_sourcify_verified_contracts, AsyncRateLimiter
+                from contract_crawler import AsyncRateLimiter, fetch_sourcify_verified_contracts
+
                 rate_limiter = AsyncRateLimiter(3.0)
-                addrs = await fetch_sourcify_verified_contracts(
-                    chain_id, client, rate_limiter, min_date
-                )
+                addrs = await fetch_sourcify_verified_contracts(chain_id, client, rate_limiter, min_date)
                 all_addresses.update(addrs)
-                print(f"  Sourcify: {len(addrs)} contracts")
-                
+                _log.info("  Sourcify: %d contracts", len(addrs))
+
             elif source == "blockscout":
-                addrs = await fetch_blockscout_verified_contracts(
-                    chain_id, client, min_date, max_results
-                )
+                addrs = await fetch_blockscout_verified_contracts(chain_id, client, min_date, max_results)
                 all_addresses.update(addrs)
-                print(f"  Blockscout: {len(addrs)} contracts")
-                
+                _log.info("  Blockscout: %d contracts", len(addrs))
+
             elif source == "bigquery":
                 days = 365 if not min_date else (datetime.now() - min_date).days
                 contracts = await asyncio.get_event_loop().run_in_executor(
                     None, fetch_contracts_from_bigquery, chain_id, days, max_results
                 )
                 all_addresses.update(c["address"] for c in contracts)
-                print(f"  BigQuery: {len(contracts)} contracts")
-        
+                _log.info("  BigQuery: %d contracts", len(contracts))
+
         return list(all_addresses)[:max_results]
-    
+
     async def get_source_code(
         self,
         chain_id: int,
@@ -411,33 +429,29 @@ class MultiSourceCrawler:
         client: httpx.AsyncClient,
     ) -> tuple[dict[str, str], dict | None]:
         """Get source code from multiple sources with fallback."""
-        
+
         for source in self.sources:
             sources: dict[str, str] = {}
             metadata: dict | None = None
-            
+
             if source == "sourcify":
-                from contract_crawler import fetch_sourcify_source, AsyncRateLimiter
+                from contract_crawler import AsyncRateLimiter, fetch_sourcify_source
+
                 rate_limiter = AsyncRateLimiter(3.0)
-                sources, metadata = await fetch_sourcify_source(
-                    chain_id, address, client, rate_limiter
-                )
-                
+                sources, metadata = await fetch_sourcify_source(chain_id, address, client, rate_limiter)
+
             elif source == "blockscout":
-                sources, metadata = await fetch_blockscout_source(
-                    chain_id, address, client
-                )
-                
+                sources, metadata = await fetch_blockscout_source(chain_id, address, client)
+
             elif source == "explorer":
-                from contract_crawler import fetch_explorer_source, get_chain_by_id, AsyncRateLimiter
+                from contract_crawler import AsyncRateLimiter, fetch_explorer_source, get_chain_by_id
+
                 chain = get_chain_by_id(chain_id)
                 if chain:
                     rate_limiter = AsyncRateLimiter(3.0)
-                    sources, metadata = await fetch_explorer_source(
-                        chain, address, client, rate_limiter
-                    )
-            
+                    sources, metadata = await fetch_explorer_source(chain, address, client, rate_limiter)
+
             if sources:
                 return sources, metadata
-        
+
         return {}, None

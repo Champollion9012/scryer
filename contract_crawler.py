@@ -2,6 +2,7 @@
 Multi-chain Smart Contract Crawler.
 Fetches verified contracts from the past year across EVM-compatible chains.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -12,15 +13,19 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
 
 import httpx
 
+import scryer_http
 from contract_registry import ContractRegistry
+from scryer_logging import get_logger
+
+_log = get_logger(__name__)
 
 # ============================================================================
 # Chain Configuration
 # ============================================================================
+
 
 @dataclass
 class ChainConfig:
@@ -54,12 +59,13 @@ def get_chain_by_id(chain_id: int) -> ChainConfig | None:
 # Rate Limiter
 # ============================================================================
 
+
 class AsyncRateLimiter:
     def __init__(self, requests_per_second: float = 3.0):
         self.min_interval = 1.0 / requests_per_second
         self._lock = asyncio.Lock()
         self._last_request = 0.0
-    
+
     async def wait(self):
         async with self._lock:
             now = time.time()
@@ -87,31 +93,31 @@ async def fetch_sourcify_verified_contracts(
     after_match_id: str | None = None
     limit = 200
     page = 0
-    
+
     while True:
         await rate_limiter.wait()
-        
+
         # Sourcify APIv2 endpoint
         url = f"{SOURCIFY_API}/v2/contracts/{chain_id}?limit={limit}&sort=desc"
         if after_match_id:
             url += f"&afterMatchId={after_match_id}"
-        
+
         try:
             resp = await client.get(url, timeout=30.0)
             if resp.status_code != 200:
-                print(f"  Sourcify API error: {resp.status_code}")
+                _log.warning("  Sourcify API error: %s", resp.status_code)
                 break
-            
+
             data = resp.json()
             results = data.get("results", [])
-            
+
             if not results:
                 break
-            
+
             for contract in results:
                 addr = contract.get("address", "")
                 verified_at = contract.get("verifiedAt", "")
-                
+
                 # Filter by date if specified
                 if min_date and verified_at:
                     try:
@@ -121,22 +127,22 @@ async def fetch_sourcify_verified_contracts(
                             return addresses
                     except:
                         pass
-                
+
                 if addr:
                     addresses.append(addr.lower())
                     after_match_id = contract.get("matchId")
-            
+
             page += 1
-            print(f"  Sourcify page {page}: {len(results)} contracts (total: {len(addresses)})")
-            
+            _log.info("  Sourcify page %d: %d contracts (total: %d)", page, len(results), len(addresses))
+
             # Safety limit
             if page > 500 or len(addresses) >= 100000:
                 break
-                
+
         except Exception as e:
-            print(f"  Sourcify error: {e}")
+            _log.warning("  Sourcify error: %s", e)
             break
-    
+
     return addresses
 
 
@@ -148,7 +154,7 @@ async def fetch_sourcify_source(
 ) -> tuple[dict[str, str], dict | None]:
     """Fetch contract source files from Sourcify APIv2."""
     await rate_limiter.wait()
-    
+
     # Sourcify APIv2: Get contract details including source files
     url = f"{SOURCIFY_API}/v2/contract/{chain_id}/{address}?fields=sources"
     try:
@@ -157,10 +163,10 @@ async def fetch_sourcify_source(
             data = resp.json()
             sources: dict[str, str] = {}
             metadata: dict | None = None
-            
+
             # v2 API returns sources in different format
             source_data = data.get("sources") or data.get("sourceFiles") or {}
-            
+
             if isinstance(source_data, dict):
                 for path, content in source_data.items():
                     if isinstance(content, str):
@@ -170,7 +176,7 @@ async def fetch_sourcify_source(
                         src = content.get("content", "")
                         if path.endswith(".sol") and src:
                             sources[path] = src
-            
+
             # Try to get metadata
             meta = data.get("metadata")
             if meta and isinstance(meta, dict):
@@ -178,19 +184,20 @@ async def fetch_sourcify_source(
                     "ContractName": data.get("name") or meta.get("settings", {}).get("compilationTarget", {}),
                     "CompilerVersion": meta.get("compiler", {}).get("version"),
                 }
-            
+
             if sources:
                 return sources, metadata
-    except Exception as e:
+    except Exception:
         # Silent fail, will try fallback
         pass
-    
+
     return {}, None
 
 
 # ============================================================================
 # Etherscan-like API
 # ============================================================================
+
 
 async def fetch_explorer_recent_contracts(
     chain: ChainConfig,
@@ -205,19 +212,19 @@ async def fetch_explorer_recent_contracts(
     """
     if not chain.explorer_api:
         return []
-    
+
     api_key = os.getenv(chain.explorer_api_key_env or "", "")
     if not api_key:
-        print(f"  Warning: No API key for {chain.name}, skipping explorer API")
+        _log.warning("  No API key for %s, skipping explorer API", chain.name)
         return []
-    
+
     contracts: list[dict] = []
     page = 1
-    
+
     # Note: Most Etherscan APIs don't have a "list all verified contracts" endpoint
     # We'll use the "get verified source code" for known addresses instead
     # This is a limitation - need contract addresses from somewhere else
-    
+
     return contracts
 
 
@@ -230,37 +237,37 @@ async def fetch_explorer_source(
     """Fetch contract source from Etherscan-like explorer."""
     if not chain.explorer_api:
         return {}, None
-    
+
     api_key = os.getenv(chain.explorer_api_key_env or "", "")
     if not api_key:
         return {}, None
-    
+
     await rate_limiter.wait()
-    
+
     url = f"{chain.explorer_api}?module=contract&action=getsourcecode&address={address}&apikey={api_key}"
-    
+
     try:
         resp = await client.get(url, timeout=30.0)
         if resp.status_code != 200:
             return {}, None
-        
+
         data = resp.json()
         if data.get("status") != "1":
             return {}, None
-        
+
         result = data.get("result", [])
         if not result or not isinstance(result, list):
             return {}, None
-        
+
         item = result[0]
         source_code = item.get("SourceCode", "")
         contract_name = item.get("ContractName", "Contract")
-        
+
         if not source_code:
             return {}, None
-        
+
         sources: dict[str, str] = {}
-        
+
         # Handle multi-file format (starts with {{ or {)
         if source_code.startswith("{{"):
             # Double-brace format: {{sources: {...}}}
@@ -285,7 +292,7 @@ async def fetch_explorer_source(
         else:
             # Plain source code
             sources[f"{contract_name}.sol"] = source_code
-        
+
         metadata = {
             "ContractName": item.get("ContractName"),
             "CompilerVersion": item.get("CompilerVersion"),
@@ -293,17 +300,18 @@ async def fetch_explorer_source(
             "Runs": item.get("Runs"),
             "EVMVersion": item.get("EVMVersion"),
         }
-        
+
         return sources, metadata
-        
+
     except Exception as e:
-        print(f"    Explorer error for {address}: {e}")
+        _log.warning("    Explorer error for %s: %s", address, e)
         return {}, None
 
 
 # ============================================================================
 # Contract Storage
 # ============================================================================
+
 
 def save_contract(
     chain_id: int,
@@ -316,20 +324,20 @@ def save_contract(
     addr_lower = address.lower()
     contract_dir = output_dir / f"{chain_id}_{addr_lower}"
     contract_dir.mkdir(parents=True, exist_ok=True)
-    
+
     for filename, content in sources.items():
         # Flatten path for simplicity
         safe_name = filename.replace("/", "_").replace("\\", "_")
         if safe_name.startswith("_"):
             safe_name = safe_name[1:]
-        
+
         file_path = contract_dir / safe_name
         file_path.write_text(content, encoding="utf-8")
-    
+
     if metadata:
         meta_path = contract_dir / "metadata.json"
         meta_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-    
+
     return contract_dir
 
 
@@ -342,6 +350,7 @@ def compute_bytecode_hash(sources: dict[str, str]) -> str:
 # ============================================================================
 # Main Crawler
 # ============================================================================
+
 
 class ContractCrawler:
     def __init__(
@@ -373,30 +382,26 @@ class ContractCrawler:
             "from_sourcify": 0,
             "from_explorer": 0,
         }
-    
+
     async def crawl_chain(self, chain_id: int, client: httpx.AsyncClient) -> int:
         """Crawl a single chain."""
         chain = get_chain_by_id(chain_id)
         if not chain:
-            print(f"Unknown chain ID: {chain_id}")
+            _log.error("Unknown chain ID: %s", chain_id)
             return 0
-        
-        print(f"\n{'='*60}")
-        print(f"Crawling {chain.name} (chain_id={chain_id})")
-        print(f"{'='*60}")
-        
+
+        _log.info("Crawling %s (chain_id=%s)", chain.name, chain_id)
+
         saved_count = 0
-        
+
         # Step 1: Get verified contract addresses from Sourcify
-        print(f"\nFetching verified contracts from Sourcify...")
-        addresses = await fetch_sourcify_verified_contracts(
-            chain_id, client, self.rate_limiter, self.min_date
-        )
-        print(f"Found {len(addresses)} verified contracts on Sourcify")
-        
+        _log.info("Fetching verified contracts from Sourcify...")
+        addresses = await fetch_sourcify_verified_contracts(chain_id, client, self.rate_limiter, self.min_date)
+        _log.info("Found %d verified contracts on Sourcify", len(addresses))
+
         # Limit per chain
-        addresses = addresses[:self.max_per_chain]
-        
+        addresses = addresses[: self.max_per_chain]
+
         # Resume support: filter out already crawled addresses
         already_crawled = self.registry.get_crawled_addresses(chain_id)
         if already_crawled:
@@ -404,66 +409,61 @@ class ContractCrawler:
             addresses = [a for a in addresses if a.lower() not in already_crawled]
             skipped = original_count - len(addresses)
             if skipped > 0:
-                print(f"  Resuming: skipped {skipped} already-crawled contracts")
-        
+                _log.info("  Resuming: skipped %d already-crawled contracts", skipped)
+
         if not addresses:
-            print(f"  All contracts already crawled!")
+            _log.info("  All contracts already crawled!")
             return 0
-        
+
         # Step 2: Fetch source code in parallel with semaphore
-        print(f"\nFetching {len(addresses)} contracts (concurrency={self.concurrency})...")
+        _log.info("Fetching %d contracts (concurrency=%d)...", len(addresses), self.concurrency)
         semaphore = asyncio.Semaphore(self.concurrency)
-        
+
         async def fetch_one(addr: str) -> tuple[str, dict[str, str], dict | None, str]:
             async with semaphore:
                 # Try Sourcify first
-                sources, metadata = await fetch_sourcify_source(
-                    chain_id, addr, client, self.rate_limiter
-                )
+                sources, metadata = await fetch_sourcify_source(chain_id, addr, client, self.rate_limiter)
                 source_origin = "sourcify"
                 # Fallback to Explorer
                 if not sources and chain.explorer_api:
-                    sources, metadata = await fetch_explorer_source(
-                        chain, addr, client, self.rate_limiter
-                    )
+                    sources, metadata = await fetch_explorer_source(chain, addr, client, self.rate_limiter)
                     source_origin = "explorer"
                 return addr, sources, metadata, source_origin
-        
+
         # Parallel fetch all contracts
         results = await asyncio.gather(*[fetch_one(addr) for addr in addresses], return_exceptions=True)
 
-        
         # Process results
         for i, result in enumerate(results):
             if i > 0 and i % 100 == 0:
-                print(f"  Progress: {i}/{len(addresses)} ({saved_count} saved)")
-            
+                _log.info("  Progress: %d/%d (%d saved)", i, len(addresses), saved_count)
+
             if isinstance(result, Exception):
                 async with self._lock:
                     self.stats["errors"] += 1
                 continue
-            
+
             addr, sources, metadata, source_origin = result
-            
+
             if not sources:
                 async with self._lock:
                     self.stats["errors"] += 1
                 continue
-            
+
             async with self._lock:
                 self.stats["total_fetched"] += 1
                 if source_origin == "sourcify":
                     self.stats["from_sourcify"] += 1
                 else:
                     self.stats["from_explorer"] += 1
-            
+
             # Get metadata info
             contract_name = None
             compiler_version = None
             if metadata:
                 contract_name = metadata.get("ContractName")
                 compiler_version = metadata.get("CompilerVersion")
-            
+
             # Register in registry (stores hash → address mapping)
             src_hash = self.registry.register_contract(
                 chain_id=chain_id,
@@ -472,16 +472,16 @@ class ContractCrawler:
                 contract_name=contract_name,
                 compiler_version=compiler_version,
             )
-            
+
             async with self._lock:
                 self.stats["total_registered"] += 1
-                
+
                 # Only save source files if hash is new (dedupe disk storage)
                 if src_hash in self.seen_hashes:
                     self.stats["duplicates_source_skipped"] += 1
                     continue
                 self.seen_hashes.add(src_hash)
-            
+
             # Save source files to disk
             try:
                 save_contract(chain_id, addr, sources, metadata, self.output_dir)
@@ -489,36 +489,33 @@ class ContractCrawler:
                     saved_count += 1
                     self.stats["total_saved"] += 1
             except Exception as e:
-                print(f"    Error saving {addr}: {e}")
+                _log.warning("    Error saving %s: %s", addr, e)
                 async with self._lock:
                     self.stats["errors"] += 1
-        
-        print(f"\n{chain.name}: Saved {saved_count} unique contracts")
+
+        _log.info("%s: Saved %d unique contracts", chain.name, saved_count)
         return saved_count
-    
+
     async def crawl_all(self) -> dict:
         """Crawl all configured chains."""
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        
-        print(f"Contract Crawler")
-        print(f"================")
+
+        print("Contract Crawler")
+        print("================")
         print(f"Output: {self.output_dir}")
         print(f"Chains: {self.chain_ids}")
         print(f"Date range: {self.min_date.date()} to now")
         print(f"Max per chain: {self.max_per_chain}")
         print(f"Concurrency: {self.concurrency}")
-        
-        async with httpx.AsyncClient() as client:
+
+        async with scryer_http.async_client() as client:
             # Parallel chain crawling
-            tasks = [
-                self.crawl_chain(chain_id, client)
-                for chain_id in self.chain_ids
-            ]
+            tasks = [self.crawl_chain(chain_id, client) for chain_id in self.chain_ids]
             await asyncio.gather(*tasks, return_exceptions=True)
-        
-        print(f"\n{'='*60}")
-        print(f"Crawl Complete!")
-        print(f"{'='*60}")
+
+        print(f"\n{'=' * 60}")
+        print("Crawl Complete!")
+        print(f"{'=' * 60}")
         print(f"Total fetched: {self.stats['total_fetched']}")
         print(f"  - From Sourcify: {self.stats['from_sourcify']}")
         print(f"  - From Explorer: {self.stats['from_explorer']}")
@@ -527,7 +524,7 @@ class ContractCrawler:
         print(f"Duplicates (source skipped): {self.stats['duplicates_source_skipped']}")
         print(f"Errors: {self.stats['errors']}")
         print(f"\nRegistry stats: {self.registry.stats()}")
-        
+
         return self.stats
 
 
@@ -535,9 +532,10 @@ class ContractCrawler:
 # CLI
 # ============================================================================
 
+
 async def main_async():
     import argparse
-    
+
     parser = argparse.ArgumentParser(description="Multi-chain Contract Crawler")
     parser.add_argument("--output-dir", default="sources", help="Output directory")
     parser.add_argument("--chains", type=str, default="", help="Comma-separated chain IDs (default: all)")
@@ -546,20 +544,20 @@ async def main_async():
     parser.add_argument("--rps", type=float, default=3.0, help="Requests per second")
     parser.add_argument("--concurrency", type=int, default=10, help="Parallel fetch concurrency")
     parser.add_argument(
-        "--sources", 
-        type=str, 
+        "--sources",
+        type=str,
         default="sourcify,blockscout,explorer",
-        help="Data sources (comma-separated): sourcify,blockscout,explorer,bigquery"
+        help="Data sources (comma-separated): sourcify,blockscout,explorer,bigquery",
     )
-    
+
     args = parser.parse_args()
-    
+
     chain_ids = None
     if args.chains:
         chain_ids = [int(x.strip()) for x in args.chains.split(",")]
-    
+
     sources = [s.strip() for s in args.sources.split(",")]
-    
+
     crawler = ContractCrawler(
         output_dir=Path(args.output_dir),
         chains=chain_ids,
@@ -568,14 +566,14 @@ async def main_async():
         requests_per_second=args.rps,
         concurrency=args.concurrency,
     )
-    
+
     # Use multi-source if requested
     if "blockscout" in sources or "bigquery" in sources:
         from data_sources import MultiSourceCrawler
-        crawler.multi_source = MultiSourceCrawler(sources=sources)
-    
-    await crawler.crawl_all()
 
+        crawler.multi_source = MultiSourceCrawler(sources=sources)
+
+    await crawler.crawl_all()
 
 
 def main():
