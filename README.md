@@ -13,16 +13,17 @@ Pulls verified source from 8 EVM chains, falls back to bytecode decompilation wh
 | Stage | Module | Notes |
 |-------|--------|-------|
 | **Download** | [`download_contract.py`](download_contract.py) | Sourcify → Blockscout → Etherscan-like → IPFS metadata. EIP-1967 / EIP-1167 proxy resolution. |
-| **Crawl** | [`contract_crawler.py`](contract_crawler.py) | Bulk verified-contract crawl across 8 chains, async + rate-limited. |
-| **Discover** | [`rpc_contract_discovery.py`](rpc_contract_discovery.py) | RPC block scanner. Pulls source if available, decompiles bytecode otherwise. |
+| **Crawl** | [`contract_crawler.py`](contract_crawler.py) | Bulk verified-contract crawl across 8 chains, async + rate-limited; atomic claim-based resume so multiple workers don't double-fetch. |
+| **Discover** | [`rpc_contract_discovery.py`](rpc_contract_discovery.py) | RPC block scanner. Pulls source if available, decompiles bytecode otherwise. TTY-aware progress (live `\r` on terminals, ~5% steps via logger off-tty). |
 | **Decompile** | [`decompilers.py`](decompilers.py) | Heimdall-rs (via WSL on Windows) + Panoramix fallback. |
 | **Index** | [`contract_registry.py`](contract_registry.py) | SQLite registry keyed by source hash → fast clone discovery across chains. |
-| **Audit** | [`audit_contracts.py`](audit_contracts.py) + [`llm_providers.py`](llm_providers.py) | OpenAI / Claude / Gemini, JSON-mode prompts, map-reduce for huge codebases. |
-| **Scan** | [`scanners.py`](scanners.py) | Curated regex rules (SWC-aligned) + optional Slither. |
-| **Compare** | [`similarity.py`](similarity.py) + [`similarity_cli.py`](similarity_cli.py) | GraphCodeBERT embeddings + ChromaDB vector store. |
+| **Audit** | [`audit_contracts.py`](audit_contracts.py) + [`llm_providers.py`](llm_providers.py) | OpenAI / Claude / Gemini, JSON-mode prompts, map-reduce for huge codebases, parallel `--concurrency`, `--stream` for live token deltas, smart retry classification (4xx bail · 429 honours `Retry-After` · 5xx exp-backoff), and content-hash cache that skips re-audits across runs. |
+| **Scan** | [`scanners.py`](scanners.py) | Curated regex rules (SWC-aligned), pluggable via `RegexRule.from_dict` + `load_rules_from_file`; optional Slither + Mythril + `forge test`. |
+| **Compare** | [`similarity.py`](similarity.py) + [`similarity_cli.py`](similarity_cli.py) | GraphCodeBERT embeddings (length-weighted chunk averaging) + ChromaDB vector store. |
 | **Pipeline** | [`bounty_pipeline.py`](bounty_pipeline.py) | One-shot download + audit driven by a target JSON. |
-| **Browse** | [`web.py`](web.py) | Local Flask dashboard over the registry. |
+| **Browse** | [`web.py`](web.py) + [`templates/`](templates/) | Local Flask dashboard over the registry; Jinja templates extend `base.html`; debug gated by `FLASK_DEBUG` env. |
 | **Reproduce** | [`tests/`](tests/) | Foundry forks + PoC templates (e.g. MARS staking sync drain). |
+| **Test** | [`tests/python/`](tests/python/) | 159 offline pytest cases over the whole pipeline (audit / cache / scanners / similarity / web routes / bounty pipeline / IPFS extraction). |
 
 ## Architecture
 
@@ -32,44 +33,66 @@ flowchart TB
         Sourcify[(Sourcify)]
         Blockscout[(Blockscout)]
         Etherscan[(Etherscan-like)]
-        IPFS[(IPFS Metadata)]
+        IPFS[(IPFS · CBOR multihash)]
         RPC[(Chain RPC)]
+        BQ[(BigQuery)]
+    end
+
+    subgraph Infra["🛠 Shared infra · scryer_*"]
+        Cfg[scryer_config<br/>idempotent .env]
+        Log[scryer_logging<br/>plain · json · file]
+        HTTP[scryer_http<br/>retries · SOCKS]
     end
 
     subgraph Acquire["📥 Acquire"]
-        Downloader[download_contract.py]
-        Crawler[contract_crawler.py]
-        RPCDiscover[rpc_contract_discovery.py]
-        Decompiler[decompilers.py]
+        Downloader[download_contract.py<br/>EIP-1967 / 1167 proxy]
+        Crawler["contract_crawler.py<br/>atomic claim · resume"]
+        RPCDiscover["rpc_contract_discovery.py<br/>TTY-aware progress"]
+        Decompiler["decompilers.py<br/>Heimdall · Panoramix"]
     end
 
     subgraph Store["🗄️ Store"]
         SrcDir[sources/]
-        Registry[(contract_registry.db)]
-        VectorDB[(.similarity_db / ChromaDB)]
+        Registry[(contract_registry.db<br/>+ scanned_blocks · vuln_tags)]
+        VectorDB[(.similarity_db<br/>ChromaDB · GraphCodeBERT)]
+        AuditCache[(.audit_cache.db<br/>incremental re-audit)]
     end
 
     subgraph Analyze["🔬 Analyze"]
-        Audit[audit_contracts.py<br/>OpenAI · Claude · Gemini]
-        Sim[similarity.py<br/>GraphCodeBERT]
-        Scan[scanners.py<br/>regex + Slither]
+        Audit["audit_contracts.py<br/>OpenAI · Claude · Gemini<br/>concurrency · streaming · cache"]
+        Sim["similarity.py<br/>length-weighted chunks"]
+        Scan["scanners.py<br/>pluggable regex registry · Slither · Mythril"]
+        Render["report_renderer.py<br/>Markdown → styled HTML"]
     end
 
     subgraph Output["📊 Output"]
         Reports[audit_reports/]
-        WebUI[web.py · Flask]
+        WebUI["web.py · Flask<br/>Jinja templates · debug gated"]
         Foundry[tests/*.t.sol]
     end
 
+    subgraph Tests["🧪 Tests · CI"]
+        Pyt["tests/python/<br/>159 offline tests"]
+    end
+
     Sources --> Acquire
+    Acquire -.uses.-> Infra
+    Analyze -.uses.-> Infra
+    WebUI -.uses.-> Infra
     Acquire --> SrcDir
     Acquire --> Registry
     Decompiler -->|bytecode-only| SrcDir
     SrcDir --> Analyze
-    Audit --> Reports
+    Audit <-->|cache hit / set| AuditCache
+    Audit --> Render
+    Render --> Reports
     Sim --> VectorDB
     Registry --> WebUI
+    VectorDB --> WebUI
     SrcDir --> Foundry
+    Pyt -. covers .-> Acquire
+    Pyt -. covers .-> Analyze
+    Pyt -. covers .-> WebUI
 ```
 
 ---
