@@ -10,6 +10,7 @@ Optimized version with:
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
 import re
@@ -138,9 +139,7 @@ def normalize_solidity_code(code: str) -> str:
 
     # Normalize whitespace
     code = re.sub(r"\s+", " ", code)
-    code = code.strip()
-
-    return code
+    return code.strip()
 
 
 def normalize_with_var_rename(code: str) -> str:
@@ -175,8 +174,7 @@ def normalize_with_var_rename(code: str) -> str:
 
         return var_map[name]
 
-    normalized = identifier_pattern.sub(replace_identifier, code)
-    return normalized
+    return identifier_pattern.sub(replace_identifier, code)
 
 
 def compute_normalized_hash(code: str, aggressive: bool = False) -> str:
@@ -205,7 +203,7 @@ def extract_functions(code: str) -> list[tuple[str, str]]:
 
     matches = list(func_pattern.finditer(code))
 
-    for i, match in enumerate(matches):
+    for _i, match in enumerate(matches):
         func_name = match.group(2)
         start = match.start()
 
@@ -254,7 +252,7 @@ def chunk_solidity_code(code: str, max_chars: int = 8000) -> list[str]:
     current_chunk = []
     current_len = 0
 
-    for func_name, func_code in functions:
+    for _func_name, func_code in functions:
         func_len = len(func_code)
 
         if current_len + func_len > max_chars and current_chunk:
@@ -306,31 +304,34 @@ def get_embedding_model(model_name: str = DEFAULT_MODEL, device: str = "auto"):
             _log.info("Model loaded successfully.")
             return _model
 
-        except ImportError:
-            raise ImportError("sentence-transformers not installed. Run: pip install sentence-transformers")
+        except ImportError as e:
+            raise ImportError("sentence-transformers not installed. Run: pip install sentence-transformers") from e
 
 
 def generate_embedding(code: str, model: Any = None) -> list[float]:
-    """Generate embedding vector for code."""
+    """Generate embedding vector for code.
+
+    For code over ~8K chars we chunk by function boundaries and combine the
+    chunk embeddings with a *length-weighted* average. A naive arithmetic
+    mean lets a 10-line helper drag the centroid as much as a 500-line core
+    contract; weighting by chunk length keeps the embedding representative
+    of where the bulk of the code lives.
+    """
     if model is None:
         model = get_embedding_model()
 
-    # Normalize before embedding
     normalized = normalize_solidity_code(code)
 
-    # Use function-level chunking for large code
     if len(normalized) > 8000:
         chunks = chunk_solidity_code(normalized, max_chars=8000)
-        # Average embeddings from all chunks
-        embeddings = []
-        for chunk in chunks:
-            emb = model.encode(chunk, convert_to_numpy=True)
-            embeddings.append(emb)
+        embeddings = model.encode(chunks, convert_to_numpy=True)
 
         import numpy as np
 
-        avg_embedding = np.mean(embeddings, axis=0)
-        return avg_embedding.tolist()
+        weights = np.array([max(1, len(c)) for c in chunks], dtype=float)
+        weights /= weights.sum()
+        weighted = (embeddings * weights[:, None]).sum(axis=0)
+        return weighted.tolist()
 
     embedding = model.encode(normalized, convert_to_numpy=True)
     return embedding.tolist()
@@ -396,8 +397,8 @@ def get_chroma_client(persist_dir: str = ".similarity_db"):
             _chroma_client = chromadb.PersistentClient(path=persist_dir)
             return _chroma_client
 
-        except ImportError:
-            raise ImportError("chromadb not installed. Run: pip install chromadb")
+        except ImportError as e:
+            raise ImportError("chromadb not installed. Run: pip install chromadb") from e
 
 
 class SimilarityIndex:
@@ -537,10 +538,8 @@ class SimilarityIndex:
 
     def delete_contract(self, contract_id: str) -> None:
         """Delete a contract from the index."""
-        try:
+        with contextlib.suppress(Exception):
             self.collection.delete(ids=[contract_id])
-        except Exception:
-            pass
 
     def stats(self) -> dict:
         """Get index statistics."""

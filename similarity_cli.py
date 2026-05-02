@@ -20,8 +20,10 @@ import json
 import sys
 from pathlib import Path
 
+import scryer_config
 from scryer_logging import get_logger
 from similarity import (
+    DEFAULT_MODEL,
     SimilarityIndex,
     index_directory,
     search_similar_contracts,
@@ -118,12 +120,18 @@ def cmd_stats(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
+    scryer_config.load()
+
     parser = argparse.ArgumentParser(
         description="Solidity Code Similarity Search",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--db-path", default=".similarity_db", help="ChromaDB persist directory")
-    parser.add_argument("--model", default="microsoft/codebert-base", help="Embedding model name")
+    parser.add_argument(
+        "--model",
+        default=DEFAULT_MODEL,
+        help="Embedding model name (default: $SIMILARITY_MODEL or microsoft/graphcodebert-base)",
+    )
     parser.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"], help="Device for inference")
 
     subparsers = parser.add_subparsers(dest="command", required=True)
