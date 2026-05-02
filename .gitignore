@@ -27,6 +27,7 @@ decompiled/
 .similarity_db/
 .contract_registry.db
 contract_registry.db
+.audit_cache.db
 source.json
 
 # Foundry

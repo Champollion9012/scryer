@@ -7,6 +7,7 @@ from pathlib import Path
 
 from flask import Flask, jsonify, render_template, request
 
+import scryer_config
 from contract_registry import ContractRegistry
 from scryer_logging import get_logger
 
@@ -362,7 +363,13 @@ def api_export(format):
         from io import StringIO
 
         output = StringIO()
-        writer = csv.DictWriter(output, fieldnames=["chain_id", "address", "contract_name", "source_hash"])
+        # search_contracts returns extra fields (chain_name, compiler_version);
+        # extrasaction="ignore" drops them so we keep CSV columns stable.
+        writer = csv.DictWriter(
+            output,
+            fieldnames=["chain_id", "address", "contract_name", "source_hash"],
+            extrasaction="ignore",
+        )
         writer.writeheader()
         writer.writerows(rows)
         return (
@@ -396,10 +403,18 @@ def api_similarity():
 
 
 def main() -> None:
-    """CLI entry point for the Flask dashboard."""
-    _log.info("Starting Contract Registry Web Interface...")
-    _log.info("Open http://localhost:5000 in your browser")
-    app.run(debug=True, port=5000)
+    """CLI entry point for the Flask dashboard.
+
+    Debug mode is gated behind ``FLASK_DEBUG`` env var (default off).
+    Werkzeug's debugger exposes a PIN-protected REPL that has been the source
+    of real-world RCEs when accidentally left on in production.
+    """
+    scryer_config.load()
+    debug = scryer_config.get_bool("FLASK_DEBUG", False)
+    port = scryer_config.get_int("FLASK_PORT", 5000) or 5000
+    _log.info("Starting Contract Registry Web Interface (debug=%s)...", debug)
+    _log.info("Open http://localhost:%d in your browser", port)
+    app.run(debug=debug, port=port)
 
 
 if __name__ == "__main__":
