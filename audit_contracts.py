@@ -4,8 +4,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import datetime as dt
+import hashlib
 import json
 import os
+import random
 import re
 import threading
 import time
@@ -13,7 +15,10 @@ from collections.abc import Iterable
 from pathlib import Path
 from string import Template
 
+import httpx
+
 import scryer_config
+from cache import AuditCache
 from llm_providers import get_provider
 from report_renderer import render_markdown
 from scanners import run_regex_scan, run_slither
@@ -251,6 +256,36 @@ def load_prompt_template(prompt_path: Path) -> Template:
     return Template(read_text(prompt_path))
 
 
+def _classify_retry(exc: BaseException) -> tuple[bool, float | None]:
+    """Decide whether to retry an LLM call and how long to wait.
+
+    Returns ``(retryable, hint_seconds)``:
+
+    - 4xx (except 408 / 429): bail; the request is malformed or unauthenticated
+      and retrying just burns money.
+    - 408 (request timeout) and 429 (rate limit): retry; respect ``Retry-After``
+      header when present.
+    - 5xx and connection-level errors: retry with caller-supplied backoff.
+    - Anything else: retry by default — better to be slow than lose work.
+    """
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        if status in (408, 429):
+            ra = exc.response.headers.get("Retry-After")
+            try:
+                hint = float(ra) if ra is not None else None
+            except ValueError:
+                hint = None
+            return True, hint
+        if 400 <= status < 500:
+            return False, None
+        return True, None  # 5xx
+    if isinstance(exc, (httpx.RequestError, asyncio.TimeoutError, TimeoutError)):
+        return True, None
+    # Unknown exception class — retry with default backoff (preserves current behaviour).
+    return True, None
+
+
 def llm_chat_completion(
     provider,
     *,
@@ -270,6 +305,11 @@ def llm_chat_completion(
     (if provided) is called with each text delta for live progress feedback.
     Usage tokens are not returned by the stream — callers fall back to the
     rough estimator when ``usage`` is empty.
+
+    Errors are classified before retry: 4xx (other than 408/429) bail
+    immediately so a malformed request doesn't burn ``max_retries`` worth of
+    billable calls; 429 honours ``Retry-After``; 5xx and transport errors
+    use exponential backoff with jitter.
     """
     last_error: str | None = None
     for attempt in range(1, max_retries + 1):
@@ -311,7 +351,19 @@ def llm_chat_completion(
 
         except Exception as e:
             last_error = f"{type(e).__name__}: {e}"
-            time.sleep(min(2**attempt, 30))
+            retryable, hint = _classify_retry(e)
+            if not retryable:
+                raise RuntimeError(f"LLM API non-retryable error: {last_error}") from e
+            if attempt >= max_retries:
+                break
+            # Honour Retry-After when the server tells us to wait, otherwise
+            # exponential backoff with jitter to avoid thundering-herd retries
+            # when many groups race the same provider after a 5xx burst.
+            if hint is not None and hint > 0:
+                delay = min(hint, 60.0)
+            else:
+                delay = min(2**attempt + random.uniform(0, 1), 30.0)
+            time.sleep(delay)
 
     raise RuntimeError(f"LLM API failed after {max_retries} retries: {last_error}")
 
@@ -323,6 +375,23 @@ def _strip_code_fences(text: str) -> str:
         if len(lines) >= 3 and lines[0].startswith("```") and lines[-1].strip() == "```":
             return "\n".join(lines[1:-1]).strip()
     return s
+
+
+def make_audit_cache_key(files: list[Path], *, model: str, provider: str) -> str:
+    """Combine source-content hash with model+provider identity.
+
+    Reusing :meth:`AuditCache.compute_hash` alone would let a cache populated
+    with ``gpt-4.1-mini`` answers serve a ``claude-sonnet-4-6`` request — same
+    code, different model = different report. Re-hashing with the model name
+    pinned avoids that footgun.
+    """
+    h = hashlib.sha256()
+    h.update(AuditCache.compute_hash(files).encode())
+    h.update(b":")
+    h.update(model.encode())
+    h.update(b":")
+    h.update(provider.encode())
+    return h.hexdigest()
 
 
 def parse_json_response(text: str) -> dict:
@@ -492,6 +561,8 @@ def main() -> int:
     run_root = Path(args.run_dir) if args.run_dir else (out_root / run_id)
     groups_root = run_root / "groups"
 
+    audit_cache: AuditCache | None = None if args.no_cache else AuditCache()
+
     if args.dry_run:
         for key, files in groups.items():
             group_dir = groups_root / key
@@ -546,6 +617,53 @@ def main() -> int:
         if args.skip_existing and report_md_path.exists():
             _log.info("SKIP (exists): %s", report_md_path)
             return None
+
+        cache_key: str | None = None
+        if audit_cache is not None:
+            cache_key = make_audit_cache_key(files, model=args.model, provider=args.provider)
+            cached_report = audit_cache.get_cached(cache_key)
+            if cached_report is not None:
+                _log.info("CACHE HIT: %s -> %s", key, report_md_path)
+                generated_at = dt.datetime.now(dt.UTC).isoformat()
+                report_json_path.write_text(
+                    json.dumps(
+                        {
+                            "generated_at": generated_at,
+                            "model": args.model,
+                            "scope_key": key,
+                            "mode": "cache_hit",
+                            "calls": [],
+                            "report": cached_report,
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                header = [
+                    "# AI-Generated Smart Contract Audit Report",
+                    "",
+                    f"- Generated: {generated_at}",
+                    f"- Model: {args.model}",
+                    f"- Scope key: {key}",
+                    "- Mode: cache_hit",
+                    "",
+                    "---",
+                    "",
+                ]
+                report_md_path.write_text("\n".join(header) + render_markdown(cached_report), encoding="utf-8")
+                return {
+                    "key": key,
+                    "dir": group_dir.relative_to(run_root).as_posix(),
+                    "files": len(files),
+                    "mode": "cache_hit",
+                    "calls": 0,
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "cost_usd_est": 0.0 if cost_enabled else None,
+                    "report_md": report_md_path.relative_to(run_root).as_posix(),
+                }
 
         def _make_chunk_logger(group_key: str):
             """Build a callback that logs streamed token deltas at ~5KB intervals."""
@@ -757,6 +875,19 @@ def main() -> int:
             "",
         ]
         report_md_path.write_text("\n".join(header) + render_markdown(report_obj or {}), encoding="utf-8")
+
+        if audit_cache is not None and cache_key is not None and report_obj:
+            try:
+                audit_cache.set_cached(
+                    cache_key,
+                    report_obj,
+                    model=args.model,
+                    provider=args.provider,
+                    files_count=len(files),
+                    total_chars=len(full_sources_text),
+                )
+            except Exception as e:  # cache failure must never block a real audit
+                _log.warning("Failed to write audit cache for %s: %s", key, e)
 
         group_prompt_tokens = sum(c.get("prompt_tokens", 0) for c in call_summaries)
         group_completion_tokens = sum(c.get("completion_tokens", 0) for c in call_summaries)
