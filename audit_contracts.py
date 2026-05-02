@@ -261,14 +261,42 @@ def llm_chat_completion(
     timeout_s: float,
     max_retries: int,
     rate_limiter: RateLimiter | None = None,
+    stream: bool = False,
+    on_chunk: callable | None = None,
 ) -> tuple[str, dict]:
+    """Run a single chat completion with retries.
+
+    When ``stream=True``, the provider's streaming API is used and ``on_chunk``
+    (if provided) is called with each text delta for live progress feedback.
+    Usage tokens are not returned by the stream — callers fall back to the
+    rough estimator when ``usage`` is empty.
+    """
     last_error: str | None = None
     for attempt in range(1, max_retries + 1):
         try:
             if rate_limiter:
                 rate_limiter.wait()
 
-            # Run async chat_completion synchronously
+            if stream:
+
+                async def _consume() -> str:
+                    parts: list[str] = []
+                    async for chunk in provider.chat_completion_stream(
+                        system_prompt=system_prompt,
+                        user_prompt=user_prompt,
+                        temperature=temperature,
+                        max_output_tokens=max_output_tokens,
+                        timeout_s=timeout_s,
+                        json_mode=True,
+                    ):
+                        parts.append(chunk)
+                        if on_chunk:
+                            on_chunk(chunk)
+                    return "".join(parts)
+
+                content = asyncio.run(_consume())
+                return content, {}
+
             content, usage = asyncio.run(
                 provider.chat_completion(
                     system_prompt=system_prompt,
@@ -283,9 +311,6 @@ def llm_chat_completion(
 
         except Exception as e:
             last_error = f"{type(e).__name__}: {e}"
-            # Check for rate limits or fatal errors if possible,
-            # but for now we just retry on everything except maybe some obvious ones.
-            # Simple retry backoff
             time.sleep(min(2**attempt, 30))
 
     raise RuntimeError(f"LLM API failed after {max_retries} retries: {last_error}")
@@ -407,6 +432,11 @@ def main() -> int:
     parser.add_argument("--no-cache", action="store_true", help="Disable audit caching (always re-run).")
     parser.add_argument("--html", action="store_true", help="Generate HTML report in addition to Markdown.")
     parser.add_argument("--mythril", action="store_true", help="Run Mythril symbolic execution (if installed).")
+    parser.add_argument(
+        "--stream",
+        action="store_true",
+        help="Stream LLM output and log incremental progress (no usage tokens, falls back to estimation).",
+    )
 
     args = parser.parse_args()
 
@@ -517,6 +547,19 @@ def main() -> int:
             _log.info("SKIP (exists): %s", report_md_path)
             return None
 
+        def _make_chunk_logger(group_key: str):
+            """Build a callback that logs streamed token deltas at ~5KB intervals."""
+            state = {"buf": 0, "total": 0}
+
+            def _on_chunk(text: str) -> None:
+                state["buf"] += len(text)
+                state["total"] += len(text)
+                if state["buf"] >= 5000:
+                    _log.info("STREAM[%s]: %d chars", group_key, state["total"])
+                    state["buf"] = 0
+
+            return _on_chunk
+
         chain_id_value = "Unknown"
         address_value = "Unknown"
         if key.startswith("chain_"):
@@ -612,6 +655,8 @@ def main() -> int:
                     timeout_s=args.timeout,
                     max_retries=args.retries,
                     rate_limiter=rate_limiter,
+                    stream=args.stream,
+                    on_chunk=_make_chunk_logger(key) if args.stream else None,
                 )
                 duration = time.time() - t0
                 (responses_dir / "audit_response.txt").write_text(raw + "\n", encoding="utf-8")

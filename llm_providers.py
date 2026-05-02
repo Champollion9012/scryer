@@ -5,8 +5,10 @@ Supports: OpenAI, Claude (Anthropic), Gemini (Google)
 
 from __future__ import annotations
 
+import json
 import os
 from abc import ABC, abstractmethod
+from collections.abc import AsyncIterator
 from typing import Any
 
 import scryer_http
@@ -37,6 +39,34 @@ class LLMProvider(ABC):
         Returns: (content, usage_dict)
         """
         pass
+
+    async def chat_completion_stream(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float = 0.1,
+        max_output_tokens: int = 4000,
+        timeout_s: float = 180.0,
+        json_mode: bool = True,
+    ) -> AsyncIterator[str]:
+        """Stream completion text as it arrives.
+
+        Default implementation falls back to the non-streaming path and yields
+        the whole content in a single chunk; concrete providers override with a
+        real SSE-based stream. Usage tokens are not surfaced from the stream
+        (the audit pipeline already estimates when the provider doesn't
+        return them).
+        """
+        content, _ = await self.chat_completion(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            temperature=temperature,
+            max_output_tokens=max_output_tokens,
+            timeout_s=timeout_s,
+            json_mode=json_mode,
+        )
+        yield content
 
 
 class OpenAIProvider(LLMProvider):
@@ -92,6 +122,56 @@ class OpenAIProvider(LLMProvider):
             content = data["choices"][0]["message"]["content"]
             usage = data.get("usage", {})
             return content, usage
+
+    async def chat_completion_stream(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float = 0.1,
+        max_output_tokens: int = 4000,
+        timeout_s: float = 180.0,
+        json_mode: bool = True,
+    ) -> AsyncIterator[str]:
+        url = f"{self.base_url}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": temperature,
+            "max_tokens": max_output_tokens,
+            "stream": True,
+        }
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
+
+        async with (
+            scryer_http.async_client(timeout=timeout_s, retries=0) as client,
+            client.stream("POST", url, headers=headers, json=payload) as resp,
+        ):
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if not line or not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    evt = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                choices = evt.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta", {}).get("content")
+                if delta:
+                    yield delta
 
 
 class ClaudeProvider(LLMProvider):
@@ -151,6 +231,53 @@ class ClaudeProvider(LLMProvider):
             }
             return content, normalized_usage
 
+    async def chat_completion_stream(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float = 0.1,
+        max_output_tokens: int = 4000,
+        timeout_s: float = 180.0,
+        json_mode: bool = True,
+    ) -> AsyncIterator[str]:
+        url = f"{self.base_url}/messages"
+        headers = {
+            "x-api-key": self.api_key,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+        }
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "max_tokens": max_output_tokens,
+            "temperature": temperature,
+            "system": system_prompt,
+            "messages": [{"role": "user", "content": user_prompt}],
+            "stream": True,
+        }
+
+        async with (
+            scryer_http.async_client(timeout=timeout_s, retries=0) as client,
+            client.stream("POST", url, headers=headers, json=payload) as resp,
+        ):
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if not data:
+                    continue
+                try:
+                    evt = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                if evt.get("type") == "content_block_delta":
+                    text = evt.get("delta", {}).get("text")
+                    if text:
+                        yield text
+                elif evt.get("type") == "message_stop":
+                    break
+
 
 class GeminiProvider(LLMProvider):
     """Google Gemini API provider."""
@@ -207,6 +334,54 @@ class GeminiProvider(LLMProvider):
                 "completion_tokens": usage_meta.get("candidatesTokenCount", 0),
             }
             return content, normalized_usage
+
+    async def chat_completion_stream(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float = 0.1,
+        max_output_tokens: int = 4000,
+        timeout_s: float = 180.0,
+        json_mode: bool = True,
+    ) -> AsyncIterator[str]:
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{self.model}:streamGenerateContent?alt=sse&key={self.api_key}"
+        )
+        headers = {"Content-Type": "application/json"}
+        payload: dict[str, Any] = {
+            "contents": [{"role": "user", "parts": [{"text": f"{system_prompt}\n\n{user_prompt}"}]}],
+            "generationConfig": {
+                "temperature": temperature,
+                "maxOutputTokens": max_output_tokens,
+            },
+        }
+        if json_mode:
+            payload["generationConfig"]["responseMimeType"] = "application/json"
+
+        async with (
+            scryer_http.async_client(timeout=timeout_s, retries=0) as client,
+            client.stream("POST", url, headers=headers, json=payload) as resp,
+        ):
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if not data:
+                    continue
+                try:
+                    evt = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                candidates = evt.get("candidates") or []
+                if not candidates:
+                    continue
+                parts = candidates[0].get("content", {}).get("parts", [])
+                chunk = "".join(p.get("text", "") for p in parts)
+                if chunk:
+                    yield chunk
 
 
 # Provider registry
