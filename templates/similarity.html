@@ -1,0 +1,82 @@
+{% extends "base.html" %}
+{% block content %}
+<h2 style="margin-bottom: 20px;">Code Similarity Search</h2>
+<p style="color: var(--text-secondary); margin-bottom: 20px;">
+    Paste Solidity code OR enter a contract address to find similar contracts. Uses CodeBERT embeddings.
+</p>
+
+<div class="search-box">
+    <form method="POST" action="/similarity">
+        <div style="display: grid; grid-template-columns: 150px 1fr 150px; gap: 15px; margin-bottom: 15px; align-items: center;">
+            <label style="color: var(--text-secondary);">Contract Address:</label>
+            <input type="text" name="address" value="{{ address }}" placeholder="0x... (optional - will fetch code automatically)" style="background: var(--bg-dark); border: 1px solid var(--border); border-radius: 8px; color: var(--text-primary); padding: 12px 16px;">
+            <select name="chain" style="background: var(--bg-dark); border: 1px solid var(--border); border-radius: 8px; color: var(--text-primary); padding: 12px;">
+                <option value="56" {{ 'selected' if chain == '56' else '' }}>BSC</option>
+                <option value="1" {{ 'selected' if chain == '1' else '' }}>Ethereum</option>
+                <option value="137" {{ 'selected' if chain == '137' else '' }}>Polygon</option>
+                <option value="42161" {{ 'selected' if chain == '42161' else '' }}>Arbitrum</option>
+            </select>
+        </div>
+
+        <p style="color: var(--text-secondary); margin-bottom: 10px; font-size: 0.9rem;">Or paste code directly:</p>
+        <textarea name="code" rows="10" style="width: 100%; background: var(--bg-dark); border: 1px solid var(--border); border-radius: 8px; color: var(--text-primary); padding: 16px; font-family: 'SF Mono', Consolas, monospace; font-size: 0.9rem; resize: vertical;" placeholder="// Paste Solidity code here...">{{ code }}</textarea>
+
+        <div style="display: flex; gap: 15px; margin-top: 15px; align-items: center;">
+            <button type="submit">Find Similar Contracts</button>
+            <label style="color: var(--text-secondary);">
+                Min Similarity:
+                <input type="number" name="min_sim" value="{{ min_sim or 0.7 }}" min="0" max="1" step="0.05" style="width: 80px; padding: 8px; background: var(--bg-dark); border: 1px solid var(--border); border-radius: 6px; color: var(--text-primary);">
+            </label>
+            <label style="color: var(--text-secondary);">
+                Max Results:
+                <input type="number" name="top_n" value="{{ top_n or 10 }}" min="1" max="50" style="width: 80px; padding: 8px; background: var(--bg-dark); border: 1px solid var(--border); border-radius: 6px; color: var(--text-primary);">
+            </label>
+        </div>
+    </form>
+</div>
+
+{% if error %}
+<div style="background: #f8514922; border: 1px solid #f85149; border-radius: 8px; padding: 15px; margin-bottom: 20px;">
+    <strong style="color: #f85149;">Error:</strong> {{ error }}
+</div>
+{% endif %}
+
+{% if results %}
+<h3 style="margin-bottom: 15px;">Found {{ results | length }} similar contracts</h3>
+<table>
+    <thead>
+        <tr>
+            <th>Similarity</th>
+            <th>Contract</th>
+            <th>File</th>
+            <th>Code Length</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for r in results %}
+        <tr>
+            <td>
+                <span style="display: inline-block; width: 60px; background: linear-gradient(90deg, var(--success) {{ (r.similarity * 100)|int }}%, var(--bg-dark) {{ (r.similarity * 100)|int }}%); padding: 4px 8px; border-radius: 4px; font-weight: 600;">
+                    {{ (r.similarity * 100)|round(1) }}%
+                </span>
+            </td>
+            <td class="address">{{ r.id[:50] }}{{ '...' if r.id|length > 50 else '' }}</td>
+            <td>{{ r.metadata.filename if r.metadata else '-' }}</td>
+            <td>{{ r.metadata.code_length if r.metadata else '-' }} chars</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% elif searched %}
+<div class="empty-state">
+    <p>No similar contracts found above {{ min_sim }} similarity threshold</p>
+</div>
+{% endif %}
+
+<div style="margin-top: 30px; padding: 20px; background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px;">
+    <h4 style="margin-bottom: 10px;">Index Status</h4>
+    <p style="color: var(--text-secondary);">Total indexed: <strong>{{ index_stats.total_contracts }}</strong> contracts</p>
+    <p style="color: var(--text-secondary); margin-top: 10px;">To index more contracts:</p>
+    <pre style="background: var(--bg-dark); padding: 12px; border-radius: 6px; margin-top: 10px;">python similarity_cli.py index sources/</pre>
+</div>
+{% endblock %}

@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="search-box">
+    <h3 style="margin-bottom: 15px;">Find Related Contracts</h3>
+    <p style="color: var(--text-secondary); margin-bottom: 20px;">
+        Enter a contract address to find all contracts with the same source code.
+    </p>
+    <form method="GET">
+        <div class="search-row">
+            <input type="text" name="address" placeholder="0x..." value="{{ address }}">
+            <select name="chain">
+                <option value="1" {{ 'selected' if chain == '1' else '' }}>Ethereum</option>
+                <option value="56" {{ 'selected' if chain == '56' else '' }}>BSC</option>
+                <option value="137" {{ 'selected' if chain == '137' else '' }}>Polygon</option>
+                <option value="42161" {{ 'selected' if chain == '42161' else '' }}>Arbitrum</option>
+            </select>
+            <button type="submit">Find Related</button>
+        </div>
+    </form>
+</div>
+
+{% if related %}
+<h3 style="margin-bottom: 20px;">Found {{ related | length }} related contracts</h3>
+<table>
+    <thead>
+        <tr>
+            <th>Chain</th>
+            <th>Address</th>
+            <th>Contract Name</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for c in related %}
+        <tr>
+            <td><span class="chain-badge chain-{{ c.chain_id }}">{{ c.chain_id }}</span></td>
+            <td class="address">{{ c.address }}</td>
+            <td>{{ c.contract_name or '-' }}</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% elif address %}
+<div class="empty-state">
+    <p>No related contracts found</p>
+</div>
+{% endif %}
+{% endblock %}

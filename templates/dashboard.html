@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="stats-grid">
+    <div class="stat-card">
+        <div class="value">{{ stats.total_contracts }}</div>
+        <div class="label">Total Contracts</div>
+    </div>
+    <div class="stat-card">
+        <div class="value">{{ stats.unique_source_hashes }}</div>
+        <div class="label">Unique Codebases</div>
+    </div>
+    <div class="stat-card">
+        <div class="value">{{ stats.duplicated_hashes }}</div>
+        <div class="label">Duplicated Hashes</div>
+    </div>
+    <div class="stat-card">
+        <div class="value">{{ stats.vulnerability_tags }}</div>
+        <div class="label">Vulnerability Tags</div>
+    </div>
+</div>
+
+<h2 style="margin-bottom: 20px; color: var(--text-secondary);">Recent Contracts</h2>
+<table>
+    <thead>
+        <tr>
+            <th>Chain</th>
+            <th>Address</th>
+            <th>Contract Name</th>
+            <th>Source Hash</th>
+            <th>Crawled At</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for c in recent %}
+        <tr>
+            <td><span class="chain-badge chain-{{ c.chain_id }}">{{ c.chain_name }}</span></td>
+            <td><a href="/contract/{{ c.chain_id }}/{{ c.address }}" class="address">{{ c.address[:10] }}...{{ c.address[-8:] }}</a></td>
+            <td>{{ c.contract_name or '-' }}</td>
+            <td class="hash">{{ c.source_hash[:16] }}...</td>
+            <td>{{ c.crawled_at[:10] if c.crawled_at else '-' }}</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% endblock %}

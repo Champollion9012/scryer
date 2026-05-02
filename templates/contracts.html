@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="search-box">
+    <form method="GET">
+        <div class="search-row">
+            <input type="text" name="q" placeholder="Search by address or contract name..." value="{{ query }}">
+            <select name="chain">
+                <option value="">All Chains</option>
+                <option value="1" {{ 'selected' if chain == '1' else '' }}>Ethereum</option>
+                <option value="56" {{ 'selected' if chain == '56' else '' }}>BSC</option>
+                <option value="137" {{ 'selected' if chain == '137' else '' }}>Polygon</option>
+                <option value="42161" {{ 'selected' if chain == '42161' else '' }}>Arbitrum</option>
+                <option value="10" {{ 'selected' if chain == '10' else '' }}>Optimism</option>
+                <option value="8453" {{ 'selected' if chain == '8453' else '' }}>Base</option>
+            </select>
+            <button type="submit">Search</button>
+        </div>
+    </form>
+</div>
+
+{% if contracts %}
+<table>
+    <thead>
+        <tr>
+            <th>Chain</th>
+            <th>Address</th>
+            <th>Contract Name</th>
+            <th>Compiler</th>
+            <th>Source Hash</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for c in contracts %}
+        <tr>
+            <td><span class="chain-badge chain-{{ c.chain_id }}">{{ c.chain_name }}</span></td>
+            <td><a href="/contract/{{ c.chain_id }}/{{ c.address }}" class="address">{{ c.address[:10] }}...{{ c.address[-8:] }}</a></td>
+            <td>{{ c.contract_name or '-' }}</td>
+            <td class="hash">{{ c.compiler_version[:15] if c.compiler_version else '-' }}</td>
+            <td class="hash">{{ c.source_hash[:16] }}...</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% else %}
+<div class="empty-state">
+    <p>No contracts found</p>
+</div>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block content %}
+<h2 style="margin-bottom: 20px; color: var(--text-secondary);">Top Duplicated Codebases</h2>
+<p style="color: var(--text-secondary); margin-bottom: 20px;">
+    These source code patterns appear in multiple contracts. Click to see all instances.
+</p>
+
+<table>
+    <thead>
+        <tr>
+            <th>Count</th>
+            <th>Sample Name</th>
+            <th>Source Hash</th>
+            <th>Chains</th>
+            <th>First Seen</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for d in duplicates %}
+        <tr>
+            <td><span class="count-badge">{{ d.contract_count }}x</span></td>
+            <td><a href="/hash/{{ d.source_hash }}" style="color: var(--accent);">{{ d.sample_name or 'Unknown' }}</a></td>
+            <td class="hash">{{ d.source_hash[:16] }}...</td>
+            <td>
+                {% for chain in d.chains %}
+                <span class="chain-badge chain-{{ chain }}">{{ chain }}</span>
+                {% endfor %}
+            </td>
+            <td>{{ d.first_seen[:10] if d.first_seen else '-' }}</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% endblock %}

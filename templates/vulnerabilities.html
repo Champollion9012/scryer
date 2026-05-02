@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% block content %}
+<h2 style="margin-bottom: 20px;">Vulnerability Tags</h2>
+<p style="color: var(--text-secondary); margin-bottom: 20px;">
+    Tag source hashes with known vulnerabilities to track affected contracts.
+</p>
+
+<div class="search-box">
+    <form method="POST" action="/api/tag-vulnerability">
+        <h4 style="margin-bottom: 15px;">Add New Tag</h4>
+        <div class="search-row" style="grid-template-columns: 1fr 1fr 150px 120px;">
+            <input type="text" name="source_hash" placeholder="Source Hash" required>
+            <input type="text" name="tag" placeholder="Tag (e.g., reentrancy)" required>
+            <select name="severity">
+                <option value="High">High</option>
+                <option value="Medium">Medium</option>
+                <option value="Low">Low</option>
+            </select>
+            <button type="submit">Add Tag</button>
+        </div>
+    </form>
+</div>
+
+{% if vulns %}
+<table>
+    <thead>
+        <tr>
+            <th>Tag</th>
+            <th>Severity</th>
+            <th>Description</th>
+            <th>Affected</th>
+            <th>Actions</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for v in vulns %}
+        <tr>
+            <td><strong>{{ v.tag }}</strong></td>
+            <td><span class="vuln-badge vuln-{{ v.severity.lower() }}">{{ v.severity }}</span></td>
+            <td>{{ v.description or '-' }}</td>
+            <td><a href="/hash/{{ v.source_hash }}">{{ v.affected }} contracts</a></td>
+            <td><a href="/hash/{{ v.source_hash }}" class="btn btn-sm btn-secondary">View</a></td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% else %}
+<div class="empty-state">
+    <p>No vulnerability tags yet</p>
+</div>
+{% endif %}
+{% endblock %}

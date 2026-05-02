@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}Contract Registry Explorer{% endblock %}</title>
+    <!-- Prism.js for syntax highlighting -->
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css" rel="stylesheet">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-solidity.min.js"></script>
+    <!-- Chart.js -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        :root {
+            --bg-dark: #0d1117;
+            --bg-card: #161b22;
+            --bg-hover: #21262d;
+            --border: #30363d;
+            --text-primary: #e6edf3;
+            --text-secondary: #8b949e;
+            --accent: #58a6ff;
+            --accent-secondary: #a371f7;
+            --success: #3fb950;
+            --warning: #d29922;
+            --danger: #f85149;
+            --gradient: linear-gradient(135deg, #58a6ff 0%, #a371f7 100%);
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: var(--bg-dark);
+            color: var(--text-primary);
+            line-height: 1.6;
+            min-height: 100vh;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        header {
+            background: linear-gradient(180deg, var(--bg-card) 0%, var(--bg-dark) 100%);
+            border-bottom: 1px solid var(--border);
+            padding: 20px 0;
+            margin-bottom: 30px;
+        }
+
+        header h1 {
+            font-size: 1.5rem;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            background: var(--gradient);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        header h1::before {
+            content: '📦';
+            font-size: 1.3rem;
+            -webkit-text-fill-color: initial;
+        }
+
+        nav {
+            display: flex;
+            gap: 10px;
+            margin-top: 15px;
+            flex-wrap: wrap;
+        }
+
+        nav a {
+            color: var(--text-secondary);
+            text-decoration: none;
+            padding: 8px 16px;
+            border-radius: 6px;
+            transition: all 0.2s;
+            border: 1px solid transparent;
+        }
+
+        nav a:hover {
+            background: var(--bg-hover);
+            color: var(--accent);
+            border-color: var(--border);
+        }
+
+        nav a.active {
+            background: var(--accent);
+            color: white;
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+
+        .stat-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 24px;
+            text-align: center;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+
+        .stat-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 25px rgba(0,0,0,0.3);
+        }
+
+        .stat-card .value {
+            font-size: 2.5rem;
+            font-weight: 700;
+            background: var(--gradient);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .stat-card .label {
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+            margin-top: 5px;
+        }
+
+        .search-box {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 24px;
+            margin-bottom: 30px;
+        }
+
+        .search-box input, .search-box select {
+            background: var(--bg-dark);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            color: var(--text-primary);
+            padding: 12px 16px;
+            font-size: 1rem;
+            width: 100%;
+            margin-bottom: 15px;
+            transition: border-color 0.2s;
+        }
+
+        .search-box input:focus, .search-box select:focus {
+            outline: none;
+            border-color: var(--accent);
+            box-shadow: 0 0 0 3px rgba(88, 166, 255, 0.1);
+        }
+
+        .search-box button, .btn {
+            background: var(--gradient);
+            color: white;
+            border: none;
+            border-radius: 8px;
+            padding: 12px 24px;
+            font-size: 1rem;
+            cursor: pointer;
+            transition: opacity 0.2s, transform 0.2s;
+            font-weight: 500;
+        }
+
+        .search-box button:hover, .btn:hover {
+            opacity: 0.9;
+            transform: translateY(-1px);
+        }
+
+        .btn-secondary {
+            background: var(--bg-hover);
+            border: 1px solid var(--border);
+        }
+
+        .btn-danger {
+            background: var(--danger);
+        }
+
+        .btn-sm {
+            padding: 6px 12px;
+            font-size: 0.85rem;
+        }
+
+        .search-row {
+            display: grid;
+            grid-template-columns: 1fr 150px 120px;
+            gap: 15px;
+            align-items: end;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            background: var(--bg-card);
+            border-radius: 12px;
+            overflow: hidden;
+        }
+
+        th, td {
+            padding: 14px 16px;
+            text-align: left;
+            border-bottom: 1px solid var(--border);
+        }
+
+        th {
+            background: var(--bg-hover);
+            font-weight: 600;
+            color: var(--text-secondary);
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        tr {
+            transition: background 0.2s;
+        }
+
+        tr:hover {
+            background: var(--bg-hover);
+        }
+
+        .address {
+            font-family: 'SF Mono', Consolas, monospace;
+            font-size: 0.9rem;
+            color: var(--accent);
+            cursor: pointer;
+        }
+
+        .address:hover {
+            text-decoration: underline;
+        }
+
+        .hash {
+            font-family: 'SF Mono', Consolas, monospace;
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+        }
+
+        .chain-badge {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+
+        .chain-1 { background: #627eea22; color: #627eea; border: 1px solid #627eea44; }
+        .chain-56 { background: #f0b90b22; color: #f0b90b; border: 1px solid #f0b90b44; }
+        .chain-137 { background: #8247e522; color: #8247e5; border: 1px solid #8247e544; }
+        .chain-42161 { background: #28a0f022; color: #28a0f0; border: 1px solid #28a0f044; }
+        .chain-10 { background: #ff042022; color: #ff0420; border: 1px solid #ff042044; }
+        .chain-8453 { background: #0052ff22; color: #0052ff; border: 1px solid #0052ff44; }
+
+        .count-badge {
+            background: var(--success);
+            color: white;
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 0.8rem;
+            font-weight: 600;
+        }
+
+        .vuln-badge {
+            padding: 4px 10px;
+            border-radius: 6px;
+            font-size: 0.75rem;
+            font-weight: 600;
+        }
+
+        .vuln-high { background: #f8514922; color: #f85149; }
+        .vuln-medium { background: #d2992222; color: #d29922; }
+        .vuln-low { background: #3fb95022; color: #3fb950; }
+
+        .empty-state {
+            text-align: center;
+            padding: 60px 20px;
+            color: var(--text-secondary);
+        }
+
+        .empty-state p {
+            font-size: 1.1rem;
+            margin-bottom: 15px;
+        }
+
+        .source-viewer {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            margin-top: 20px;
+            overflow: hidden;
+        }
+
+        .source-viewer header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 12px 16px;
+            background: var(--bg-hover);
+            border-bottom: 1px solid var(--border);
+            margin-bottom: 0;
+        }
+
+        .source-viewer h4 {
+            font-size: 0.9rem;
+            color: var(--text-primary);
+        }
+
+        .source-viewer pre {
+            margin: 0;
+            padding: 20px;
+            overflow-x: auto;
+            font-size: 0.85rem;
+            max-height: 500px;
+            overflow-y: auto;
+            background: #1e1e1e !important;
+        }
+
+        .source-viewer code {
+            font-family: 'SF Mono', Consolas, 'Fira Code', monospace;
+        }
+
+        .chart-container {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 30px;
+        }
+
+        .pagination {
+            display: flex;
+            gap: 8px;
+            justify-content: center;
+            margin-top: 20px;
+        }
+
+        .pagination a {
+            padding: 8px 14px;
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            color: var(--text-secondary);
+            text-decoration: none;
+            transition: all 0.2s;
+        }
+
+        .pagination a:hover, .pagination a.active {
+            background: var(--accent);
+            color: white;
+            border-color: var(--accent);
+        }
+
+        .tag-form {
+            display: flex;
+            gap: 10px;
+            margin-top: 20px;
+            align-items: center;
+        }
+
+        .tag-form input {
+            flex: 1;
+            padding: 10px 14px;
+            background: var(--bg-dark);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            color: var(--text-primary);
+        }
+
+        .tooltip {
+            position: relative;
+        }
+
+        .tooltip::after {
+            content: 'Click to copy';
+            position: absolute;
+            bottom: 100%;
+            left: 50%;
+            transform: translateX(-50%);
+            padding: 4px 8px;
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            font-size: 0.75rem;
+            opacity: 0;
+            transition: opacity 0.2s;
+            pointer-events: none;
+        }
+
+        .tooltip:hover::after {
+            opacity: 1;
+        }
+
+        .toast {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            padding: 12px 20px;
+            background: var(--success);
+            color: white;
+            border-radius: 8px;
+            opacity: 0;
+            transform: translateY(20px);
+            transition: all 0.3s;
+            z-index: 1000;
+        }
+
+        .toast.show {
+            opacity: 1;
+            transform: translateY(0);
+        }
+
+        footer {
+            text-align: center;
+            padding: 30px;
+            color: var(--text-secondary);
+            font-size: 0.85rem;
+            border-top: 1px solid var(--border);
+            margin-top: 40px;
+        }
+
+        @media (max-width: 768px) {
+            .search-row {
+                grid-template-columns: 1fr;
+            }
+            nav {
+                gap: 5px;
+            }
+            nav a {
+                padding: 6px 12px;
+                font-size: 0.9rem;
+            }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <div class="container">
+            <h1>Contract Registry Explorer</h1>
+            <nav>
+                <a href="/" class="{{ 'active' if page == 'home' else '' }}">Dashboard</a>
+                <a href="/contracts" class="{{ 'active' if page == 'contracts' else '' }}">Contracts</a>
+                <a href="/duplicates" class="{{ 'active' if page == 'duplicates' else '' }}">Duplicates</a>
+                <a href="/search" class="{{ 'active' if page == 'search' else '' }}">Search</a>
+                <a href="/similarity" class="{{ 'active' if page == 'similarity' else '' }}">Similarity</a>
+                <a href="/vulnerabilities" class="{{ 'active' if page == 'vulns' else '' }}">Vulnerabilities</a>
+            </nav>
+        </div>
+    </header>
+
+    <main class="container">
+        {% block content %}{% endblock %}
+    </main>
+
+    <div id="toast" class="toast"></div>
+
+    <footer>
+        Contract Registry v2.0 • Powered by Sourcify + Blockscout
+    </footer>
+
+    <script>
+        // Copy to clipboard
+        function copyToClipboard(text) {
+            navigator.clipboard.writeText(text).then(() => {
+                showToast('Copied to clipboard!');
+            });
+        }
+
+        function showToast(message) {
+            const toast = document.getElementById('toast');
+            toast.textContent = message;
+            toast.classList.add('show');
+            setTimeout(() => toast.classList.remove('show'), 2000);
+        }
+
+        // Make addresses clickable to copy
+        document.querySelectorAll('.address').forEach(el => {
+            el.addEventListener('click', (e) => {
+                if (!e.target.href) {
+                    copyToClipboard(el.textContent);
+                }
+            });
+        });
+
+        // Initialize Prism
+        if (typeof Prism !== 'undefined') {
+            Prism.highlightAll();
+        }
+    </script>
+</body>
+</html>

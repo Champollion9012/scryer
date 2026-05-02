@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block content %}
+<h2 style="margin-bottom: 10px;">Contract Details</h2>
+<p style="color: var(--text-secondary); margin-bottom: 20px;">
+    <span class="chain-badge chain-{{ chain_id }}">{{ chain_name }}</span>
+    <span class="address tooltip" style="margin-left: 10px;" onclick="copyToClipboard('{{ address }}')">{{ address }}</span>
+    <a href="{{ explorer_url }}" target="_blank" class="btn btn-sm btn-secondary" style="margin-left: 10px;">View on Explorer</a>
+</p>
+
+<div class="stats-grid" style="grid-template-columns: repeat(3, 1fr); margin-bottom: 30px;">
+    <div class="stat-card">
+        <div class="value">{{ related | length }}</div>
+        <div class="label">Related Contracts</div>
+    </div>
+    <div class="stat-card">
+        <div class="value">{{ source_files | length }}</div>
+        <div class="label">Source Files</div>
+    </div>
+    <div class="stat-card">
+        <div class="value">{{ source_hash[:8] if source_hash else 'N/A' }}...</div>
+        <div class="label">Source Hash</div>
+    </div>
+</div>
+
+{% if source_files %}
+<h3 style="margin-bottom: 15px;">Source Files</h3>
+{% for name, src in source_files.items() %}
+<div class="source-viewer">
+    <header>
+        <h4>{{ name }}</h4>
+        <button class="btn btn-sm btn-secondary" onclick="copyToClipboard(document.getElementById('src-{{ name|replace('.', '-') }}').textContent)">Copy</button>
+    </header>
+    <pre><code id="src-{{ name|replace('.', '-') }}" class="language-solidity">{{ src[:8000] }}</code></pre>
+</div>
+{% endfor %}
+{% else %}
+<div class="empty-state"><p>Source files not found locally</p></div>
+{% endif %}
+{% endblock %}

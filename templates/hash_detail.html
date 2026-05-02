@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block content %}
+<h2 style="margin-bottom: 20px;">
+    Contracts with hash: <span class="hash">{{ source_hash[:24] }}...</span>
+</h2>
+
+<div class="stats-grid" style="grid-template-columns: repeat(2, 1fr); margin-bottom: 30px;">
+    <div class="stat-card">
+        <div class="value">{{ contracts | length }}</div>
+        <div class="label">Total Instances</div>
+    </div>
+    <div class="stat-card">
+        <div class="value">{{ chains | length }}</div>
+        <div class="label">Chains</div>
+    </div>
+</div>
+
+<table>
+    <thead>
+        <tr>
+            <th>Chain</th>
+            <th>Address</th>
+            <th>Contract Name</th>
+            <th>Compiler</th>
+            <th>Crawled At</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for c in contracts %}
+        <tr>
+            <td><span class="chain-badge chain-{{ c.chain_id }}">{{ c.chain_id }}</span></td>
+            <td><a href="/contract/{{ c.chain_id }}/{{ c.address }}" class="address">{{ c.address }}</a></td>
+            <td>{{ c.contract_name or '-' }}</td>
+            <td class="hash">{{ c.compiler_version or '-' }}</td>
+            <td>{{ c.crawled_at[:10] if c.crawled_at else '-' }}</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% endblock %}
