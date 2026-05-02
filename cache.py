@@ -2,6 +2,7 @@
 SQLite-based cache for incremental auditing.
 Stores audit results keyed by source file content hash.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -16,11 +17,11 @@ class AuditCache:
     Cache for audit results using SQLite.
     Key = SHA256 hash of concatenated source file contents.
     """
-    
+
     def __init__(self, db_path: str | Path = ".audit_cache.db"):
         self.db_path = Path(db_path)
         self._init_db()
-    
+
     def _init_db(self) -> None:
         """Initialize the database schema."""
         conn = sqlite3.connect(self.db_path)
@@ -42,7 +43,7 @@ class AuditCache:
             conn.commit()
         finally:
             conn.close()
-    
+
     @staticmethod
     def compute_hash(files: list[Path]) -> str:
         """
@@ -62,7 +63,7 @@ class AuditCache:
                 except Exception:
                     pass
         return hasher.hexdigest()
-    
+
     def get_cached(self, content_hash: str) -> dict | None:
         """
         Retrieve cached audit result by content hash.
@@ -70,17 +71,14 @@ class AuditCache:
         """
         conn = sqlite3.connect(self.db_path)
         try:
-            cursor = conn.execute(
-                "SELECT report_json FROM audits WHERE content_hash = ?",
-                (content_hash,)
-            )
+            cursor = conn.execute("SELECT report_json FROM audits WHERE content_hash = ?", (content_hash,))
             row = cursor.fetchone()
             if row:
                 return json.loads(row[0])
             return None
         finally:
             conn.close()
-    
+
     def set_cached(
         self,
         content_hash: str,
@@ -100,24 +98,21 @@ class AuditCache:
                 (content_hash, report_json, model, provider, files_count, total_chars)
                 VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (content_hash, json.dumps(report, ensure_ascii=False), model, provider, files_count, total_chars)
+                (content_hash, json.dumps(report, ensure_ascii=False), model, provider, files_count, total_chars),
             )
             conn.commit()
         finally:
             conn.close()
-    
+
     def has_cached(self, content_hash: str) -> bool:
         """Check if a hash exists in cache."""
         conn = sqlite3.connect(self.db_path)
         try:
-            cursor = conn.execute(
-                "SELECT 1 FROM audits WHERE content_hash = ?",
-                (content_hash,)
-            )
+            cursor = conn.execute("SELECT 1 FROM audits WHERE content_hash = ?", (content_hash,))
             return cursor.fetchone() is not None
         finally:
             conn.close()
-    
+
     def clear(self) -> int:
         """Clear all cached entries. Returns number of entries deleted."""
         conn = sqlite3.connect(self.db_path)
@@ -128,7 +123,7 @@ class AuditCache:
             return count
         finally:
             conn.close()
-    
+
     def stats(self) -> dict[str, Any]:
         """Get cache statistics."""
         conn = sqlite3.connect(self.db_path)
