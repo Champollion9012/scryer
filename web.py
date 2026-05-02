@@ -2,10 +2,15 @@
 Contract Registry Web Interface.
 A dark-themed web UI for querying and exploring crawled contracts.
 """
-from flask import Flask, render_template_string, request, jsonify
-import json
+
 from pathlib import Path
+
+from flask import Flask, jsonify, render_template_string, request
+
 from contract_registry import ContractRegistry
+from scryer_logging import get_logger
+
+_log = get_logger(__name__)
 
 app = Flask(__name__)
 registry = ContractRegistry()
@@ -758,25 +763,31 @@ CHAIN_EXPLORERS = {
 def get_recent_contracts(limit=20):
     """Get recent contracts from registry."""
     import sqlite3
+
     conn = sqlite3.connect(registry.db_path)
     try:
-        cursor = conn.execute("""
+        cursor = conn.execute(
+            """
             SELECT chain_id, address, contract_name, source_hash, crawled_at, compiler_version
             FROM contracts
             ORDER BY crawled_at DESC
             LIMIT ?
-        """, (limit,))
+        """,
+            (limit,),
+        )
         results = []
         for row in cursor.fetchall():
-            results.append({
-                "chain_id": row[0],
-                "chain_name": CHAIN_NAMES.get(row[0], str(row[0])),
-                "address": row[1],
-                "contract_name": row[2],
-                "source_hash": row[3],
-                "crawled_at": row[4],
-                "compiler_version": row[5],
-            })
+            results.append(
+                {
+                    "chain_id": row[0],
+                    "chain_name": CHAIN_NAMES.get(row[0], str(row[0])),
+                    "address": row[1],
+                    "contract_name": row[2],
+                    "source_hash": row[3],
+                    "crawled_at": row[4],
+                    "compiler_version": row[5],
+                }
+            )
         return results
     finally:
         conn.close()
@@ -785,6 +796,7 @@ def get_recent_contracts(limit=20):
 def search_contracts(query="", chain=None, limit=100):
     """Search contracts by address or name."""
     import sqlite3
+
     conn = sqlite3.connect(registry.db_path)
     try:
         sql = """
@@ -793,29 +805,31 @@ def search_contracts(query="", chain=None, limit=100):
             WHERE 1=1
         """
         params = []
-        
+
         if query:
             sql += " AND (address LIKE ? OR contract_name LIKE ?)"
             params.extend([f"%{query}%", f"%{query}%"])
-        
+
         if chain:
             sql += " AND chain_id = ?"
             params.append(int(chain))
-        
+
         sql += " ORDER BY crawled_at DESC LIMIT ?"
         params.append(limit)
-        
+
         cursor = conn.execute(sql, params)
         results = []
         for row in cursor.fetchall():
-            results.append({
-                "chain_id": row[0],
-                "chain_name": CHAIN_NAMES.get(row[0], str(row[0])),
-                "address": row[1],
-                "contract_name": row[2],
-                "source_hash": row[3],
-                "compiler_version": row[4],
-            })
+            results.append(
+                {
+                    "chain_id": row[0],
+                    "chain_name": CHAIN_NAMES.get(row[0], str(row[0])),
+                    "address": row[1],
+                    "contract_name": row[2],
+                    "source_hash": row[3],
+                    "compiler_version": row[4],
+                }
+            )
         return results
     finally:
         conn.close()
@@ -849,12 +863,7 @@ def duplicates():
 def hash_detail(source_hash):
     contracts = registry.get_addresses_by_hash(source_hash)
     chains = list(set(c["chain_id"] for c in contracts))
-    content = render_template_string(
-        HASH_DETAIL_CONTENT, 
-        source_hash=source_hash, 
-        contracts=contracts,
-        chains=chains
-    )
+    content = render_template_string(HASH_DETAIL_CONTENT, source_hash=source_hash, contracts=contracts, chains=chains)
     return render_template_string(BASE_TEMPLATE, content=content, page="duplicates")
 
 
@@ -863,16 +872,11 @@ def search():
     address = request.args.get("address", "")
     chain = request.args.get("chain", "56")
     related = []
-    
+
     if address:
         related = registry.find_related_contracts(int(chain), address)
-    
-    content = render_template_string(
-        SEARCH_CONTENT,
-        address=address,
-        chain=chain,
-        related=related
-    )
+
+    content = render_template_string(SEARCH_CONTENT, address=address, chain=chain, related=related)
     return render_template_string(BASE_TEMPLATE, content=content, page="search")
 
 
@@ -881,20 +885,19 @@ def contract_detail(chain_id, address):
     """View a specific contract and its source files."""
     source_hash = registry.get_hash_by_address(chain_id, address)
     related = registry.find_related_contracts(chain_id, address)
-    
+
     # Load source files from disk
     sources_dir = Path("sources") / f"{chain_id}_{address.lower()}"
     source_files = {}
     if sources_dir.exists():
         for f in sources_dir.glob("*.sol"):
             source_files[f.name] = f.read_text(encoding="utf-8", errors="ignore")
-    
+
     # Build source files HTML with proper syntax highlighting
     source_html = ""
     for name, src in source_files.items():
-
         escaped = src.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")[:8000]
-        source_html += f'''
+        source_html += f"""
         <div class="source-viewer">
             <header>
                 <h4>{name}</h4>
@@ -902,10 +905,10 @@ def contract_detail(chain_id, address):
             </header>
             <pre><code id="src-{name.replace(".", "-")}" class="language-solidity">{escaped}</code></pre>
         </div>
-        '''
-    
+        """
+
     # Explorer URL
-    explorer_base = CHAIN_EXPLORERS.get(chain_id, "https://bscscan.com") # Default to BSC if unknown
+    explorer_base = CHAIN_EXPLORERS.get(chain_id, "https://bscscan.com")  # Default to BSC if unknown
     if chain_id == 1:
         explorer_base = "https://etherscan.io"
     elif chain_id == 137:
@@ -920,7 +923,7 @@ def contract_detail(chain_id, address):
         explorer_base = "https://snowtrace.io"
     elif chain_id == 250:
         explorer_base = "https://ftmscan.com"
-        
+
     explorer_url = f"{explorer_base}/address/{address}"
 
     content = f"""
@@ -941,7 +944,7 @@ def contract_detail(chain_id, address):
             <div class="label">Source Files</div>
         </div>
         <div class="stat-card">
-            <div class="value">{source_hash[:8] if source_hash else 'N/A'}...</div>
+            <div class="value">{source_hash[:8] if source_hash else "N/A"}...</div>
             <div class="label">Source Hash</div>
         </div>
     </div>
@@ -949,7 +952,7 @@ def contract_detail(chain_id, address):
     {'<h3 style="margin-bottom: 15px;">Source Files</h3>' if source_files else '<div class="empty-state"><p>Source files not found locally</p></div>'}
     {source_html}
     """
-    
+
     return render_template_string(BASE_TEMPLATE, content=content, page="contracts")
 
 
@@ -957,6 +960,7 @@ def contract_detail(chain_id, address):
 def vulnerabilities():
     """View vulnerability tags."""
     import sqlite3
+
     conn = sqlite3.connect(registry.db_path)
     try:
         cursor = conn.execute("""
@@ -965,16 +969,19 @@ def vulnerabilities():
             FROM vulnerability_tags v
             ORDER BY v.created_at DESC
         """)
-        vulns = [{
-            "tag": row[0],
-            "severity": row[1],
-            "description": row[2],
-            "source_hash": row[3],
-            "affected": row[4],
-        } for row in cursor.fetchall()]
+        vulns = [
+            {
+                "tag": row[0],
+                "severity": row[1],
+                "description": row[2],
+                "source_hash": row[3],
+                "affected": row[4],
+            }
+            for row in cursor.fetchall()
+        ]
     finally:
         conn.close()
-    
+
     content = """
     <h2 style="margin-bottom: 20px;">Vulnerability Tags</h2>
     <p style="color: var(--text-secondary); margin-bottom: 20px;">
@@ -1026,7 +1033,7 @@ def vulnerabilities():
     </div>
     {% endif %}
     """
-    
+
     return render_template_string(BASE_TEMPLATE, content=render_template_string(content, vulns=vulns), page="vulns")
 
 
@@ -1036,7 +1043,7 @@ def api_tag_vulnerability():
     source_hash = request.form.get("source_hash", "")
     tag = request.form.get("tag", "")
     severity = request.form.get("severity", "Medium")
-    
+
     if source_hash and tag:
         affected = registry.tag_vulnerability(source_hash, tag, severity)
         return jsonify({"success": True, "affected": affected})
@@ -1065,18 +1072,23 @@ def api_related(chain_id, address):
 def api_export(format):
     """Export contracts data."""
     contracts = search_contracts(limit=10000)
-    
+
     if format == "json":
         return jsonify(contracts)
-    elif format == "csv":
+    if format == "csv":
         import csv
         from io import StringIO
+
         output = StringIO()
         writer = csv.DictWriter(output, fieldnames=["chain_id", "address", "contract_name", "source_hash"])
         writer.writeheader()
         writer.writerows(contracts)
-        return output.getvalue(), 200, {"Content-Type": "text/csv", "Content-Disposition": "attachment; filename=contracts.csv"}
-    
+        return (
+            output.getvalue(),
+            200,
+            {"Content-Type": "text/csv", "Content-Disposition": "attachment; filename=contracts.csv"},
+        )
+
     return jsonify({"error": "Unsupported format"})
 
 
@@ -1179,15 +1191,16 @@ def similarity_search():
     top_n = 10
     error = None
     index_stats = {"total_contracts": 0}
-    
+
     # Try to get index stats
     try:
         from similarity import SimilarityIndex
+
         index = SimilarityIndex()
         index_stats = index.stats()
-    except Exception as e:
+    except Exception:
         pass
-    
+
     if request.method == "POST":
         address = request.form.get("address", "").strip()
         chain = request.form.get("chain", "56")
@@ -1195,7 +1208,7 @@ def similarity_search():
         min_sim = float(request.form.get("min_sim", 0.7))
         top_n = int(request.form.get("top_n", 10))
         searched = True
-        
+
         # If address provided, fetch code from Sourcify/local
         if address and address.startswith("0x"):
             chain_id = int(chain)
@@ -1205,37 +1218,39 @@ def similarity_search():
                 sol_files = list(sources_dir.glob("*.sol"))
                 if sol_files:
                     code = sol_files[0].read_text(encoding="utf-8", errors="ignore")
-            
+
             # If not local, try fetching from API
             if not code:
                 try:
-                    import httpx
                     import asyncio
-                    from contract_crawler import fetch_sourcify_source, AsyncRateLimiter
-                    
+
+                    import scryer_http
+                    from contract_crawler import AsyncRateLimiter, fetch_sourcify_source
+
                     async def fetch_code():
-                        async with httpx.AsyncClient() as client:
+                        async with scryer_http.async_client() as client:
                             rate_limiter = AsyncRateLimiter(3.0)
                             sources, _ = await fetch_sourcify_source(chain_id, address, client, rate_limiter)
                             return sources
-                    
+
                     sources = asyncio.run(fetch_code())
                     if sources:
                         # Get the main contract file
                         code = list(sources.values())[0]
                 except Exception as e:
                     error = f"Could not fetch code for {address}: {str(e)}"
-        
+
         if code:
             try:
                 from similarity import SimilarityIndex
+
                 index = SimilarityIndex()
                 results = index.find_similar(code, n_results=top_n, min_similarity=min_sim)
             except Exception as e:
                 error = f"Similarity search error: {str(e)}"
         elif not error:
             error = "Please provide either a contract address or paste code"
-    
+
     content = render_template_string(
         SIMILARITY_CONTENT,
         code=code,
@@ -1258,12 +1273,13 @@ def api_similarity():
     code = data.get("code", "")
     min_sim = float(data.get("min_similarity", 0.7))
     top_n = int(data.get("top_n", 10))
-    
+
     if not code.strip():
         return jsonify({"error": "No code provided"}), 400
-    
+
     try:
         from similarity import SimilarityIndex
+
         index = SimilarityIndex()
         results = index.find_similar(code, n_results=top_n, min_similarity=min_sim)
         return jsonify({"results": results, "count": len(results)})
@@ -1272,6 +1288,6 @@ def api_similarity():
 
 
 if __name__ == "__main__":
-    print("Starting Contract Registry Web Interface...")
-    print("Open http://localhost:5000 in your browser")
+    _log.info("Starting Contract Registry Web Interface...")
+    _log.info("Open http://localhost:5000 in your browser")
     app.run(debug=True, port=5000)

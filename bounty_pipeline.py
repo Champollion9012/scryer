@@ -10,6 +10,9 @@ import sys
 from pathlib import Path
 
 from download_contract import DEFAULT_RPC_URL, fetch_contract_source
+from scryer_logging import get_logger
+
+_log = get_logger(__name__)
 
 
 def read_targets(path: Path) -> list[dict]:
@@ -24,7 +27,9 @@ def main() -> int:
     parser.add_argument("--targets", required=True, help="Path to targets JSON (array).")
     parser.add_argument("--run-dir", default=None, help="Run directory (default: runs/run_<timestamp>).")
 
-    parser.add_argument("--rpc-url", default=os.getenv("RPC_URL") or DEFAULT_RPC_URL, help="Default RPC URL (per-target can override).")
+    parser.add_argument(
+        "--rpc-url", default=os.getenv("RPC_URL") or DEFAULT_RPC_URL, help="Default RPC URL (per-target can override)."
+    )
     parser.add_argument("--default-chain-id", type=int, default=56, help="Default chain id if missing in targets.")
     parser.add_argument("--follow-proxy", action="store_true", help="Follow proxy implementation by default.")
     parser.add_argument("--layout", choices=["flat", "tree"], default="tree", help="Downloader save layout.")
@@ -49,10 +54,10 @@ def main() -> int:
     targets_path = Path(args.targets)
     targets = read_targets(targets_path)
     if not targets:
-        print(f"No targets found in: {targets_path}", file=sys.stderr)
+        _log.error("No targets found in: %s", targets_path)
         return 2
 
-    run_id = dt.datetime.now(dt.timezone.utc).strftime("run_%Y%m%d_%H%M%SZ")
+    run_id = dt.datetime.now(dt.UTC).strftime("run_%Y%m%d_%H%M%SZ")
     run_root = Path(args.run_dir) if args.run_dir else Path("runs") / run_id
     sources_dir = run_root / "sources"
     audit_dir = run_root / "audit"
@@ -60,7 +65,7 @@ def main() -> int:
 
     manifest: dict = {
         "run_id": run_id,
-        "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "generated_at": dt.datetime.now(dt.UTC).isoformat(),
         "targets_file": targets_path.as_posix(),
         "run_dir": run_root.as_posix(),
         "sources_dir": sources_dir.as_posix(),
@@ -100,8 +105,10 @@ def main() -> int:
             )
 
     if args.download_only:
-        (run_root / "pipeline_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        print(f"Done (download-only). Run dir: {run_root}")
+        (run_root / "pipeline_manifest.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+        _log.info("Done (download-only). Run dir: %s", run_root)
         return 0
 
     audit_dir.mkdir(parents=True, exist_ok=True)
@@ -135,13 +142,14 @@ def main() -> int:
         cmd.append("--disable-regex-scan")
 
     manifest["audit_command"] = cmd
-    (run_root / "pipeline_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    (run_root / "pipeline_manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
 
-    print("Running audit:", " ".join(cmd))
+    _log.info("Running audit: %s", " ".join(cmd))
     proc = subprocess.run(cmd)
     return int(proc.returncode)
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

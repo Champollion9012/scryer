@@ -2,15 +2,20 @@
 Contract Registry - Maps bytecode hashes to contract addresses.
 Used for vulnerability correlation: find all contracts affected by the same issue.
 """
+
 from __future__ import annotations
 
 import hashlib
 import json
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+
+
+def _utc_now_iso() -> str:
+    """Return current UTC time as ISO 8601 string (replacement for utcnow())."""
+    return datetime.now(UTC).replace(tzinfo=None).isoformat()
 
 
 @dataclass
@@ -25,14 +30,14 @@ class ContractInfo:
 class ContractRegistry:
     """
     SQLite registry mapping source code hashes to contract addresses.
-    
+
     Use case: When a vulnerability is found, query all addresses with the same hash.
     """
-    
+
     def __init__(self, db_path: str | Path = ".contract_registry.db"):
         self.db_path = Path(db_path)
         self._init_db()
-    
+
     def _init_db(self) -> None:
         """Initialize database schema."""
         conn = sqlite3.connect(self.db_path)
@@ -92,14 +97,14 @@ class ContractRegistry:
             conn.commit()
         finally:
             conn.close()
-    
+
     @staticmethod
     def compute_source_hash(sources: dict[str, str]) -> str:
         """Compute SHA256 hash of concatenated source files."""
         # Sort by filename for deterministic ordering
         combined = "".join(sources[k] for k in sorted(sources.keys()))
         return hashlib.sha256(combined.encode()).hexdigest()
-    
+
     def register_contract(
         self,
         chain_id: int,
@@ -114,14 +119,15 @@ class ContractRegistry:
         """
         source_hash = self.compute_source_hash(sources)
         address_lower = address.lower()
-        now = datetime.utcnow().isoformat()
-        
-        total_lines = sum(s.count('\n') + 1 for s in sources.values())
-        
+        now = _utc_now_iso()
+
+        total_lines = sum(s.count("\n") + 1 for s in sources.values())
+
         conn = sqlite3.connect(self.db_path)
         try:
             # Insert or update contract
-            conn.execute("""
+            conn.execute(
+                """
                 INSERT INTO contracts (chain_id, address, source_hash, contract_name, 
                                        compiler_version, source_files_count, total_lines, crawled_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -132,35 +138,43 @@ class ContractRegistry:
                     source_files_count = excluded.source_files_count,
                     total_lines = excluded.total_lines,
                     crawled_at = excluded.crawled_at
-            """, (chain_id, address_lower, source_hash, contract_name, 
-                  compiler_version, len(sources), total_lines, now))
-            
+            """,
+                (chain_id, address_lower, source_hash, contract_name, compiler_version, len(sources), total_lines, now),
+            )
+
             # Update hash stats
             self._update_hash_stats(conn, source_hash, contract_name)
-            
+
             conn.commit()
         finally:
             conn.close()
-        
+
         return source_hash
-    
+
     def _update_hash_stats(self, conn: sqlite3.Connection, source_hash: str, sample_name: str | None):
         """Update aggregated hash statistics."""
-        now = datetime.utcnow().isoformat()
-        
+        now = _utc_now_iso()
+
         # Get current stats
-        cursor = conn.execute("""
+        cursor = conn.execute(
+            """
             SELECT chain_id FROM contracts WHERE source_hash = ?
-        """, (source_hash,))
+        """,
+            (source_hash,),
+        )
         chains = list(set(row[0] for row in cursor.fetchall()))
-        
-        cursor = conn.execute("""
+
+        cursor = conn.execute(
+            """
             SELECT COUNT(*) FROM contracts WHERE source_hash = ?
-        """, (source_hash,))
+        """,
+            (source_hash,),
+        )
         count = cursor.fetchone()[0]
-        
+
         # Upsert hash stats
-        conn.execute("""
+        conn.execute(
+            """
             INSERT INTO hash_stats (source_hash, first_seen, last_seen, contract_count, chains, sample_name)
             VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(source_hash) DO UPDATE SET
@@ -168,19 +182,24 @@ class ContractRegistry:
                 contract_count = excluded.contract_count,
                 chains = excluded.chains,
                 sample_name = COALESCE(hash_stats.sample_name, excluded.sample_name)
-        """, (source_hash, now, now, count, json.dumps(chains), sample_name))
-    
+        """,
+            (source_hash, now, now, count, json.dumps(chains), sample_name),
+        )
+
     def get_addresses_by_hash(self, source_hash: str) -> list[dict]:
         """Get all contract addresses with the same source hash."""
         conn = sqlite3.connect(self.db_path)
         try:
-            cursor = conn.execute("""
+            cursor = conn.execute(
+                """
                 SELECT chain_id, address, contract_name, compiler_version, crawled_at
                 FROM contracts
                 WHERE source_hash = ?
                 ORDER BY chain_id, address
-            """, (source_hash,))
-            
+            """,
+                (source_hash,),
+            )
+
             return [
                 {
                     "chain_id": row[0],
@@ -193,42 +212,48 @@ class ContractRegistry:
             ]
         finally:
             conn.close()
-    
+
     def get_hash_by_address(self, chain_id: int, address: str) -> str | None:
         """Get source hash for a specific contract address."""
         conn = sqlite3.connect(self.db_path)
         try:
-            cursor = conn.execute("""
+            cursor = conn.execute(
+                """
                 SELECT source_hash FROM contracts
                 WHERE chain_id = ? AND address = ?
-            """, (chain_id, address.lower()))
+            """,
+                (chain_id, address.lower()),
+            )
             row = cursor.fetchone()
             return row[0] if row else None
         finally:
             conn.close()
-    
+
     def exists_contract(self, chain_id: int, address: str) -> bool:
         """Check if a contract address has already been crawled."""
         return self.get_hash_by_address(chain_id, address) is not None
-    
+
     def get_crawled_addresses(self, chain_id: int) -> set[str]:
         """Get all crawled addresses for a chain (for resume support)."""
         conn = sqlite3.connect(self.db_path)
         try:
-            cursor = conn.execute("""
+            cursor = conn.execute(
+                """
                 SELECT address FROM contracts WHERE chain_id = ?
-            """, (chain_id,))
+            """,
+                (chain_id,),
+            )
             return {row[0].lower() for row in cursor.fetchall()}
         finally:
             conn.close()
-    
+
     def find_related_contracts(self, chain_id: int, address: str) -> list[dict]:
         """Find all contracts with the same source code as the given address."""
         source_hash = self.get_hash_by_address(chain_id, address)
         if not source_hash:
             return []
         return self.get_addresses_by_hash(source_hash)
-    
+
     def tag_vulnerability(
         self,
         source_hash: str,
@@ -242,35 +267,44 @@ class ContractRegistry:
         """
         conn = sqlite3.connect(self.db_path)
         try:
-            conn.execute("""
+            conn.execute(
+                """
                 INSERT INTO vulnerability_tags (source_hash, tag, severity, description)
                 VALUES (?, ?, ?, ?)
                 ON CONFLICT(source_hash, tag) DO UPDATE SET
                     severity = excluded.severity,
                     description = excluded.description
-            """, (source_hash, tag, severity, description))
+            """,
+                (source_hash, tag, severity, description),
+            )
             conn.commit()
-            
+
             # Return affected count
-            cursor = conn.execute("""
+            cursor = conn.execute(
+                """
                 SELECT COUNT(*) FROM contracts WHERE source_hash = ?
-            """, (source_hash,))
+            """,
+                (source_hash,),
+            )
             return cursor.fetchone()[0]
         finally:
             conn.close()
-    
+
     def get_vulnerable_contracts(self, tag: str) -> list[dict]:
         """Get all contracts affected by a vulnerability tag."""
         conn = sqlite3.connect(self.db_path)
         try:
-            cursor = conn.execute("""
+            cursor = conn.execute(
+                """
                 SELECT c.chain_id, c.address, c.contract_name, v.severity, v.description
                 FROM contracts c
                 JOIN vulnerability_tags v ON c.source_hash = v.source_hash
                 WHERE v.tag = ?
                 ORDER BY c.chain_id, c.address
-            """, (tag,))
-            
+            """,
+                (tag,),
+            )
+
             return [
                 {
                     "chain_id": row[0],
@@ -283,19 +317,22 @@ class ContractRegistry:
             ]
         finally:
             conn.close()
-    
+
     def get_top_duplicates(self, limit: int = 50) -> list[dict]:
         """Get source hashes with the most contract instances."""
         conn = sqlite3.connect(self.db_path)
         try:
-            cursor = conn.execute("""
+            cursor = conn.execute(
+                """
                 SELECT source_hash, contract_count, chains, sample_name, first_seen
                 FROM hash_stats
                 WHERE contract_count > 1
                 ORDER BY contract_count DESC
                 LIMIT ?
-            """, (limit,))
-            
+            """,
+                (limit,),
+            )
+
             return [
                 {
                     "source_hash": row[0],
@@ -308,23 +345,23 @@ class ContractRegistry:
             ]
         finally:
             conn.close()
-    
+
     def stats(self) -> dict:
         """Get registry statistics."""
         conn = sqlite3.connect(self.db_path)
         try:
             cursor = conn.execute("SELECT COUNT(*) FROM contracts")
             total_contracts = cursor.fetchone()[0]
-            
+
             cursor = conn.execute("SELECT COUNT(DISTINCT source_hash) FROM contracts")
             unique_hashes = cursor.fetchone()[0]
-            
+
             cursor = conn.execute("SELECT COUNT(*) FROM vulnerability_tags")
             vuln_tags = cursor.fetchone()[0]
-            
+
             cursor = conn.execute("SELECT COUNT(*) FROM hash_stats WHERE contract_count > 1")
             duplicated_hashes = cursor.fetchone()[0]
-            
+
             return {
                 "total_contracts": total_contracts,
                 "unique_source_hashes": unique_hashes,
@@ -334,11 +371,11 @@ class ContractRegistry:
             }
         finally:
             conn.close()
-    
+
     # =========================================================================
     # Block Scan Tracking
     # =========================================================================
-    
+
     def record_scanned_blocks(
         self,
         chain_id: int,
@@ -349,30 +386,36 @@ class ContractRegistry:
         """Record a range of blocks that have been scanned."""
         conn = sqlite3.connect(self.db_path)
         try:
-            conn.execute("""
+            conn.execute(
+                """
                 INSERT INTO scanned_blocks (chain_id, from_block, to_block, contracts_found)
                 VALUES (?, ?, ?, ?)
                 ON CONFLICT(chain_id, from_block, to_block) DO UPDATE SET
                     contracts_found = excluded.contracts_found,
                     scanned_at = CURRENT_TIMESTAMP
-            """, (chain_id, from_block, to_block, contracts_found))
+            """,
+                (chain_id, from_block, to_block, contracts_found),
+            )
             conn.commit()
         finally:
             conn.close()
-    
+
     def get_scanned_ranges(self, chain_id: int) -> list[tuple[int, int]]:
         """Get all scanned block ranges for a chain, sorted by from_block."""
         conn = sqlite3.connect(self.db_path)
         try:
-            cursor = conn.execute("""
+            cursor = conn.execute(
+                """
                 SELECT from_block, to_block FROM scanned_blocks
                 WHERE chain_id = ?
                 ORDER BY from_block
-            """, (chain_id,))
+            """,
+                (chain_id,),
+            )
             return [(row[0], row[1]) for row in cursor.fetchall()]
         finally:
             conn.close()
-    
+
     def get_unscanned_ranges(
         self,
         chain_id: int,
@@ -386,11 +429,11 @@ class ContractRegistry:
         scanned = self.get_scanned_ranges(chain_id)
         if not scanned:
             return [(from_block, to_block)]
-        
+
         # Merge overlapping ranges and find gaps
         gaps = []
         current_start = from_block
-        
+
         for scan_from, scan_to in scanned:
             # Skip ranges entirely before our target
             if scan_to < from_block:
@@ -398,32 +441,34 @@ class ContractRegistry:
             # Stop if we've passed our target
             if scan_from > to_block:
                 break
-            
+
             # If there's a gap before this scanned range
             if current_start < scan_from:
                 gap_end = min(scan_from - 1, to_block)
                 if gap_end >= current_start:
                     gaps.append((current_start, gap_end))
-            
+
             # Move current_start past this scanned range
             current_start = max(current_start, scan_to + 1)
-        
+
         # Check if there's a gap at the end
         if current_start <= to_block:
             gaps.append((current_start, to_block))
-        
+
         return gaps
-    
+
     def get_last_scanned_block(self, chain_id: int) -> int | None:
         """Get the highest block number that has been scanned for a chain."""
         conn = sqlite3.connect(self.db_path)
         try:
-            cursor = conn.execute("""
+            cursor = conn.execute(
+                """
                 SELECT MAX(to_block) FROM scanned_blocks
                 WHERE chain_id = ?
-            """, (chain_id,))
+            """,
+                (chain_id,),
+            )
             row = cursor.fetchone()
             return row[0] if row and row[0] is not None else None
         finally:
             conn.close()
-
