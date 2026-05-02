@@ -5,7 +5,7 @@ import re
 import shutil
 import subprocess
 import tempfile
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -16,6 +16,36 @@ class RegexRule:
     severity: str
     title: str
     pattern: re.Pattern[str]
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> RegexRule:
+        """Build a rule from JSON-friendly dict, e.g. loaded from disk.
+
+        Expected keys: ``rule_id``, ``severity``, ``title``, ``pattern``.
+        Optional ``flags`` (e.g. ``"IGNORECASE"``) maps to :mod:`re` constants.
+        """
+        flags = 0
+        for name in (payload.get("flags") or "").split("|"):
+            name = name.strip().upper()
+            if name:
+                flags |= getattr(re, name)
+        return cls(
+            rule_id=str(payload["rule_id"]),
+            severity=str(payload["severity"]),
+            title=str(payload["title"]),
+            pattern=re.compile(str(payload["pattern"]), flags),
+        )
+
+
+def load_rules_from_file(path: Path) -> list[RegexRule]:
+    """Load a list of regex rules from a JSON file (array of dicts).
+
+    Lets users carry custom in-house rules without forking this module.
+    """
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(payload, list):
+        raise ValueError(f"Expected a JSON list of rules, got {type(payload).__name__}")
+    return [RegexRule.from_dict(item) for item in payload]
 
 
 DEFAULT_REGEX_RULES: list[RegexRule] = [
@@ -100,11 +130,24 @@ DEFAULT_REGEX_RULES: list[RegexRule] = [
 
 
 def _iter_lines(text: str):
-    for i, line in enumerate(text.splitlines(), start=1):
-        yield i, line
+    yield from enumerate(text.splitlines(), start=1)
 
 
-def run_regex_scan(files: Iterable[Path], *, root: Path | None = None, max_findings: int = 500) -> dict:
+def run_regex_scan(
+    files: Iterable[Path],
+    *,
+    root: Path | None = None,
+    max_findings: int = 500,
+    rules: Sequence[RegexRule] | None = None,
+) -> dict:
+    """Scan ``files`` against a set of heuristic regex rules.
+
+    By default the built-in :data:`DEFAULT_REGEX_RULES` are used. Callers can
+    pass their own ``rules`` (e.g. extended with project-specific patterns
+    loaded via :func:`load_rules_from_file`) without monkey-patching the
+    module-level list.
+    """
+    active_rules: Sequence[RegexRule] = rules if rules is not None else DEFAULT_REGEX_RULES
     findings: list[dict] = []
     files_scanned = 0
     lines_scanned = 0
@@ -124,7 +167,7 @@ def run_regex_scan(files: Iterable[Path], *, root: Path | None = None, max_findi
 
         for line_no, line in _iter_lines(text):
             lines_scanned += 1
-            for rule in DEFAULT_REGEX_RULES:
+            for rule in active_rules:
                 for match in rule.pattern.finditer(line):
                     findings.append(
                         {
@@ -357,7 +400,7 @@ def run_mythril(
     results: list[dict] = []
 
     for file_path in files:
-        if not file_path.exists() or not file_path.suffix == ".sol":
+        if not file_path.exists() or file_path.suffix != ".sol":
             continue
 
         try:
