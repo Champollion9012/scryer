@@ -41,7 +41,7 @@ Domain modules (no prefix) are the user-visible CLI entry points:
 
 ## Logging
 
-In **new code** prefer `scryer_logging.get_logger(__name__)` instead of `print()`. Existing modules will be migrated incrementally — do not do a wholesale `print → log` swap in the same PR as a feature change. Keep CLI user-facing output (final results, summaries) on `print()` if that is what the user expects to see; route everything else through the logger.
+In **new code** prefer `scryer_logging.get_logger(__name__)` instead of `print()`. Keep CLI user-facing output (final results, summaries) on `print()` if that is what the user expects to see; route everything else through the logger.
 
 ## HTTP
 

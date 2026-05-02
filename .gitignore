@@ -11,6 +11,14 @@ __pycache__/
 .venv/
 venv/
 
+# Tooling caches and runtime artifacts
+.coverage
+coverage.xml
+htmlcov/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
 # Generated data (large, regenerable)
 sources/
 audit_reports/

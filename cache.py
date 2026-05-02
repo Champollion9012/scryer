@@ -94,7 +94,7 @@ class AuditCache:
         try:
             conn.execute(
                 """
-                INSERT OR REPLACE INTO audits 
+                INSERT OR REPLACE INTO audits
                 (content_hash, report_json, model, provider, files_count, total_chars)
                 VALUES (?, ?, ?, ?, ?, ?)
                 """,

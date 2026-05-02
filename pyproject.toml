@@ -126,22 +126,6 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/python/**" = ["B011", "F401", "F811"]
-# web.py contains large HTML/CSS template strings — whitespace there is intentional.
-"web.py" = ["W291", "W293", "C401"]
-# Legacy domain modules — keep these warnings as known tech debt and clean up
-# incrementally rather than blocking CI on a one-time mass migration.
-# When a file is cleaned up, drop its entry here.
-"cache.py" = ["W291"]
-"contract_registry.py" = ["W291", "W293", "C401", "B007", "SIM105"]
-"contract_crawler.py" = ["W291", "W293", "B904", "SIM105", "B007", "E722", "F841"]
-"download_contract.py" = ["E722", "PTH108", "PTH118", "PTH120", "PTH122", "SIM105", "SIM112", "RET504", "SIM102"]
-"rpc_contract_discovery.py" = ["E722", "B904", "SIM105", "SIM112", "SIM102"]
-"audit_contracts.py" = ["E722", "SIM105", "B023"]
-"data_sources.py" = ["E722", "SIM105", "F841", "W291"]
-"decompilers.py" = ["W291", "W293", "SIM105", "F841", "PTH108"]
-"similarity.py" = ["W291", "W293", "C401", "SIM102", "RET504", "UP028", "B007", "B904", "SIM105"]
-"report_renderer.py" = ["RET504", "SIM102", "SIM201", "F841", "W293"]
-"scanners.py" = ["RET504", "B007", "UP028", "SIM201"]
 
 [tool.ruff.format]
 quote-style = "double"

@@ -278,7 +278,7 @@ Python 3.11 / 3.12 / 3.13 on every push and pull request. See
 | `scryer_logging` | bare `print()` | Structured logger via `get_logger(__name__)`; supports `plain` / `json` formats and optional file sink. |
 | `scryer_http`    | `httpx.AsyncClient(...)` | Shared client factory with timeouts, retries, default `User-Agent`, and SOCKS-proxy fallback. |
 
-Existing modules will be migrated incrementally — keep changes scoped per PR.
+All domain modules already route through these. New modules should do the same.
 
 ## ⚠️ Disclaimer
 
