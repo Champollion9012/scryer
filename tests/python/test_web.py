@@ -33,7 +33,7 @@ def client(tmp_path, monkeypatch):
         yield c
 
 
-PAGE_ROUTES = ["/", "/contracts", "/duplicates", "/search", "/vulnerabilities", "/similarity"]
+PAGE_ROUTES = ["/", "/contracts", "/duplicates", "/search", "/vulnerabilities", "/similarity", "/whales"]
 
 
 @pytest.mark.parametrize("route", PAGE_ROUTES)
@@ -127,3 +127,137 @@ def test_tag_vulnerability_endpoint_inserts(client) -> None:
     )
     assert resp.is_json
     assert resp.get_json()["success"] is True
+
+
+# ---------------------------------------------------------------------------
+# /whales route — empty DB and seeded DB
+# ---------------------------------------------------------------------------
+
+
+def test_whales_route_handles_missing_db(client, tmp_path, monkeypatch) -> None:
+    """When no whale_watcher DB exists, the page renders an explanatory empty state."""
+    monkeypatch.setattr(
+        "scryer_config.get",
+        lambda key, default=None: str(tmp_path / "absent.db") if key == "WHALE_WATCHER_DB" else default,
+    )
+    body = client.get("/whales").get_data(as_text=True)
+    assert "No whale_watcher database yet" in body
+    assert "scryer_whale_watcher.py" in body
+
+
+def test_whales_route_renders_seeded_hits(client, tmp_path, monkeypatch) -> None:
+    """A populated DB shows the row in the table and includes the explorer link."""
+    import scryer_whale_watcher as ww
+
+    db = tmp_path / "w.db"
+    store = ww.WhaleStore(db)
+    log = ww.TransferLog(
+        chain_id=1,
+        block_number=1234,
+        tx_hash="0x" + "ab" * 32,
+        log_index=0,
+        token_address="0xdac17f958d2ee523a2206206994597c13d831ec7",
+        from_address="0x" + "11" * 20,
+        to_address="0x" + "22" * 20,
+        amount_raw=80_000 * 10**6,
+    )
+    store.insert_hit(log, symbol="USDT", decimals=6, receiver_is_contract=True)
+
+    monkeypatch.setattr(
+        "scryer_config.get",
+        lambda key, default=None: str(db) if key == "WHALE_WATCHER_DB" else default,
+    )
+
+    body = client.get("/whales").get_data(as_text=True)
+    assert "USDT" in body
+    # ETH explorer link assembled from CHAIN_EXPLORERS
+    assert "etherscan.io/tx/" in body
+    assert "0xab" in body
+    # Receiver renders truncated
+    assert "0x2222222222" in body
+
+
+def test_whales_route_ignores_garbage_chain_param(client, tmp_path, monkeypatch) -> None:
+    """?chain=foo must not 500 — graceful fall back to "all chains"."""
+    monkeypatch.setattr(
+        "scryer_config.get",
+        lambda key, default=None: str(tmp_path / "absent.db") if key == "WHALE_WATCHER_DB" else default,
+    )
+    resp = client.get("/whales?chain=not-an-int&to=junk")
+    assert resp.status_code == 200
+
+
+def test_api_whales_clamps_limit(client, tmp_path, monkeypatch) -> None:
+    """Negative or zero limit must be clamped — SQLite LIMIT -1 = unlimited."""
+    import scryer_whale_watcher as ww
+
+    db = tmp_path / "w.db"
+    store = ww.WhaleStore(db)
+    # Seed 5 hits so we can verify the limit bound is enforced.
+    for i in range(5):
+        log = ww.TransferLog(
+            chain_id=1,
+            block_number=1000 + i,
+            tx_hash=f"0x{i:064x}",
+            log_index=0,
+            token_address="0xdac17f958d2ee523a2206206994597c13d831ec7",
+            from_address="0x" + "11" * 20,
+            to_address="0x" + "22" * 20,
+            amount_raw=80_000 * 10**6,
+        )
+        store.insert_hit(log, symbol="USDT", decimals=6, receiver_is_contract=True)
+
+    monkeypatch.setattr(
+        "scryer_config.get",
+        lambda key, default=None: str(db) if key == "WHALE_WATCHER_DB" else default,
+    )
+
+    # limit=-1 (raw) -> clamped to 1 (NOT unlimited)
+    resp = client.get("/api/whales?limit=-1")
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert len(payload["hits"]) == 1, "negative limit should clamp to 1, not return all rows"
+
+    # limit=abc -> default 100 -> all 5 returned
+    resp = client.get("/api/whales?limit=garbage")
+    assert resp.status_code == 200
+    assert len(resp.get_json()["hits"]) == 5
+
+    # limit=99999 -> capped at 1000 (we can't directly observe the cap with 5 rows,
+    # but we can confirm we still get all 5 and no error)
+    resp = client.get("/api/whales?limit=99999")
+    assert resp.status_code == 200
+    assert len(resp.get_json()["hits"]) == 5
+
+
+def test_api_whales_returns_json(client, tmp_path, monkeypatch) -> None:
+    import scryer_whale_watcher as ww
+
+    db = tmp_path / "w.db"
+    store = ww.WhaleStore(db)
+    log = ww.TransferLog(
+        chain_id=56,
+        block_number=999,
+        tx_hash="0x" + "cd" * 32,
+        log_index=2,
+        token_address="0x55d398326f99059ff775485246999027b3197955",
+        from_address="0x" + "11" * 20,
+        to_address="0x" + "22" * 20,
+        amount_raw=70_000 * 10**18,
+    )
+    store.insert_hit(log, symbol="USDT", decimals=18, receiver_is_contract=True)
+
+    monkeypatch.setattr(
+        "scryer_config.get",
+        lambda key, default=None: str(db) if key == "WHALE_WATCHER_DB" else default,
+    )
+
+    resp = client.get("/api/whales?chain=56&limit=10")
+    assert resp.is_json
+    payload = resp.get_json()
+    assert payload["db_exists"] is True
+    assert payload["totals"]["total"] == 1
+    assert len(payload["hits"]) == 1
+    assert payload["hits"][0]["token_symbol"] == "USDT"
+    assert payload["hits"][0]["chain_name"] == "BSC"
+    assert "bscscan.com/tx/" in payload["hits"][0]["tx_explorer_url"]

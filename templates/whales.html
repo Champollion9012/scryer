@@ -1,0 +1,101 @@
+{% extends "base.html" %}
+{% block title %}Whale Hits - Contract Registry Explorer{% endblock %}
+{% block content %}
+
+<div class="search-box">
+    <form method="GET">
+        <div class="search-row">
+            <input type="text" name="to" placeholder="Filter by receiver address (0x...)" value="{{ filter_to or '' }}">
+            <select name="chain">
+                <option value="">All Chains</option>
+                <option value="1" {{ 'selected' if filter_chain == '1' else '' }}>Ethereum</option>
+                <option value="56" {{ 'selected' if filter_chain == '56' else '' }}>BSC</option>
+                <option value="137" {{ 'selected' if filter_chain == '137' else '' }}>Polygon</option>
+                <option value="42161" {{ 'selected' if filter_chain == '42161' else '' }}>Arbitrum</option>
+                <option value="10" {{ 'selected' if filter_chain == '10' else '' }}>Optimism</option>
+                <option value="8453" {{ 'selected' if filter_chain == '8453' else '' }}>Base</option>
+            </select>
+            <button type="submit">Filter</button>
+        </div>
+    </form>
+</div>
+
+<div class="stats-grid">
+    <div class="stat-card">
+        <div class="value">{{ totals.total }}</div>
+        <div class="label">Hits Stored</div>
+    </div>
+    <div class="stat-card">
+        <div class="value">{{ totals.last_24h }}</div>
+        <div class="label">Last 24h</div>
+    </div>
+    <div class="stat-card">
+        <div class="value">${{ '{:,.0f}'.format(totals.usd_total) }}</div>
+        <div class="label">Total Notional (USD)</div>
+    </div>
+    <div class="stat-card">
+        <div class="value">{{ totals.unique_receivers }}</div>
+        <div class="label">Unique Receivers</div>
+    </div>
+</div>
+
+{% if hits %}
+<table>
+    <thead>
+        <tr>
+            <th>Seen</th>
+            <th>Chain</th>
+            <th>Block</th>
+            <th>Tx</th>
+            <th>Token</th>
+            <th>Amount (USD)</th>
+            <th>From</th>
+            <th>To (Contract)</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for h in hits %}
+        <tr>
+            <td class="hash">{{ h.seen_at[:19] if h.seen_at else '-' }}</td>
+            <td><span class="chain-badge chain-{{ h.chain_id }}">{{ h.chain_name }}</span></td>
+            <td class="hash">{{ h.block_number }}</td>
+            <td>
+                <a href="{{ h.tx_explorer_url }}" target="_blank" rel="noopener" class="address">
+                    {{ h.tx_hash[:10] }}...{{ h.tx_hash[-6:] }}
+                </a>
+            </td>
+            <td><strong>{{ h.token_symbol or '?' }}</strong></td>
+            <td>
+                {% if h.amount_normalized is not none %}
+                    {{ '{:,.2f}'.format(h.amount_normalized) }}
+                {% else %}
+                    -
+                {% endif %}
+            </td>
+            <td><span class="address">{{ h.from_address[:10] }}...{{ h.from_address[-6:] }}</span></td>
+            <td>
+                <a href="/contract/{{ h.chain_id }}/{{ h.to_address }}" class="address">
+                    {{ h.to_address[:10] }}...{{ h.to_address[-6:] }}
+                </a>
+                {% if h.in_registry %}
+                <span class="vuln-badge vuln-low">indexed</span>
+                {% else %}
+                <span class="vuln-badge vuln-medium">unseen</span>
+                {% endif %}
+            </td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% else %}
+<div class="empty-state">
+    {% if not db_exists %}
+        <p>No whale_watcher database yet.</p>
+        <p class="hash">Run <code>python scryer_whale_watcher.py --mode once</code> to start collecting hits.</p>
+    {% else %}
+        <p>No hits matched your filter.</p>
+    {% endif %}
+</div>
+{% endif %}
+
+{% endblock %}

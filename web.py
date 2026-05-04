@@ -205,6 +205,140 @@ def contract_detail(chain_id, address):
     )
 
 
+def _safe_int(value: str | None, *, default: int | None = None) -> int | None:
+    """Parse an int query-string value, returning ``default`` on garbage.
+
+    Avoids 500s on user-supplied junk (e.g. ?chain=foo).
+    """
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+@app.route("/whales")
+def whales():
+    """Recent whale hits collected by scryer_whale_watcher."""
+    filter_chain = request.args.get("chain", "")
+    filter_to = (request.args.get("to") or "").strip().lower() or None
+    chain_id = _safe_int(filter_chain)
+
+    db_path = scryer_config.get("WHALE_WATCHER_DB") or ".whale_watcher.db"
+    hits, totals, db_exists = _load_whale_hits(db_path, chain_id=chain_id, to_address=filter_to)
+    return render_template(
+        "whales.html",
+        page="whales",
+        hits=hits,
+        totals=totals,
+        db_exists=db_exists,
+        filter_chain=filter_chain,
+        filter_to=filter_to,
+    )
+
+
+@app.route("/api/whales")
+def api_whales():
+    """JSON endpoint mirror of /whales (for cron/alerting)."""
+    chain_id = _safe_int(request.args.get("chain"))
+    raw_limit = _safe_int(request.args.get("limit"), default=100) or 100
+    # Clamp to [1, 1000] — negative limits coerce SQLite into "no LIMIT" which
+    # would let an unauthenticated caller pull the entire whale_hits table.
+    limit = max(1, min(raw_limit, 1000))
+    db_path = scryer_config.get("WHALE_WATCHER_DB") or ".whale_watcher.db"
+    hits, totals, db_exists = _load_whale_hits(db_path, chain_id=chain_id, to_address=None, limit=limit)
+    return jsonify({"db_exists": db_exists, "totals": totals, "hits": hits})
+
+
+def _load_whale_hits(
+    db_path: str | Path,
+    *,
+    chain_id: int | None = None,
+    to_address: str | None = None,
+    limit: int = 200,
+) -> tuple[list[dict], dict, bool]:
+    """Read recent hits + summary stats. Returns ([], zeros, False) if DB missing."""
+    import sqlite3
+
+    p = Path(db_path)
+    zero_totals = {"total": 0, "last_24h": 0, "usd_total": 0.0, "unique_receivers": 0}
+    if not p.exists():
+        return [], zero_totals, False
+
+    conn = sqlite3.connect(p)
+    conn.row_factory = sqlite3.Row
+    try:
+        # Defensive: scryer_whale_watcher may not have run yet on this DB.
+        existing = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if "whale_hits" not in existing:
+            return [], zero_totals, True
+
+        # Build hits query
+        params: list = []
+        sql = "SELECT * FROM whale_hits WHERE 1=1"
+        if chain_id is not None:
+            sql += " AND chain_id = ?"
+            params.append(chain_id)
+        if to_address:
+            sql += " AND to_address = ?"
+            params.append(to_address)
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+
+        rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+        # Summary stats (unaffected by current filter — gives global picture)
+        total = conn.execute("SELECT COUNT(*) FROM whale_hits").fetchone()[0]
+        last_24h = conn.execute(
+            "SELECT COUNT(*) FROM whale_hits WHERE seen_at >= datetime('now', '-1 day')"
+        ).fetchone()[0]
+        usd_total = conn.execute("SELECT COALESCE(SUM(amount_normalized), 0) FROM whale_hits").fetchone()[0] or 0.0
+        unique_receivers = conn.execute("SELECT COUNT(DISTINCT to_address) FROM whale_hits").fetchone()[0]
+    finally:
+        conn.close()
+
+    # Cross-reference with the contract registry to mark "indexed" rows.
+    indexed_keys: set[tuple[int, str]] = set()
+    if rows:
+        reg_conn = sqlite3.connect(registry.db_path)
+        try:
+            placeholders = ",".join(["(?,?)"] * len(rows))
+            flat: list = []
+            for r in rows:
+                flat.extend([r["chain_id"], r["to_address"].lower()])
+            indexed = reg_conn.execute(
+                f"SELECT chain_id, lower(address) FROM contracts WHERE (chain_id, lower(address)) IN ({placeholders})",
+                flat,
+            ).fetchall()
+            indexed_keys = {(int(c), str(a).lower()) for c, a in indexed}
+        except sqlite3.OperationalError:
+            # registry DB missing/corrupt — treat all as unseen
+            indexed_keys = set()
+        finally:
+            reg_conn.close()
+
+    enriched: list[dict] = []
+    for r in rows:
+        explorer_base = CHAIN_EXPLORERS.get(r["chain_id"], "https://etherscan.io")
+        enriched.append(
+            {
+                **r,
+                "chain_name": CHAIN_NAMES.get(r["chain_id"], str(r["chain_id"])),
+                "tx_explorer_url": f"{explorer_base}/tx/{r['tx_hash']}",
+                "in_registry": (r["chain_id"], r["to_address"].lower()) in indexed_keys,
+            }
+        )
+
+    totals = {
+        "total": int(total),
+        "last_24h": int(last_24h),
+        "usd_total": float(usd_total),
+        "unique_receivers": int(unique_receivers),
+    }
+    return enriched, totals, True
+
+
 @app.route("/vulnerabilities")
 def vulnerabilities():
     """View vulnerability tags."""
