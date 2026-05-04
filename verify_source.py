@@ -61,6 +61,22 @@ class VerifyResult:
     compiled_no_meta_prefix: str | None = None
     notes: list[str] = field(default_factory=list)
     cache_hit: bool = False
+    immutables_zeroed: int = 0  # how many immutable byte ranges were zeroed before compare
+
+
+@dataclass
+class CompiledArtifact:
+    """Output of :func:`compile_runtime_bytecode`.
+
+    ``bytecode_hex`` is the runtime bytecode (no ``0x`` prefix, lowercase).
+    ``immutable_ranges`` is a flattened list of ``(byte_start, byte_length)``
+    pairs from solc's ``immutableReferences`` field — each entry marks bytes
+    that get filled in at construction time and so must be masked out before
+    comparing recompiled vs. deployed bytecode.
+    """
+
+    bytecode_hex: str
+    immutable_ranges: list[tuple[int, int]] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -254,6 +270,53 @@ def find_solc(version: str | None = None) -> Path | None:
 # ---------------------------------------------------------------------------
 
 
+def _flatten_immutable_refs(refs: dict | None) -> list[tuple[int, int]]:
+    """Flatten solc's ``immutableReferences`` map into ``[(start, length), ...]``.
+
+    Solc emits ``{"<astId>": [{"start": int, "length": int}, ...]}``. The same
+    immutable can be inlined at multiple call sites, so each AST id maps to a
+    list of byte positions in the deployed bytecode.
+    """
+    flat: list[tuple[int, int]] = []
+    if not isinstance(refs, dict):
+        return flat
+    for entries in refs.values():
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            start = entry.get("start")
+            length = entry.get("length")
+            if isinstance(start, int) and isinstance(length, int) and length > 0:
+                flat.append((start, length))
+    return flat
+
+
+def zero_immutable_ranges(bytecode_hex: str, ranges: list[tuple[int, int]]) -> str:
+    """Zero out the bytes covered by ``ranges`` (each ``(start_byte, length_byte)``).
+
+    Operates on the lowercase hex string (no ``0x`` prefix). Out-of-range
+    entries are silently skipped — defensive against length mismatch between
+    a recompile and on-chain code that has been truncated/padded.
+    """
+    if not ranges:
+        return bytecode_hex
+    bc = bytecode_hex.lower()
+    if bc.startswith("0x"):
+        bc = bc[2:]
+    chars = list(bc)
+    total = len(chars)
+    for start_byte, length_byte in ranges:
+        start_char = start_byte * 2
+        end_char = start_char + length_byte * 2
+        if start_char < 0 or end_char > total:
+            continue
+        for i in range(start_char, end_char):
+            chars[i] = "0"
+    return "".join(chars)
+
+
 def compile_runtime_bytecode(
     sources: dict[str, str],
     settings: dict,
@@ -262,19 +325,22 @@ def compile_runtime_bytecode(
     target_contract: str,
     solc_path: Path,
     timeout_s: int = 120,
-) -> str:
-    """Compile via ``solc --standard-json`` and return runtime bytecode hex.
+) -> CompiledArtifact:
+    """Compile via ``solc --standard-json`` and return runtime + immutable refs.
 
     ``settings`` should mirror what was in the metadata (optimizer, evmVersion,
     libraries, remappings); ``outputSelection`` is overridden to ensure
-    ``deployedBytecode`` is emitted.
+    ``deployedBytecode`` (and its ``immutableReferences``) is emitted so
+    callers can mask immutable byte ranges before comparing to deployed code.
     """
     # Strip metadata-only keys solc's standard-json rejects (compilationTarget
     # is a Sourcify breadcrumb, not a compiler setting). Override outputSelection
-    # to make sure deployedBytecode is emitted.
+    # to make sure deployedBytecode + immutableReferences are emitted.
     _SETTINGS_BLOCKLIST = {"compilationTarget", "outputSelection"}
     full_settings = {k: v for k, v in settings.items() if k not in _SETTINGS_BLOCKLIST}
-    full_settings["outputSelection"] = {"*": {"*": ["evm.deployedBytecode.object"]}}
+    full_settings["outputSelection"] = {
+        "*": {"*": ["evm.deployedBytecode.object", "evm.deployedBytecode.immutableReferences"]}
+    }
 
     standard_input = {
         "language": "Solidity",
@@ -304,11 +370,13 @@ def compile_runtime_bytecode(
     contracts = out.get("contracts", {}) or {}
     file_out = contracts.get(target_file) or {}
     contract_out = file_out.get(target_contract) or {}
-    deployed = ((contract_out.get("evm") or {}).get("deployedBytecode") or {}).get("object", "") or ""
+    deployed_obj = (contract_out.get("evm") or {}).get("deployedBytecode") or {}
+    deployed = deployed_obj.get("object", "") or ""
     if not deployed:
         available = [f"{f}:{c}" for f, cs in contracts.items() for c in (cs or {})]
         raise RuntimeError(f"no deployedBytecode for {target_file}:{target_contract}; available={available}")
-    return deployed.lower()
+    immutables = _flatten_immutable_refs(deployed_obj.get("immutableReferences"))
+    return CompiledArtifact(bytecode_hex=deployed.lower(), immutable_ranges=immutables)
 
 
 # ---------------------------------------------------------------------------
@@ -500,13 +568,15 @@ def _verify_contract_uncached(
 
     # Compile
     try:
-        compiled = compile_runtime_bytecode(
+        artifact = compile_runtime_bytecode(
             sources,
             settings,
             target_file=target_file,
             target_contract=target_contract,
             solc_path=solc_path,
         )
+        compiled = artifact.bytecode_hex
+        immutable_ranges = artifact.immutable_ranges
     except Exception as e:
         return VerifyResult(
             verdict="mismatch",
@@ -546,12 +616,25 @@ def _verify_contract_uncached(
             notes=["empty bytecode (EOA or selfdestructed?)"],
         )
 
-    # Compare
-    on_chain_no_meta = strip_metadata_trailer(on_chain)
-    compiled_no_meta = strip_metadata_trailer(compiled)
-
+    # Mask immutables before comparing — they're filled in at construction
+    # time from constructor args, so the recompiled deployedBytecode has
+    # placeholder zeros there while on-chain has the real values.
     notes: list[str] = []
-    if on_chain == compiled:
+    if immutable_ranges:
+        on_chain_cmp = zero_immutable_ranges(on_chain, immutable_ranges)
+        compiled_cmp = zero_immutable_ranges(compiled, immutable_ranges)
+        bytes_zeroed = sum(length for _, length in immutable_ranges)
+        notes.append(
+            f"masked {len(immutable_ranges)} immutable ref(s) ({bytes_zeroed} bytes) before compare"
+        )
+    else:
+        on_chain_cmp = on_chain
+        compiled_cmp = compiled
+
+    on_chain_no_meta = strip_metadata_trailer(on_chain_cmp)
+    compiled_no_meta = strip_metadata_trailer(compiled_cmp)
+
+    if on_chain_cmp == compiled_cmp:
         verdict: VerifyVerdict = "full_match"
     elif on_chain_no_meta == compiled_no_meta and on_chain_no_meta:
         verdict = "partial_match"
@@ -579,6 +662,7 @@ def _verify_contract_uncached(
         on_chain_no_meta_prefix=on_chain_no_meta[:64],
         compiled_no_meta_prefix=compiled_no_meta[:64],
         notes=notes,
+        immutables_zeroed=len(immutable_ranges),
     )
 
 

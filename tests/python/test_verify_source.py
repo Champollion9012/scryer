@@ -109,13 +109,16 @@ def test_find_solc_returns_none_if_no_match(monkeypatch) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _solc_output(deployed_object: str) -> str:
+def _solc_output(deployed_object: str, *, immutable_refs: dict | None = None) -> str:
+    deployed: dict = {"object": deployed_object}
+    if immutable_refs is not None:
+        deployed["immutableReferences"] = immutable_refs
     return json.dumps(
         {
             "errors": [],
             "contracts": {
                 "scripts/1.sol": {
-                    "test": {"evm": {"deployedBytecode": {"object": deployed_object}}}
+                    "test": {"evm": {"deployedBytecode": deployed}}
                 }
             },
         }
@@ -125,22 +128,86 @@ def _solc_output(deployed_object: str) -> str:
 def test_compile_runtime_bytecode_returns_deployed_object() -> None:
     fake_proc = SimpleNamespace(returncode=0, stdout=_solc_output("60806040DEAD"), stderr="")
     with patch.object(vs.subprocess, "run", return_value=fake_proc) as mock_run:
-        out = vs.compile_runtime_bytecode(
+        artifact = vs.compile_runtime_bytecode(
             sources={"scripts/1.sol": "contract test{}"},
             settings={"optimizer": {"enabled": False}, "evmVersion": "paris"},
             target_file="scripts/1.sol",
             target_contract="test",
             solc_path=Path("/fake/solc"),
         )
-    assert out == "60806040dead"
+    assert artifact.bytecode_hex == "60806040dead"
+    assert artifact.immutable_ranges == []
     # standard-json invocation contract
     args, kwargs = mock_run.call_args
     assert args[0] == [str(Path("/fake/solc")), "--standard-json"]
     payload = json.loads(kwargs["input"])
     assert payload["language"] == "Solidity"
-    # outputSelection must request deployedBytecode
+    # outputSelection must request both the bytecode object AND immutableReferences
     sel = payload["settings"]["outputSelection"]["*"]["*"]
     assert "evm.deployedBytecode.object" in sel
+    assert "evm.deployedBytecode.immutableReferences" in sel
+
+
+# ---------------------------------------------------------------------------
+# Immutable ranges: parse + zero-out helpers
+# ---------------------------------------------------------------------------
+
+
+def test_flatten_immutable_refs_handles_solc_format() -> None:
+    """Each AST id maps to a list of {start, length} entries — flatten all of them."""
+    refs = {
+        "12": [{"start": 100, "length": 32}, {"start": 500, "length": 32}],
+        "34": [{"start": 200, "length": 32}],
+    }
+    out = vs._flatten_immutable_refs(refs)
+    assert sorted(out) == [(100, 32), (200, 32), (500, 32)]
+
+
+def test_flatten_immutable_refs_skips_garbage() -> None:
+    refs = {
+        "1": [{"start": 10, "length": 32}],
+        "2": "not-a-list",
+        "3": [None, {}, {"start": 20}],  # missing length
+        "4": [{"start": 30, "length": 0}],  # zero-length
+        "5": [{"start": "string", "length": 32}],  # wrong type
+    }
+    assert vs._flatten_immutable_refs(refs) == [(10, 32)]
+
+
+def test_flatten_immutable_refs_handles_none_or_empty() -> None:
+    assert vs._flatten_immutable_refs(None) == []
+    assert vs._flatten_immutable_refs({}) == []
+
+
+def test_zero_immutable_ranges_zeros_specified_bytes() -> None:
+    # 8 bytes total: aabbccddeeff1122
+    bc = "aabbccddeeff1122"
+    # Zero bytes [2,4) — chars [4,8)
+    out = vs.zero_immutable_ranges(bc, [(2, 2)])
+    assert out == "aabb0000eeff1122"
+
+
+def test_zero_immutable_ranges_handles_multiple_ranges() -> None:
+    bc = "aabbccddeeff1122"
+    out = vs.zero_immutable_ranges(bc, [(0, 1), (3, 1), (7, 1)])
+    assert out == "00bbcc00eeff1100"
+
+
+def test_zero_immutable_ranges_no_op_when_empty() -> None:
+    bc = "aabbccddeeff"
+    assert vs.zero_immutable_ranges(bc, []) == bc
+
+
+def test_zero_immutable_ranges_skips_out_of_bounds() -> None:
+    """An out-of-range entry must NOT crash; valid entries still apply."""
+    bc = "aabbccdd"  # 4 bytes
+    out = vs.zero_immutable_ranges(bc, [(1, 1), (10, 5)])  # 2nd is out of bounds
+    assert out == "aa00ccdd"
+
+
+def test_zero_immutable_ranges_strips_0x_prefix() -> None:
+    out = vs.zero_immutable_ranges("0xaabbccdd", [(0, 1)])
+    assert out == "00bbccdd"
 
 
 def test_compile_raises_on_solc_error() -> None:
@@ -245,6 +312,59 @@ def test_verify_full_match(tmp_path: Path) -> None:
     assert result.verdict == "full_match"
     assert result.compiler_version == "0.8.34+commit.80d5c536"
     assert result.on_chain_size == result.compiled_size
+    assert result.immutables_zeroed == 0  # no immutables in this fixture
+
+
+def test_verify_full_match_with_immutables_zeroed(tmp_path: Path) -> None:
+    """The original Resolv-style failure: same size, single byte differs, due to
+    an immutable filled in at construction. solc reports the byte range; we
+    mask it out and the contract verifies cleanly.
+    """
+    addr = "0x" + "fa" * 20
+    sources_dir = _seed_meta_and_source(tmp_path, chain_id=1, address=addr)
+
+    # 32 bytes of "code" + 8-byte trailer + 2-byte length suffix.
+    # Imagine the 32-byte slot at byte offset 16 is an immutable address.
+    runtime_code_compiled = "ff" * 16 + "00" * 32 + "ee" * 4 + "0008"   # immutable = zeros
+    runtime_code_on_chain = "ff" * 16 + "ab" * 32 + "ee" * 4 + "0008"   # immutable = real address
+    immutable_refs = {"42": [{"start": 16, "length": 32}]}
+
+    fake_proc = SimpleNamespace(
+        returncode=0, stdout=_solc_output(runtime_code_compiled, immutable_refs=immutable_refs), stderr=""
+    )
+    with patch.object(vs.subprocess, "run", return_value=fake_proc), \
+         patch.object(vs.scryer_http, "sync_client", return_value=_fake_rpc_post(runtime_code_on_chain)), \
+         patch.object(vs, "find_solc", return_value=Path("/fake/solc")):
+        result = vs.verify_contract(1, addr, sources_dir=sources_dir, rpc_url="http://stub")
+
+    assert result.verdict == "full_match", f"got {result.verdict}: {result.notes}"
+    assert result.immutables_zeroed == 1
+    assert any("masked 1 immutable" in n for n in result.notes)
+
+
+def test_verify_mismatch_remains_when_runtime_actually_differs_around_immutables(tmp_path: Path) -> None:
+    """If the bytes OUTSIDE immutable ranges differ, masking shouldn't paper over it.
+    """
+    addr = "0x" + "fb" * 20
+    sources_dir = _seed_meta_and_source(tmp_path, chain_id=1, address=addr)
+    # immutable at [16, 48); but we tweak a byte at offset 4 too — that should
+    # still produce a real mismatch.
+    compiled = "ff" * 4 + "AA" + "ff" * 11 + "00" * 32 + "ee" * 4 + "0008"
+    on_chain = "ff" * 4 + "BB" + "ff" * 11 + "ab" * 32 + "ee" * 4 + "0008"
+    immutable_refs = {"7": [{"start": 16, "length": 32}]}
+
+    fake_proc = SimpleNamespace(
+        returncode=0, stdout=_solc_output(compiled, immutable_refs=immutable_refs), stderr=""
+    )
+    with patch.object(vs.subprocess, "run", return_value=fake_proc), \
+         patch.object(vs.scryer_http, "sync_client", return_value=_fake_rpc_post(on_chain)), \
+         patch.object(vs, "find_solc", return_value=Path("/fake/solc")):
+        result = vs.verify_contract(1, addr, sources_dir=sources_dir, rpc_url="http://stub")
+
+    assert result.verdict == "mismatch"
+    assert result.immutables_zeroed == 1
+    # Real diff at hex char 8 (byte 4 -> char 8)
+    assert any("first byte differs at hex char index 8" in n for n in result.notes)
 
 
 def test_verify_partial_match_when_only_trailer_differs(tmp_path: Path) -> None:
