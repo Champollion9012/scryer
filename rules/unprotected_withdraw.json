@@ -1,0 +1,44 @@
+[
+  {
+    "rule_id": "CALL_GAS_FORWARD_FULL",
+    "severity": "High",
+    "title": "Low-level call forwards all remaining gas (reentrancy door)",
+    "pattern": "\\.call\\s*\\{[^}]*gas\\s*:\\s*(gasleft\\s*\\(\\s*\\)|msg\\.gas)"
+  },
+  {
+    "rule_id": "PUBLIC_WITHDRAW_FN_PARAM_RECEIVER",
+    "severity": "High",
+    "title": "Withdraw/claim/distribute fn signature takes an address parameter",
+    "pattern": "function\\s+(withdraw|withdrawTo|withdrawFor|claim|claimTo|claimFor|payout|distribute|distributeTo|sweep|drain|rescue|rescueTokens|migrate|emergencyWithdraw|transferOut|adminWithdraw|batchClaim|batchDistribute|batchWithdraw|forwardTokens)[A-Za-z0-9_]*\\s*\\(\\s*(address|address\\[\\])"
+  },
+  {
+    "rule_id": "TRANSFER_TO_PARAM_RECEIVER",
+    "severity": "Medium",
+    "title": "transfer/send/sendValue with a parameter-named recipient (caller-controlled)",
+    "pattern": "\\.(transfer|safeTransfer|send|sendValue|safeTransferFrom)\\s*\\(\\s*(_?to|_?recipient|_?receiver|_?beneficiary|_?payee|_?destination|_?dest|_?target)\\b"
+  },
+  {
+    "rule_id": "BATCH_TRANSFER_INDEXED_RECEIVER",
+    "severity": "High",
+    "title": "transfer/call to indexed receivers[i] inside a loop (per-element auth often missing)",
+    "pattern": "\\.(transfer|safeTransfer|safeTransferFrom|send|sendValue|call)\\s*\\(\\s*[a-zA-Z_][a-zA-Z0-9_]*\\s*\\[\\s*[ijk_a-zA-Z]+\\s*\\]"
+  },
+  {
+    "rule_id": "CALL_VALUE_TO_PARAM",
+    "severity": "High",
+    "title": "Low-level call with value to caller-controlled address",
+    "pattern": "(_?to|_?recipient|_?receiver|_?beneficiary|_?payee|_?destination|_?target)\\s*\\.\\s*call\\s*\\{[^}]*value\\s*:"
+  },
+  {
+    "rule_id": "PAYABLE_TO_PARAM_RECEIVER",
+    "severity": "Medium",
+    "title": "payable(to).transfer / payable(to).call with parameter-named address",
+    "pattern": "payable\\s*\\(\\s*(_?to|_?recipient|_?receiver|_?beneficiary|_?payee|_?destination|_?target)\\s*\\)\\s*\\.\\s*(transfer|send|call)"
+  },
+  {
+    "rule_id": "MISSING_OWNER_RECEIVER_BINDING",
+    "severity": "Info",
+    "title": "Function has both an `owner` and a separate `receiver`/`to` parameter (verify they are bound)",
+    "pattern": "function\\s+[A-Za-z0-9_]+\\s*\\([^)]*\\baddress\\s+(_?owner|_?from|_?account|_?holder)\\b[^)]*\\baddress\\s+(_?to|_?receiver|_?recipient|_?beneficiary)\\b"
+  }
+]
