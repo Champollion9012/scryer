@@ -282,17 +282,39 @@ def get_sourcify_source(chain_id: int, address: str):
                     continue
 
     if sources:
-        return sources, metadata, "Sourcify success"
+        # Stash match_type into metadata so download_meta.json persists it.
+        # "perfect" / "full_match" means deployed bytecode (incl. metadata
+        # trailer) matches source 1:1. "partial_match" only guarantees runtime
+        # behavior — variable names, comments, hex-literal layout may differ.
+        # Downstream LLM/regex analysis should treat partial as "trustworthy
+        # for behavior, not for cosmetic specifics".
+        if isinstance(metadata, dict):
+            metadata.setdefault("sourcify_match_type", match_type)
+        return sources, metadata, f"Sourcify success ({match_type})"
     return None, None, "Sourcify download failed"
 
 
+_BLOCKSCOUT_BASE_URLS: dict[int, list[str]] = {
+    1: ["https://eth.blockscout.com/api/v2"],
+    10: ["https://optimism.blockscout.com/api/v2"],
+    56: [
+        "https://bsc.blockscout.com/api/v2",
+        "https://blockscout.com/bnb/mainnet/api/v2",
+    ],
+    137: ["https://polygon.blockscout.com/api/v2"],
+    250: ["https://ftmscan.blockscout.com/api/v2"],
+    8453: ["https://base.blockscout.com/api/v2"],
+    42161: ["https://arbitrum.blockscout.com/api/v2"],
+    43114: ["https://snowtrace.io/api/v2"],
+}
+
+
 def get_blockscout_source(chain_id: int, address: str):
-    """Fallback: Blockscout BSC 實例 API"""
-    # 依序嘗試幾個 Blockscout 實例
-    api_urls = [
-        f"https://bsc.blockscout.com/api/v2/smart-contracts/{address.lower()}",
-        f"https://blockscout.com/bnb/mainnet/api/v2/smart-contracts/{address.lower()}",
-    ]
+    """Fallback: per-chain Blockscout instance API."""
+    bases = _BLOCKSCOUT_BASE_URLS.get(chain_id, [])
+    if not bases:
+        return None, None, f"no Blockscout base URL configured for chain_id={chain_id}"
+    api_urls = [f"{base}/smart-contracts/{address.lower()}" for base in bases]
     errors = []
     for api_url in api_urls:
         r = HTTP.get(api_url)
@@ -401,6 +423,12 @@ def get_bscscan_source(chain_id: int, address: str):
 
         if not sources:
             sources = {"combined_source.sol": source_code_raw}
+
+        # Etherscan returns an empty SourceCode when the contract is not
+        # verified — don't treat that as success or we silently write 0-byte
+        # files and downstream tools (regex/slither/LLM) get nothing.
+        if not any((content or "").strip() for content in sources.values()):
+            return None, None, f"contract not verified on {label} (empty SourceCode)"
 
         metadata = {
             "compiler": {"version": result.get("CompilerVersion", "")},
