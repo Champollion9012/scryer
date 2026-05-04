@@ -48,6 +48,19 @@ def main() -> int:
     parser.add_argument("--force-map-reduce", action="store_true")
     parser.add_argument("--slither", action="store_true")
     parser.add_argument("--disable-regex-scan", action="store_true")
+    parser.add_argument(
+        "--regex-rules",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="Forward extra regex-rule JSON file(s) to audit_contracts.py.",
+    )
+    parser.add_argument(
+        "--source-verify",
+        choices=["off", "warn", "strict"],
+        default="off",
+        help="Forward --source-verify to audit_contracts.py.",
+    )
 
     args = parser.parse_args()
 
@@ -140,6 +153,10 @@ def main() -> int:
         cmd.append("--slither")
     if args.disable_regex_scan:
         cmd.append("--disable-regex-scan")
+    for rules_path in args.regex_rules or []:
+        cmd.extend(["--regex-rules", str(rules_path)])
+    if args.source_verify and args.source_verify != "off":
+        cmd.extend(["--source-verify", args.source_verify])
 
     manifest["audit_command"] = cmd
     (run_root / "pipeline_manifest.json").write_text(

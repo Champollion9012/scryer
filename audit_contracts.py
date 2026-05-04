@@ -21,8 +21,9 @@ import scryer_config
 from cache import AuditCache
 from llm_providers import get_provider
 from report_renderer import render_markdown
-from scanners import run_regex_scan, run_slither
+from scanners import DEFAULT_REGEX_RULES, RegexRule, load_rules_from_file, run_regex_scan, run_slither
 from scryer_logging import get_logger
+from verify_source import VerifyCache, verify_contract
 
 _log = get_logger(__name__)
 
@@ -613,6 +614,31 @@ def main() -> int:
         "--disable-regex-scan", action="store_true", help="Disable heuristic regex scan in the prompt context."
     )
     parser.add_argument(
+        "--regex-rules",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help=(
+            "Path to a JSON file with extra regex rules (appended to built-in defaults). "
+            "May be passed multiple times. See rules/ for examples."
+        ),
+    )
+    parser.add_argument(
+        "--source-verify",
+        choices=["off", "warn", "strict"],
+        default="off",
+        help=(
+            "Locally recompile and compare to deployed bytecode before auditing. "
+            "'warn' logs verdict; 'strict' aborts the group on mismatch. Requires "
+            "matching solc on PATH (or via solc-select)."
+        ),
+    )
+    parser.add_argument(
+        "--no-verify-cache",
+        action="store_true",
+        help="Disable the .verify_cache.db SQLite cache (always re-run RPC + recompile).",
+    )
+    parser.add_argument(
         "--slither", action="store_true", help="Run slither (if installed) and include results in the prompt context."
     )
     parser.add_argument("--slither-timeout", type=int, default=300, help="Slither timeout in seconds.")
@@ -689,6 +715,9 @@ def main() -> int:
     groups_root = run_root / "groups"
 
     audit_cache: AuditCache | None = None if args.no_cache else AuditCache()
+    verify_cache: VerifyCache | None = (
+        None if args.no_verify_cache or args.source_verify == "off" else VerifyCache()
+    )
 
     if args.dry_run:
         for key, files in groups.items():
@@ -720,7 +749,9 @@ def main() -> int:
             "prompt_tokens": 0,
             "completion_tokens": 0,
             "cost_usd_est": 0.0 if cost_enabled else None,
+            "aborted_by_source_verify": 0,
         },
+        "aborted_groups": [],
         "groups": [],
     }
 
@@ -819,10 +850,91 @@ def main() -> int:
                 chain_id_value, address_value = key.split("_", 1)
 
         analysis_payload: dict = {}
+
+        # Source verification: recompile & compare to deployed bytecode. Only
+        # runs when we can derive a real (chain_id, address) from the group key.
+        source_verify_hint: str | None = None
+        if args.source_verify != "off":
+            if address_value != "Unknown" and chain_id_value != "Unknown":
+                try:
+                    verify_result = verify_contract(
+                        chain_id=int(chain_id_value),
+                        address=address_value,
+                        sources_dir=sources_root,
+                        cache=verify_cache,
+                    )
+                    verify_dict = {
+                        "verdict": verify_result.verdict,
+                        "compiler_version": verify_result.compiler_version,
+                        "on_chain_size": verify_result.on_chain_size,
+                        "compiled_size": verify_result.compiled_size,
+                        "notes": list(verify_result.notes or []),
+                        "cache_hit": verify_result.cache_hit,
+                    }
+                    analysis_payload["source_verify"] = verify_dict
+                    if verify_result.verdict == "mismatch":
+                        if args.source_verify == "strict":
+                            _log.error(
+                                "STRICT: source_verify=mismatch for %s; aborting group. notes=%s",
+                                key,
+                                verify_result.notes,
+                            )
+                            return {
+                                "_aborted": True,
+                                "key": key,
+                                "reason": "source_verify_mismatch",
+                                "verdict": "mismatch",
+                                "notes": list(verify_result.notes or []),
+                            }
+                        _log.warning(
+                            "source_verify=mismatch for %s — proceeding because --source-verify=warn. notes=%s",
+                            key,
+                            verify_result.notes,
+                        )
+                        source_verify_hint = (
+                            "[source_verify hint] WARNING: Local recompilation produced bytecode that "
+                            "does NOT match the deployed contract. The source you are analyzing may have "
+                            "been altered; cite findings carefully and flag any conclusions that depend "
+                            "on source-only details (variable names, comments, or string literals)."
+                        )
+                    elif verify_result.verdict == "partial_match":
+                        _log.info("source_verify=partial_match for %s (cache_hit=%s)", key, verify_result.cache_hit)
+                        source_verify_hint = (
+                            "[source_verify hint] This contract was independently re-compiled. The "
+                            "deployed runtime bytecode is byte-for-byte identical to the source EXCEPT "
+                            "the metadata trailer (IPFS hash). Variable names, comments, and licence "
+                            "headers may differ from what the deployer originally uploaded — focus on "
+                            "behavior, not on naming or surface text."
+                        )
+                    else:
+                        _log.info(
+                            "source_verify=%s for %s (cache_hit=%s)",
+                            verify_result.verdict,
+                            key,
+                            verify_result.cache_hit,
+                        )
+                except Exception as e:
+                    _log.warning("source_verify exception for %s: %s", key, e)
+                    analysis_payload["source_verify"] = {"verdict": "error", "error": str(e)}
+            else:
+                analysis_payload["source_verify"] = {
+                    "verdict": "skipped",
+                    "reason": "could not derive chain_id+address from group key",
+                }
+
         if args.disable_regex_scan:
             analysis_payload["regex_scan"] = {"disabled": True}
         else:
-            analysis_payload["regex_scan"] = run_regex_scan(files, root=sources_root)
+            extra_rules: list[RegexRule] = []
+            for rules_path in args.regex_rules or []:
+                try:
+                    extra_rules.extend(load_rules_from_file(Path(rules_path)))
+                except Exception as e:
+                    _log.warning("Failed to load --regex-rules %s: %s", rules_path, e)
+            active_rules = list(DEFAULT_REGEX_RULES) + extra_rules if extra_rules else None
+            analysis_payload["regex_scan"] = run_regex_scan(files, root=sources_root, rules=active_rules)
+            if extra_rules:
+                analysis_payload["regex_scan"]["custom_rule_files"] = list(args.regex_rules)
         if args.slither:
             analysis_payload["slither"] = run_slither(files, sources_root=sources_root, timeout_s=args.slither_timeout)
         else:
@@ -832,6 +944,11 @@ def main() -> int:
             json.dumps(analysis_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
         )
         analysis_text = json.dumps(analysis_payload, ensure_ascii=False, indent=2)
+        # Prepend a plain-text hint when source verification revealed something
+        # the LLM should adjust its conclusions for. Goes in front of the JSON
+        # so it's seen first regardless of token-budget truncation.
+        if source_verify_hint:
+            analysis_text = source_verify_hint + "\n\n" + analysis_text
 
         files_md, blocks = build_file_blocks(
             files,
@@ -1068,6 +1185,14 @@ def main() -> int:
     for entry in results:
         if entry is None:
             continue
+        if entry.get("_aborted"):
+            # strict --source-verify mismatch: track separately so the user
+            # can see what got skipped without it disappearing silently.
+            manifest["aborted_groups"].append(
+                {k: v for k, v in entry.items() if k != "_aborted"}
+            )
+            manifest["totals"]["aborted_by_source_verify"] += 1
+            continue
         manifest["groups"].append(entry)
         manifest["totals"]["calls"] += entry["calls"]
         manifest["totals"]["prompt_tokens"] += entry["prompt_tokens"]
@@ -1076,6 +1201,7 @@ def main() -> int:
             manifest["totals"]["cost_usd_est"] += float(entry["cost_usd_est"])
 
     manifest["groups"].sort(key=lambda g: g["key"])
+    manifest["aborted_groups"].sort(key=lambda g: g["key"])
 
     (run_root / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 

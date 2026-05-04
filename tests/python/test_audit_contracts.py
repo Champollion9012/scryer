@@ -594,3 +594,277 @@ def test_estimate_cost_without_pricing_skips_dollar_amount(tmp_path: Path, fake_
     captured = capsys.readouterr().out
     assert "Projected cost:" in captured
     assert "(set --price-in-per-1k" in captured
+
+
+# ---------------------------------------------------------------------------
+# --regex-rules: custom rule file is loaded and appended to defaults
+# ---------------------------------------------------------------------------
+
+
+def test_regex_rules_flag_appends_custom_rules(tmp_path: Path, fake_provider) -> None:
+    """A custom rule file fires alongside built-ins; analysis.json records it."""
+    # Vulnerable contract: contains a synthetic pattern only the custom rule catches.
+    sources_root = tmp_path / "sources"
+    contract_dir = sources_root / ("56_0x" + "aa" * 20)
+    contract_dir.mkdir(parents=True)
+    (contract_dir / "X.sol").write_text(
+        "contract X {\n"
+        "    function batchClaim(address[] calldata receivers, uint256[] calldata amounts) external {\n"
+        "        for (uint256 i; i < receivers.length; ++i) {\n"
+        "            IERC20(token).transfer(receivers[i], amounts[i]);\n"
+        "        }\n"
+        "    }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    rules_path = tmp_path / "custom.json"
+    rules_path.write_text(
+        json.dumps(
+            [
+                {
+                    "rule_id": "CUSTOM_BATCH_RECV",
+                    "severity": "High",
+                    "title": "loop-indexed receiver transfer",
+                    "pattern": r"\.transfer\s*\(\s*receivers\[",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    out_dir = _run_audit(tmp_path, sources_root, "--regex-rules", str(rules_path))
+    run_dir = next(out_dir.glob("run_*"))
+    group = json.loads((run_dir / "manifest.json").read_text())["groups"][0]
+    analysis = json.loads((run_dir / group["dir"] / "analysis.json").read_text())
+    assert analysis["regex_scan"]["custom_rule_files"] == [str(rules_path)]
+    finding_ids = {f["rule_id"] for f in analysis["regex_scan"]["findings"]}
+    # Custom rule fired
+    assert "CUSTOM_BATCH_RECV" in finding_ids
+    # Built-in rules still active (UNSAFE_TRANSFER catches `.transfer(`)
+    assert any(rid in finding_ids for rid in ("UNSAFE_TRANSFER", "DOS_UNBOUNDED_LOOP"))
+
+
+def test_regex_rules_bad_path_warns_but_does_not_crash(tmp_path: Path, fake_provider) -> None:
+    """Invalid rules path must not abort the audit — warn and proceed with defaults."""
+    sources_root = _seed_sources(tmp_path)
+    out_dir = _run_audit(tmp_path, sources_root, "--regex-rules", str(tmp_path / "missing.json"))
+    run_dir = next(out_dir.glob("run_*"))
+    group = json.loads((run_dir / "manifest.json").read_text())["groups"][0]
+    analysis = json.loads((run_dir / group["dir"] / "analysis.json").read_text())
+    # File didn't load -> custom_rule_files key absent
+    assert "custom_rule_files" not in analysis["regex_scan"]
+    # But scan still ran with defaults
+    assert "findings" in analysis["regex_scan"]
+
+
+# ---------------------------------------------------------------------------
+# --source-verify: pre-audit bytecode comparison wiring
+# ---------------------------------------------------------------------------
+
+
+def _stub_verify(verdict: str, **extra):
+    """Build a stub for verify_contract that returns a canned VerifyResult."""
+    from verify_source import VerifyResult
+
+    def _fake(chain_id, address, **kwargs):
+        return VerifyResult(
+            verdict=verdict,
+            chain_id=chain_id,
+            address=address.lower(),
+            compiler_version="0.8.20+commit.fake",
+            on_chain_size=extra.get("on_chain_size", 100),
+            compiled_size=extra.get("compiled_size", 100),
+            notes=extra.get("notes", []),
+        )
+
+    return _fake
+
+
+def test_source_verify_off_skips_verification(tmp_path: Path, fake_provider, monkeypatch) -> None:
+    sources_root = _seed_sources(tmp_path)
+    called = []
+    monkeypatch.setattr(ac, "verify_contract", lambda *a, **kw: called.append(1) or _stub_verify("full_match")(*a, **kw))
+
+    out_dir = _run_audit(tmp_path, sources_root, "--disable-regex-scan")
+    run_dir = next(out_dir.glob("run_*"))
+    group = json.loads((run_dir / "manifest.json").read_text())["groups"][0]
+    analysis = json.loads((run_dir / group["dir"] / "analysis.json").read_text())
+
+    assert called == []  # verify_contract never invoked
+    assert "source_verify" not in analysis
+
+
+def test_source_verify_warn_records_verdict_in_analysis(tmp_path: Path, fake_provider, monkeypatch) -> None:
+    sources_root = _seed_sources(tmp_path)
+    monkeypatch.setattr(ac, "verify_contract", _stub_verify("partial_match", notes=["trailer differs"]))
+
+    out_dir = _run_audit(tmp_path, sources_root, "--disable-regex-scan", "--source-verify", "warn")
+    run_dir = next(out_dir.glob("run_*"))
+    group = json.loads((run_dir / "manifest.json").read_text())["groups"][0]
+    analysis = json.loads((run_dir / group["dir"] / "analysis.json").read_text())
+
+    sv = analysis["source_verify"]
+    assert sv["verdict"] == "partial_match"
+    assert sv["compiler_version"] == "0.8.20+commit.fake"
+    assert "trailer differs" in sv["notes"]
+
+
+def test_source_verify_warn_proceeds_on_mismatch(tmp_path: Path, fake_provider, monkeypatch) -> None:
+    """warn: log + record but still produce an audit report."""
+    sources_root = _seed_sources(tmp_path)
+    monkeypatch.setattr(ac, "verify_contract", _stub_verify("mismatch", notes=["first byte differs at 4/100"]))
+
+    out_dir = _run_audit(tmp_path, sources_root, "--disable-regex-scan", "--source-verify", "warn")
+    run_dir = next(out_dir.glob("run_*"))
+    manifest = json.loads((run_dir / "manifest.json").read_text())
+    # Group still in manifest (audit ran)
+    assert len(manifest["groups"]) == 1
+    sv = json.loads((run_dir / manifest["groups"][0]["dir"] / "analysis.json").read_text())["source_verify"]
+    assert sv["verdict"] == "mismatch"
+
+
+def test_source_verify_strict_aborts_on_mismatch(tmp_path: Path, fake_provider, monkeypatch) -> None:
+    """strict: mismatch returns None from _audit_one_group; group not in manifest."""
+    sources_root = _seed_sources(tmp_path)
+    monkeypatch.setattr(ac, "verify_contract", _stub_verify("mismatch", notes=["forensic divergence"]))
+
+    out_dir = _run_audit(
+        tmp_path, sources_root, "--disable-regex-scan", "--source-verify", "strict", "--no-verify-cache"
+    )
+    run_dir = next(out_dir.glob("run_*"))
+    manifest = json.loads((run_dir / "manifest.json").read_text())
+    # Group should not be in `groups` (aborted) but tracked in `aborted_groups`
+    assert manifest["groups"] == []
+    assert manifest["totals"]["aborted_by_source_verify"] == 1
+    assert len(manifest["aborted_groups"]) == 1
+    aborted = manifest["aborted_groups"][0]
+    assert aborted["reason"] == "source_verify_mismatch"
+    assert aborted["verdict"] == "mismatch"
+    assert "forensic divergence" in aborted["notes"]
+    # Group key should be preserved for traceability
+    assert aborted["key"].startswith("56_0x")
+
+
+def test_source_verify_skipped_when_address_unknown(tmp_path: Path, fake_provider, monkeypatch) -> None:
+    """Group keyed without chain_id+address (e.g. group_by=all) records skipped reason."""
+    sources_root = _seed_sources(tmp_path)
+    called = []
+    monkeypatch.setattr(ac, "verify_contract", lambda *a, **kw: called.append(1) or _stub_verify("full_match")(*a, **kw))
+
+    out_dir = _run_audit(
+        tmp_path, sources_root, "--disable-regex-scan", "--source-verify", "warn", "--group-by", "all"
+    )
+    run_dir = next(out_dir.glob("run_*"))
+    group = json.loads((run_dir / "manifest.json").read_text())["groups"][0]
+    analysis = json.loads((run_dir / group["dir"] / "analysis.json").read_text())
+
+    assert called == []  # not called because chain_id/address weren't extractable
+    assert analysis["source_verify"]["verdict"] == "skipped"
+
+
+def test_partial_match_injects_llm_hint(tmp_path: Path, fake_provider, monkeypatch) -> None:
+    """partial_match prepends a behavioural-equivalence note to the LLM context.
+
+    The hint must reach the saved prompt files (so the LLM literally sees it).
+    """
+    sources_root = _seed_sources(tmp_path)
+    monkeypatch.setattr(ac, "verify_contract", _stub_verify("partial_match", notes=["trailer differs"]))
+
+    out_dir = _run_audit(
+        tmp_path, sources_root, "--disable-regex-scan", "--source-verify", "warn", "--no-verify-cache"
+    )
+    run_dir = next(out_dir.glob("run_*"))
+    group = json.loads((run_dir / "manifest.json").read_text())["groups"][0]
+
+    # The prompt(s) saved to disk must contain the hint
+    prompts_dir = run_dir / group["dir"] / "prompts"
+    prompt_files = list(prompts_dir.glob("*.txt"))
+    assert prompt_files, "no prompt files written"
+    combined = "\n".join(p.read_text(encoding="utf-8") for p in prompt_files)
+    assert "[source_verify hint]" in combined
+    assert "byte-for-byte identical" in combined
+    assert "Variable names" in combined
+
+
+def test_mismatch_warn_injects_stronger_hint(tmp_path: Path, fake_provider, monkeypatch) -> None:
+    """mismatch (warn mode) needs a stronger WARNING hint, not the partial_match wording."""
+    sources_root = _seed_sources(tmp_path)
+    monkeypatch.setattr(ac, "verify_contract", _stub_verify("mismatch", notes=["differs at index 4"]))
+
+    out_dir = _run_audit(
+        tmp_path, sources_root, "--disable-regex-scan", "--source-verify", "warn", "--no-verify-cache"
+    )
+    run_dir = next(out_dir.glob("run_*"))
+    group = json.loads((run_dir / "manifest.json").read_text())["groups"][0]
+    prompts_dir = run_dir / group["dir"] / "prompts"
+    combined = "\n".join(p.read_text(encoding="utf-8") for p in prompts_dir.glob("*.txt"))
+    assert "[source_verify hint] WARNING" in combined
+    assert "may have been altered" in combined
+    # Must NOT also include the partial_match wording — only one hint
+    assert "byte-for-byte identical" not in combined
+
+
+def test_full_match_does_not_inject_hint(tmp_path: Path, fake_provider, monkeypatch) -> None:
+    """full_match is the happy path — no prompt pollution."""
+    sources_root = _seed_sources(tmp_path)
+    monkeypatch.setattr(ac, "verify_contract", _stub_verify("full_match"))
+
+    out_dir = _run_audit(
+        tmp_path, sources_root, "--disable-regex-scan", "--source-verify", "warn", "--no-verify-cache"
+    )
+    run_dir = next(out_dir.glob("run_*"))
+    group = json.loads((run_dir / "manifest.json").read_text())["groups"][0]
+    prompts_dir = run_dir / group["dir"] / "prompts"
+    combined = "\n".join(p.read_text(encoding="utf-8") for p in prompts_dir.glob("*.txt"))
+    assert "[source_verify hint]" not in combined
+
+
+def test_verify_cache_passed_when_enabled(tmp_path: Path, fake_provider, monkeypatch) -> None:
+    """audit_contracts must pass a non-None VerifyCache to verify_contract by default.
+
+    End-to-end cache HIT is exercised in test_verify_source.test_verify_contract_uses_cache_on_hit;
+    here we just check the wiring: did audit_contracts plumb the cache through?
+    """
+    sources_root = _seed_sources(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    captured: dict = {}
+
+    def _capture(*a, **kw):
+        captured["cache"] = kw.get("cache")
+        return _stub_verify("full_match")(*a, **kw)
+
+    monkeypatch.setattr(ac, "verify_contract", _capture)
+    _run_audit(tmp_path, sources_root, "--disable-regex-scan", "--source-verify", "warn")
+
+    from verify_source import VerifyCache as _VC
+    assert isinstance(captured["cache"], _VC), "default behaviour must pass a VerifyCache"
+    # And the SQLite file must have been created at the default path
+    assert (tmp_path / ".verify_cache.db").exists()
+
+
+def test_no_verify_cache_flag_disables_persistence(tmp_path: Path, fake_provider, monkeypatch) -> None:
+    """--no-verify-cache must not create the SQLite file."""
+    sources_root = _seed_sources(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(ac, "verify_contract", _stub_verify("partial_match"))
+
+    _run_audit(
+        tmp_path, sources_root, "--disable-regex-scan", "--source-verify", "warn", "--no-verify-cache"
+    )
+    assert not (tmp_path / ".verify_cache.db").exists()
+
+
+def test_source_verify_exception_does_not_crash_audit(tmp_path: Path, fake_provider, monkeypatch) -> None:
+    sources_root = _seed_sources(tmp_path)
+
+    def _boom(*a, **kw):
+        raise RuntimeError("rpc died")
+
+    monkeypatch.setattr(ac, "verify_contract", _boom)
+    out_dir = _run_audit(tmp_path, sources_root, "--disable-regex-scan", "--source-verify", "warn")
+    run_dir = next(out_dir.glob("run_*"))
+    group = json.loads((run_dir / "manifest.json").read_text())["groups"][0]
+    analysis = json.loads((run_dir / group["dir"] / "analysis.json").read_text())
+    assert analysis["source_verify"]["verdict"] == "error"
+    assert "rpc died" in analysis["source_verify"]["error"]

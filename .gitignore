@@ -28,6 +28,8 @@ decompiled/
 .contract_registry.db
 contract_registry.db
 .audit_cache.db
+.verify_cache.db
+.whale_watcher.db
 source.json
 
 # Foundry

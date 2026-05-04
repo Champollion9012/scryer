@@ -149,6 +149,50 @@ def test_main_full_run_passes_audit_options(tmp_path: Path, fake_downloader, fak
     assert "--disable-regex-scan" in cmd
 
 
+def test_main_forwards_source_verify(tmp_path: Path, fake_downloader, fake_subprocess) -> None:
+    """--source-verify must reach audit_contracts subprocess; 'off' is suppressed."""
+    targets = _write_targets(tmp_path, [{"chain_id": 56, "address": "0x" + "aa" * 20}])
+
+    # Strict mode is forwarded
+    rc = _run_main("--targets", str(targets), "--run-dir", str(tmp_path / "runs/sv1"), "--source-verify", "strict")
+    assert rc == 0
+    cmd = fake_subprocess[0]
+    assert "--source-verify" in cmd and "strict" in cmd
+
+    # Default 'off' is NOT forwarded (keeps subprocess command minimal)
+    fake_subprocess.clear()
+    rc = _run_main("--targets", str(targets), "--run-dir", str(tmp_path / "runs/sv2"))
+    assert rc == 0
+    assert "--source-verify" not in fake_subprocess[0]
+
+
+def test_main_forwards_regex_rules(tmp_path: Path, fake_downloader, fake_subprocess) -> None:
+    """--regex-rules must reach audit_contracts subprocess (multi-file capable)."""
+    targets = _write_targets(tmp_path, [{"chain_id": 56, "address": "0x" + "aa" * 20}])
+    run_dir = tmp_path / "runs" / "regex_rules"
+    rules_a = tmp_path / "a.json"
+    rules_b = tmp_path / "b.json"
+    rules_a.write_text("[]")
+    rules_b.write_text("[]")
+    rc = _run_main(
+        "--targets",
+        str(targets),
+        "--run-dir",
+        str(run_dir),
+        "--regex-rules",
+        str(rules_a),
+        "--regex-rules",
+        str(rules_b),
+    )
+    assert rc == 0
+    cmd = fake_subprocess[0]
+    # Each --regex-rules occurrence is forwarded with its path
+    indices = [i for i, arg in enumerate(cmd) if arg == "--regex-rules"]
+    assert len(indices) == 2
+    forwarded_paths = {cmd[i + 1] for i in indices}
+    assert forwarded_paths == {str(rules_a), str(rules_b)}
+
+
 def test_main_skips_targets_without_address(tmp_path: Path, fake_downloader, fake_subprocess) -> None:
     targets = _write_targets(
         tmp_path,
