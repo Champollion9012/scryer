@@ -57,6 +57,50 @@ A function that mutates balance/debt/position and OMITS a check / state-update /
 
 Real example to anchor on (Euler $200M, March 2023): `donateToReserves(amount)` reduced user balance and increased reserveBalance, but did NOT call `checkLiquidity(account)` — every other balance-mutating function (deposit, withdraw, mint, burn, transferFrom) did. Attacker donated themselves into liquidatable territory, then self-liquidated for a deeply discounted payout. The bug was the OMITTED checkLiquidity, not anything in the function's own logic. An auditor doing a sibling-consistency pass would have spotted this immediately.
 
+Reentrancy & CEI Ordering Audit (MANDATORY for every external call):
+For EVERY external call (`.call`, `.transfer`, `.send`, ERC20 `transfer`/`transferFrom`, ERC777/ERC1155/ERC721 hooks, callbacks like `onFlashLoan`/`onTokenTransfer`/`onERC1155Received`/`onERC721Received`, low-level delegatecall/staticcall), trace the enclosing function and explicitly verify:
+  - State mutations affecting the caller's position complete BEFORE the external call (Checks-Effects-Interactions). Cite the file:line of state writes vs. the file:line of the call.
+  - A reentrancy guard (`nonReentrant`, `ReentrancyGuard`, `_NOT_ENTERED` / `_ENTERED` slot) covers the function — OR the call recipient is a hardcoded trusted contract whose code is in scope and proven reentrancy-safe.
+  - Any callback the recipient can invoke back into THIS contract has matching reentrancy protection. ERC777 `tokensReceived` and ERC721 `onERC721Received` are silent reentrancy vectors — a token transfer to an attacker contract is an external call.
+  - **Cross-function reentrancy**: a function that does NOT itself make an external call can still be re-entered through a SIBLING function that does. List sibling functions reading/writing the same storage slots and verify their reentrancy guards align (a single shared `nonReentrant` lock across all sibling functions, not per-function locks).
+  - **Read-only reentrancy**: view functions reading state that's mid-update during an external call return stale or attacker-poisoned values. If any view function exposes price/balance derived from storage that is mutated post-call, flag it.
+
+Real anchors: The DAO 2016 ($60M, classic CEI violation), Cream Finance 2021 ($130M, ERC777 `tokensReceived` hook), Penpie September 2024 ($27M, market reward callback reentrancy on `redeemDueInterestAndRewards`). A reentrancy-exposed external call without `nonReentrant` is ALWAYS at least High. When the recipient is user-controlled (e.g. arbitrary token address, arbitrary callback target), it is Critical.
+
+Oracle / Price Feed Audit (MANDATORY for every price or value lookup):
+For EVERY oracle/price read (Chainlink `latestRoundData`, Uniswap V2 `getReserves`, V3 `slot0`/`observe`, Curve `get_dy`/`balances`, Balancer `getRate`, custom `getPrice`/`getOracle`), enumerate:
+  - **Staleness**: is `updatedAt` / `timestamp` checked against a max-age threshold? `require(block.timestamp - updatedAt < HEARTBEAT)` — cite the line, or note "NONE".
+  - **Round consistency** (Chainlink): is `answeredInRound >= roundId` enforced to detect stuck/stale rounds?
+  - **Sign check**: for signed answers (`int256`), is `require(answer > 0)` present? A negative price returned during a feed transition can wreak havoc.
+  - **L2 sequencer uptime** (Arbitrum, Optimism, Base): is `L2SequencerUptimeFeed` checked alongside the asset feed? During a sequencer outage, the asset feed price is frozen but trading windows still open — a known liquidation-grief vector.
+  - **Manipulation cost vs. TVL**: is the price source liquid enough that flash-loan manipulation costs more than the value at stake? Spot AMM prices on a single pool are ALWAYS manipulable in a single block, regardless of TVL.
+  - **Decimal scaling**: does the consumer correctly scale Chainlink's 8-decimal answer to the asset's 18 decimals? Off-by-10**10 errors are a recurring class.
+  - **Single-source dependency**: is there ANY fallback if the primary oracle reverts/returns stale? A single-source oracle for a value-bearing operation is itself the bug.
+
+Real anchors: Mango Markets October 2022 ($114M, attacker pumped MNGO spot price on thin liquidity then borrowed against inflated collateral); Inverse Finance April 2022 ($15M, oracle manipulation via flash-loan-backed AMM swap). Using a single AMM spot price for collateralization, redemption, or mint amount is ALWAYS at least High. Missing staleness or round-consistency checks on a Chainlink feed driving solvency decisions is High.
+
+Arithmetic Precision Audit (MANDATORY for every division, scaling, or compounding operation):
+For EVERY division, `mulDiv`, scaling (`_upscale`/`_downscale`), exponentiation, sqrt, or fixed-point arithmetic, verify:
+  - **Rounding direction**: down (default Solidity integer division), up (`Math.ceilDiv` / `mulDivRoundingUp`), or nearest. The direction must favor the PROTOCOL, never the user. Common rule: shares-to-assets when redeeming rounds DOWN, assets-to-shares when minting rounds UP, debt accrual rounds UP, fee deduction rounds UP. Cite the line and the chosen direction.
+  - **Order of operations**: `(a * b) / c` preserves precision; `(a / c) * b` discards it. Verify multiplication-before-division wherever both operands are user-controlled.
+  - **Boundary inputs**: trace what happens at `amount = 1 wei`, `amount = type(uint256).max`, `amount = scalingFactor - 1`, `amount = scalingFactor + 1`. Off-by-one rounding boundaries are the classic shape.
+  - **Cumulative drift**: is the operation invoked in a loop, batchSwap, multi-step swap, or composable hook? Sub-wei rounding errors that look harmless per-call compound across batches into extractable value. Constructor-time multi-call sequences are a particular red flag.
+  - **Asymmetric rounding across in/out paths**: in AMM-style code, both the swap-in and swap-out rounding must favor the pool. If `_upscale` and `_downscale` use different rounding directions, attacker-crafted amounts hit the seam.
+  - **Decimal mismatch between ERC20s in the same pool**: a 6-decimal token (USDC) interacting with an 18-decimal token (DAI) without explicit scaling is the canonical precision-loss site.
+
+Real anchor: Balancer V2 ComposableStablePool November 2025 ($128M). 65+ micro-swaps in the attacker contract's constructor compounded `_upscaleArray` rounding loss in the 8-9 wei range to manipulate the pool invariant downward, allowing a final batch swap to extract the difference. The per-operation error was below 1e-8 of pool value — only the cumulative effect was catastrophic. A division that rounds in the user's favor on ANY value-extraction path is at minimum High. A loop-amplifiable rounding error in invariant calculation is Critical regardless of per-iteration size.
+
+Cross-Chain Message Authenticity Audit (MANDATORY when the contract receives or executes a message from another chain):
+For EVERY function that processes a cross-chain message (LayerZero `lzReceive`/`_nonblockingLzReceive`, Wormhole `completeTransfer`/`parseAndVerifyVM`, Chainlink CCIP `_ccipReceive`, Axelar `execute`/`executeWithToken`, Hyperlane `handle`, custom bridge callbacks, Optimism `xDomainMessageSender`), explicitly check:
+  - **Caller authentication**: is `msg.sender` verified to be the messaging endpoint contract on THIS chain? `require(msg.sender == endpoint)` is the absolute minimum — without it, ANY contract can call the receive function.
+  - **Source authentication**: is the source-chain sender address (and source chain ID) verified against a hardcoded/governance-set trustedRemote map? `require(trustedRemoteLookup[srcChainId] == srcAddress)`.
+  - **Replay protection**: is there a per-message nonce or `processedMessages[messageHash] = true` guard preventing re-execution? Cross-chain messages are gossiped — without nonce, an observer can re-submit indefinitely.
+  - **Validator-set diversity**: how many independent signers must agree before a message is treated as valid? Single-validator bridges are single-key-compromise targets.
+  - **Forge resistance at the messaging layer**: can a malformed or empty proof bypass verification (Nomad-style empty-root, Wormhole-style signature gap)?
+  - **Replay across instances/forks**: is the chainId or the bridge-instance address part of the signed payload, or just the message body? Without it, a message valid on one fork is valid on a forked chain too.
+
+Real anchors: Wormhole February 2022 ($325M, signature verification gap allowed forging guardian set acceptance); Nomad August 2022 ($190M, empty-bytes32 root accepted as valid for arbitrary messages); Kelp DAO April 2026 ($293M, single-validator bridge — attacker forged one message, drained 116,500 rsETH). A bridge accepting messages without verifying both `msg.sender == endpoint` AND `srcAddress == trustedRemote[srcChainId]` is ALWAYS Critical. A single-validator bridge IS the bug, regardless of audit cleanliness elsewhere.
+
 Example Finding (for format reference):
 {
   "id": "F-01",
