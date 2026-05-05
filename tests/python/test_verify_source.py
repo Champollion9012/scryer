@@ -492,16 +492,33 @@ def test_verify_cache_key_changes_with_meta_bytes() -> None:
     assert k1 == k4  # address normalisation
 
 
+def test_verify_cache_key_changes_with_solc_id() -> None:
+    """Different resolved solc binaries → different cache slots, even when
+    everything else is equal. Prevents a stale verdict from a previous solc
+    serving a request after the user upgrades.
+    """
+    base_args = (1, "0xabc", b"meta")
+    k_no_solc = vs.VerifyCache.compute_key(*base_args, solc_id="")
+    k_solc1 = vs.VerifyCache.compute_key(*base_args, solc_id="/usr/local/bin/solc-0.8.20")
+    k_solc2 = vs.VerifyCache.compute_key(*base_args, solc_id="/usr/local/bin/solc-0.8.28")
+    assert len({k_no_solc, k_solc1, k_solc2}) == 3
+    # And changing solc_id alone must NOT match the no-solc-id key
+    assert k_solc1 != k_no_solc
+
+
 def test_verify_contract_uses_cache_on_hit(tmp_path: Path) -> None:
     """Cache hit short-circuits — no solc invocation, no RPC call."""
     addr = "0x" + "ab" * 20
     sources_dir = _seed_meta_and_source(tmp_path, chain_id=1, address=addr)
     cache = vs.VerifyCache(tmp_path / "verify.db")
 
-    # Pre-populate the cache for this exact (chain, addr, meta) tuple
+    # Pre-populate the cache for this exact (chain, addr, meta, solc_id) tuple.
+    # The cache key now includes the resolved solc binary identity so that
+    # an upgraded compiler invalidates entries.
     meta_path = sources_dir / f"1_{addr}_download_meta.json"
     meta_bytes = meta_path.read_bytes()
-    key = vs.VerifyCache.compute_key(1, addr, meta_bytes)
+    fake_solc = Path("/fake/solc")
+    key = vs.VerifyCache.compute_key(1, addr, meta_bytes, solc_id=str(fake_solc))
     cache.set(
         key,
         vs.VerifyResult(verdict="full_match", chain_id=1, address=addr, compiler_version="0.8.34"),
@@ -509,7 +526,8 @@ def test_verify_contract_uses_cache_on_hit(tmp_path: Path) -> None:
 
     # If solc or RPC were called, these mocks would fail loudly
     with patch.object(vs.subprocess, "run", side_effect=AssertionError("solc must not run on cache hit")), \
-         patch.object(vs.scryer_http, "sync_client", side_effect=AssertionError("RPC must not run on cache hit")):
+         patch.object(vs.scryer_http, "sync_client", side_effect=AssertionError("RPC must not run on cache hit")), \
+         patch.object(vs, "find_solc", return_value=fake_solc):
         result = vs.verify_contract(1, addr, sources_dir=sources_dir, cache=cache)
 
     assert result.verdict == "full_match"
@@ -532,9 +550,11 @@ def test_verify_contract_writes_cacheable_verdicts(tmp_path: Path) -> None:
     assert first.verdict == "full_match"
     assert first.cache_hit is False
 
-    # Second call must hit cache — solc/RPC mocks raise if invoked
+    # Second call must hit cache — solc/RPC mocks raise if invoked.
+    # find_solc must keep returning the same path so the cache key matches.
     with patch.object(vs.subprocess, "run", side_effect=AssertionError("should not recompile")), \
-         patch.object(vs.scryer_http, "sync_client", side_effect=AssertionError("should not RPC")):
+         patch.object(vs.scryer_http, "sync_client", side_effect=AssertionError("should not RPC")), \
+         patch.object(vs, "find_solc", return_value=Path("/fake/solc")):
         second = vs.verify_contract(1, addr, sources_dir=sources_dir, rpc_url="http://stub", cache=cache)
     assert second.verdict == "full_match"
     assert second.cache_hit is True

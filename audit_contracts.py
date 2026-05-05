@@ -474,13 +474,46 @@ def dedupe_findings_across_chunks(chunk_outputs: list[dict]) -> list[dict]:
     return list(seen.values())
 
 
-def make_audit_cache_key(files: list[Path], *, model: str, provider: str) -> str:
-    """Combine source-content hash with model+provider identity.
+def _hash_prompt_files(prompt_paths: Iterable[Path]) -> str:
+    """SHA256 over the concatenated bytes of each prompt template, in order.
 
-    Reusing :meth:`AuditCache.compute_hash` alone would let a cache populated
-    with ``gpt-4.1-mini`` answers serve a ``claude-sonnet-4-6`` request — same
-    code, different model = different report. Re-hashing with the model name
-    pinned avoids that footgun.
+    Cache key invalidation: when a user edits an audit/map/reduce prompt, the
+    cached answers from the previous prompt should NOT serve the new prompt
+    (same code, different instructions = different report). Hashing the
+    actual file bytes ties cache identity to the prompt the model saw.
+    """
+    h = hashlib.sha256()
+    for path in prompt_paths:
+        try:
+            h.update(path.read_bytes())
+        except OSError:
+            # If a prompt file is missing or unreadable we still want a stable
+            # key — encode the absence explicitly so two missing files don't
+            # collide with two empty files.
+            h.update(b"<missing>")
+        h.update(b"\x00")
+    return h.hexdigest()
+
+
+def make_audit_cache_key(
+    files: list[Path],
+    *,
+    model: str,
+    provider: str,
+    prompt_files: Iterable[Path] | None = None,
+) -> str:
+    """Combine source-content hash with model+provider+prompt identity.
+
+    Three reasons the key is wider than just source content:
+
+    - **Model identity** (``gpt-4.1-mini`` vs ``claude-sonnet-4-6``): same
+      code, different model = different report.
+    - **Provider identity**: same model name across providers can mean
+      different things; pinning provider avoids confusion.
+    - **Prompt identity** (``prompt_files``): editing the audit prompt
+      template (e.g. adding a "force trusted-role threat enumeration"
+      directive) changes what the model is being asked. Without hashing
+      the templates, the cache would silently serve pre-edit results.
     """
     h = hashlib.sha256()
     h.update(AuditCache.compute_hash(files).encode())
@@ -488,6 +521,8 @@ def make_audit_cache_key(files: list[Path], *, model: str, provider: str) -> str
     h.update(model.encode())
     h.update(b":")
     h.update(provider.encode())
+    h.update(b":")
+    h.update(_hash_prompt_files(prompt_files or []).encode())
     return h.hexdigest()
 
 
@@ -842,7 +877,12 @@ def main() -> int:
 
         cache_key: str | None = None
         if audit_cache is not None:
-            cache_key = make_audit_cache_key(files, model=args.model, provider=args.provider)
+            cache_key = make_audit_cache_key(
+                files,
+                model=args.model,
+                provider=args.provider,
+                prompt_files=[Path(args.audit_prompt), Path(args.map_prompt), Path(args.reduce_prompt)],
+            )
             cached_report = audit_cache.get_cached(cache_key)
             if cached_report is not None:
                 _log.info("CACHE HIT: %s -> %s", key, report_md_path)

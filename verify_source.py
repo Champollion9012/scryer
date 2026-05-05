@@ -123,11 +123,22 @@ class VerifyCache:
             conn.commit()
 
     @staticmethod
-    def compute_key(chain_id: int, address: str, meta_bytes: bytes) -> str:
+    def compute_key(chain_id: int, address: str, meta_bytes: bytes, *, solc_id: str = "") -> str:
+        """Cache key.
+
+        ``solc_id`` should identify the locally available compiler (typically
+        the resolved solc binary path). Including it prevents a stale cached
+        verdict from a previous solc binary serving a request after the user
+        upgrades or switches via ``solc-select``. Empty string means "no solc
+        identity recorded" — only safe when the caller knows the binary
+        hasn't changed since the entry was created.
+        """
         h = hashlib.sha256()
         h.update(f"{chain_id}:{address.lower()}".encode("ascii"))
         h.update(b"\x00")
         h.update(meta_bytes)
+        h.update(b"\x00")
+        h.update(solc_id.encode("utf-8"))
         return h.hexdigest()
 
     def get(self, key: str) -> VerifyResult | None:
@@ -485,9 +496,23 @@ def verify_contract(
         )
 
     meta_bytes = meta_path.read_bytes()
+
+    # Resolve solc up-front so its identity becomes part of the cache key.
+    # If the user upgrades solc (or switches via solc-select), the previous
+    # cached verdict shouldn't silently win.
+    if solc_path is None:
+        # Peek at metadata for the compiler version to look up via solc-select.
+        try:
+            peek_meta = json.loads(meta_bytes.decode("utf-8")).get("metadata") or {}
+            peek_version = (peek_meta.get("compiler") or {}).get("version") or peek_meta.get("compilerVersion")
+        except Exception:
+            peek_version = None
+        solc_path = find_solc(peek_version)
+
     cache_key: str | None = None
     if cache is not None:
-        cache_key = VerifyCache.compute_key(chain_id, address_lower, meta_bytes)
+        solc_id = str(solc_path) if solc_path else ""
+        cache_key = VerifyCache.compute_key(chain_id, address_lower, meta_bytes, solc_id=solc_id)
         hit = cache.get(cache_key)
         if hit is not None:
             return hit

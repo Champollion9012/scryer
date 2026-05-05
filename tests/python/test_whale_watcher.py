@@ -182,12 +182,12 @@ def test_store_insert_idempotent(tmp_path: Path) -> None:
 
 def test_store_recent_hits_filtered_by_chain(tmp_path: Path) -> None:
     store = ww.WhaleStore(tmp_path / "w.db")
-    base = dict(
-        token_address="0xt",
-        from_address="0xf",
-        to_address="0xrec",
-        log_index=0,
-    )
+    base = {
+        "token_address": "0xt",
+        "from_address": "0xf",
+        "to_address": "0xrec",
+        "log_index": 0,
+    }
     for i, chain_id in enumerate([1, 1, 56, 56, 56]):
         log = ww.TransferLog(
             chain_id=chain_id, block_number=i, tx_hash=f"0x{i:064x}", amount_raw=10**18, **base

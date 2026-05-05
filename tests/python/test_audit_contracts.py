@@ -125,6 +125,42 @@ def test_make_audit_cache_key_changes_with_model(tmp_path: Path) -> None:
     assert k1 == k3  # deterministic
 
 
+def test_make_audit_cache_key_changes_with_prompt_template(tmp_path: Path) -> None:
+    """Editing an audit prompt template MUST invalidate cached answers.
+
+    Same source + model + provider, but different prompt text = different
+    instructions to the model = a different report. We hash the prompt files
+    into the key so cached answers from before a prompt edit don't silently
+    serve callers using the new prompt.
+    """
+    f = tmp_path / "X.sol"
+    f.write_text("contract X {}")
+    p1 = tmp_path / "audit_v1.txt"
+    p1.write_text("Please audit this code.")
+    p2 = tmp_path / "audit_v2.txt"
+    p2.write_text("Please audit this code AND enumerate trusted-role threats.")
+
+    k_v1 = ac.make_audit_cache_key([f], model="m", provider="p", prompt_files=[p1])
+    k_v2 = ac.make_audit_cache_key([f], model="m", provider="p", prompt_files=[p2])
+    k_v1_again = ac.make_audit_cache_key([f], model="m", provider="p", prompt_files=[p1])
+    k_default = ac.make_audit_cache_key([f], model="m", provider="p")  # no prompt files
+    assert k_v1 != k_v2, "different prompt content must produce different keys"
+    assert k_v1 == k_v1_again, "same inputs must produce same key"
+    assert k_v1 != k_default, "missing-prompt sentinel must not collide with hashed-prompt key"
+
+
+def test_make_audit_cache_key_treats_missing_prompt_file_distinctly(tmp_path: Path) -> None:
+    """A missing prompt file shouldn't collide with an empty-file prompt."""
+    f = tmp_path / "X.sol"
+    f.write_text("contract X {}")
+    empty = tmp_path / "empty.txt"
+    empty.write_text("")
+    missing = tmp_path / "does-not-exist.txt"
+    k_empty = ac.make_audit_cache_key([f], model="m", provider="p", prompt_files=[empty])
+    k_missing = ac.make_audit_cache_key([f], model="m", provider="p", prompt_files=[missing])
+    assert k_empty != k_missing
+
+
 # ---------------------------------------------------------------------------
 # Retry classification
 # ---------------------------------------------------------------------------
