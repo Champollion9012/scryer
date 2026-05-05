@@ -168,9 +168,16 @@ Source-less contracts get decompiled (Heimdall first, Panoramix fallback) and sa
 python bounty_pipeline.py --targets targets.json
 python bounty_pipeline.py --targets targets.json --download-only
 python bounty_pipeline.py --targets targets.json --slither --model gpt-4.1
+python bounty_pipeline.py --targets targets.json \
+  --regex-rules rules/unprotected_withdraw.json \
+  --source-verify strict \
+  --slither
 ```
 
-Target schema in [targets.example.json](targets.example.json).
+Target schema in [targets.example.json](targets.example.json). The pipeline
+forwards `--regex-rules`, `--source-verify`, `--slither`, `--model`,
+`--rpm`, and `--force-map-reduce` to the underlying
+[`audit_contracts.py`](audit_contracts.py) subprocess.
 
 ### LLM audit
 
@@ -182,6 +189,65 @@ python audit_contracts.py --max-chunk-chars 50000   # force map-reduce
 python audit_contracts.py --html                # Markdown + HTML output
 ```
 
+#### Custom regex rule packs
+
+The default regex set in [scanners.py](scanners.py) covers SWC-style
+patterns. Layer your own rule files on top with `--regex-rules`
+(repeatable). [`rules/unprotected_withdraw.json`](rules/unprotected_withdraw.json)
+ships as an example pack targeting the public-withdraw / batch-distribute
+bug class behind the 2026 yieldcore drain.
+
+```bash
+python audit_contracts.py --regex-rules rules/unprotected_withdraw.json
+python audit_contracts.py --regex-rules rules/a.json --regex-rules rules/b.json
+```
+
+Rule schema: `[{rule_id, severity, title, pattern, flags?}, ...]`. See
+[`rules/unprotected_withdraw.json`](rules/unprotected_withdraw.json) for a
+concrete example. Custom rules are appended to the built-in defaults; pass
+`--disable-regex-scan` to skip the regex pass entirely.
+
+#### Local source verification (`--source-verify`)
+
+Re-compile the downloaded source with the metadata-recorded compiler and
+compare to `eth_getCode` to confirm the explorer's "verified" claim is
+genuine. Removes Sourcify / Etherscan / Blockscout from your trust chain.
+Requires a matching `solc` on `$PATH` (or via [solc-select](https://github.com/crytic/solc-select)).
+
+```bash
+python audit_contracts.py --source-verify off       # skip (default)
+python audit_contracts.py --source-verify warn      # log verdict, proceed regardless
+python audit_contracts.py --source-verify strict    # mismatch aborts that group
+```
+
+Verdicts: `full_match` / `partial_match` (runtime identical except metadata
+trailer) / `mismatch` / `no_solc` / `no_bytecode`. Strict mode records
+aborted groups in `manifest.aborted_groups` so they're visible rather than
+silently dropped. Results are cached in `.verify_cache.db`; pass
+`--no-verify-cache` to always re-verify. Standalone CLI also exists:
+
+```bash
+python verify_source.py --chain-id 1 --address 0xAC85eF...95f2e
+```
+
+#### Auto-continue on truncated LLM output
+
+Sonnet/Opus often produce thorough reports that exceed `--max-output-tokens`
+mid-JSON, breaking the parse and discarding everything the model wrote. The
+audit pipeline detects truncation (provider-aware: OpenAI `finish_reason`,
+Anthropic `stop_reason`, Gemini `finishReason`) and transparently calls the
+provider's continuation API to extend the response, concatenating until the
+JSON is complete or the cap is hit.
+
+```bash
+python audit_contracts.py --auto-continue-attempts 3   # default
+python audit_contracts.py --auto-continue-attempts 0   # disable
+```
+
+Each continuation re-sends the prompt + prior partial, so cost scales
+roughly linearly with attempts triggered. Stream mode (`--stream`) doesn't
+support auto-continue (no truncation signal mid-stream).
+
 ### Similarity search
 
 ```bash
@@ -190,11 +256,39 @@ python similarity_cli.py search --query contract.sol --min-similarity 0.8
 python similarity_cli.py clones --query contract.sol
 ```
 
+### Whale-deposit watcher
+
+Polls major-stablecoin `Transfer` logs on configured chains, filters to
+contract recipients above a USD threshold, persists hits to
+`.whale_watcher.db`. Pairs with the `/whales` web route below — useful for
+spotting freshly-funded launchpads / vaults that are candidates for an
+automated audit pass.
+
+```bash
+python scryer_whale_watcher.py --mode once                       # single sweep
+python scryer_whale_watcher.py --mode daemon --poll-interval-s 30
+python scryer_whale_watcher.py --threshold-usd 100000 --chains 1,56
+python scryer_whale_watcher.py --tokens-file extra_tokens.json   # add chains/tokens
+```
+
+Default tokens cover ETH (USDT/USDC/DAI) and BSC (USDT/USDC/BUSD). Per-chain
+RPC URLs come from env vars (`ETH_RPC_URL`, `BSC_RPC_URL`, etc.) with
+public-RPC fallbacks.
+
 ### Web UI
 
 ```bash
 python web.py     # http://localhost:5000
 ```
+
+Routes: `/` dashboard, `/contracts`, `/duplicates`, `/hash/<hash>`,
+`/contract/<chain>/<addr>`, `/search`, `/similarity`, `/vulnerabilities`,
+`/whales` (tails `whale_watcher.db`, joins against the contract registry to
+flag indexed vs. unseen receivers). JSON mirrors at `/api/stats`,
+`/api/contracts`, `/api/related/<chain>/<addr>`, `/api/whales`,
+`/api/export/<csv|json>`. Configure with `FLASK_PORT` / `FLASK_DEBUG` env
+vars (debug stays off by default — Werkzeug's debugger is RCE-prone if
+exposed).
 
 ### Foundry PoC tests
 
