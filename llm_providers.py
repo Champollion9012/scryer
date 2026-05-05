@@ -286,6 +286,13 @@ class ClaudeProvider(LLMProvider):
     def name(self) -> str:
         return f"claude:{self.model}"
 
+    def _accepts_temperature(self) -> bool:
+        """Anthropic deprecated ``temperature`` on Opus 4.7+; sending it
+        returns 400 invalid_request_error. Sonnet and Haiku still accept it.
+        Pass-through if accepted, omit otherwise.
+        """
+        return not self.model.startswith("claude-opus-4-7")
+
     async def chat_completion(
         self,
         *,
@@ -308,10 +315,11 @@ class ClaudeProvider(LLMProvider):
         payload: dict[str, Any] = {
             "model": self.model,
             "max_tokens": max_output_tokens,
-            "temperature": temperature,
             "system": system_prompt,
             "messages": [{"role": "user", "content": user_prompt}],
         }
+        if self._accepts_temperature():
+            payload["temperature"] = temperature
 
         async with scryer_http.async_client(timeout=timeout_s, retries=0) as client:
             resp = await client.post(url, headers=headers, json=payload)
@@ -360,7 +368,6 @@ class ClaudeProvider(LLMProvider):
         payload: dict[str, Any] = {
             "model": self.model,
             "max_tokens": max_output_tokens,
-            "temperature": temperature,
             "system": system_prompt,
             "messages": [
                 {"role": "user", "content": user_prompt},
@@ -375,6 +382,8 @@ class ClaudeProvider(LLMProvider):
                 },
             ],
         }
+        if self._accepts_temperature():
+            payload["temperature"] = temperature
 
         async with scryer_http.async_client(timeout=timeout_s, retries=0) as client:
             resp = await client.post(url, headers=headers, json=payload)
@@ -410,11 +419,12 @@ class ClaudeProvider(LLMProvider):
         payload: dict[str, Any] = {
             "model": self.model,
             "max_tokens": max_output_tokens,
-            "temperature": temperature,
             "system": system_prompt,
             "messages": [{"role": "user", "content": user_prompt}],
             "stream": True,
         }
+        if self._accepts_temperature():
+            payload["temperature"] = temperature
 
         # Claude reports input_tokens at message_start and cumulative output
         # tokens in each message_delta. We accumulate and emit once at the end
