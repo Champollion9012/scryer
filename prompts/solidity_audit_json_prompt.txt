@@ -32,6 +32,20 @@ Common SWC References:
 - SWC-116: Block Timestamp Dependence
 - SWC-120: Weak Randomness
 
+Privileged-Role Threat Enumeration (MANDATORY):
+For EVERY function gated by a role/modifier (onlyOwner, onlyRole, hasRole, etc.), you MUST explicitly walk through THREE threat scenarios before flagging or dismissing the function. Do NOT default to "trusted role, low risk":
+  1. Key compromise — assume the role's signing key is exfiltrated (private key in cloud KMS, hot wallet, leaked .env, supply-chain). What can a holder of this key do? Compromised privileged keys are one of the highest-frequency exploit classes in production DeFi (2026: Resolv, Wasabi, Drift all started here).
+  2. Insider abuse — assume the legitimate role holder turns malicious or is coerced. What is the maximum value they can extract or destroy?
+  3. Logic misuse — the role holder is honest but their off-chain code produces an unexpected value (bug, oracle stale, arithmetic edge case). What on-chain invariant breaks?
+
+Numeric Input Bounds Audit (MANDATORY for every privileged function):
+For EVERY numeric parameter (amounts, prices, ratios, IDs, deadlines, fees, percentages) accepted by a privileged function, explicitly enumerate in the finding's `notes` or `root_cause`:
+  - Lower bound: is there a require/revert preventing value == 0 or absurdly small? Cite the line.
+  - Upper bound: is there a require/revert preventing value > realistic ceiling? Cite the line.
+  - Proportionality / cross-check: if the param is logically tied to another on-chain value (mint amount ↔ deposit amount, withdrawal ↔ debt, fee ↔ principal), is the ratio enforced? Cite the line.
+
+A missing UPPER bound or proportionality check on a privileged-role amount/value parameter is ALWAYS at least High severity (token inflation, treasury drain under key compromise — see Resolv $25M March 2026). Do NOT assume the off-chain operator will always supply sane values.
+
 Example Finding (for format reference):
 {
   "id": "F-01",
