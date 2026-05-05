@@ -978,6 +978,43 @@ def main() -> int:
 
         analysis_payload: dict = {}
 
+        # Decompiled-source detection: when download_contract fell back to
+        # heimdall / panoramix because no verified source was available, the
+        # download_meta.json records ``decompiled: True`` and identifies the
+        # decompiler. Tell the LLM so it knows to trust opcodes + constants
+        # but distrust variable names, comments, and exact control-flow
+        # comments.
+        decompiled_hint: str | None = None
+        if address_value != "Unknown" and chain_id_value != "Unknown":
+            for meta_candidate in (
+                sources_root / f"{chain_id_value}_{address_value.lower()}_download_meta.json",
+                sources_root / f"{chain_id_value}_{address_value.lower()}" / "download_meta.json",
+            ):
+                if meta_candidate.exists():
+                    try:
+                        meta_obj = json.loads(meta_candidate.read_text(encoding="utf-8"))
+                    except Exception:
+                        break
+                    if meta_obj.get("decompiled"):
+                        analysis_payload["source_form"] = {
+                            "decompiled": True,
+                            "decompiler": meta_obj.get("decompiler", "unknown"),
+                        }
+                        decompiled_hint = (
+                            "[source_form hint] WARNING: This contract was NOT verified on any "
+                            "explorer. The Solidity source you are auditing was reconstructed "
+                            "from on-chain bytecode by a decompiler "
+                            f"({meta_obj.get('decompiler', 'unknown')}). Trust function selectors, "
+                            "hardcoded addresses, numeric constants, storage slot offsets, and the "
+                            "overall opcode-level control flow — those came from the real bytecode. "
+                            "DO NOT trust variable names, parameter names, comments, struct field "
+                            "names, internal-function names, or stylistic details — those are "
+                            "heuristic guesses by the decompiler. When citing a finding, prefer "
+                            "selectors and offsets over names; explicitly note when a conclusion "
+                            "depends on naming that may be reconstructed."
+                        )
+                    break
+
         # Source verification: recompile & compare to deployed bytecode. Only
         # runs when we can derive a real (chain_id, address) from the group key.
         source_verify_hint: str | None = None
@@ -1076,6 +1113,11 @@ def main() -> int:
         # so it's seen first regardless of token-budget truncation.
         if source_verify_hint:
             analysis_text = source_verify_hint + "\n\n" + analysis_text
+        if decompiled_hint:
+            # Prepend AFTER source_verify_hint so decompiled WARNING is the
+            # very first thing the model sees — its conclusions hinge on
+            # knowing not to trust naming.
+            analysis_text = decompiled_hint + "\n\n" + analysis_text
 
         files_md, blocks = build_file_blocks(
             files,

@@ -1007,6 +1007,44 @@ def test_mismatch_warn_injects_stronger_hint(tmp_path: Path, fake_provider, monk
     assert "byte-for-byte identical" not in combined
 
 
+def test_decompiled_meta_injects_warning_hint(tmp_path: Path, fake_provider, monkeypatch) -> None:
+    """When download_meta marks decompiled=True, audit MUST inject a stronger
+    hint than the source_verify variants: trust opcodes, distrust naming.
+    Otherwise the LLM treats decompiler-guessed variable names as ground truth.
+    """
+    sources_root = _seed_sources(tmp_path)
+    addr_lower = ("0x" + "aa" * 20).lower()
+    # Drop a meta.json that mimics the heimdall fallback path.
+    (sources_root / f"56_{addr_lower}_download_meta.json").write_text(
+        json.dumps(
+            {
+                "chain_id": 56,
+                "address": addr_lower,
+                "download_method": "decompiled_heimdall",
+                "decompiled": True,
+                "decompiler": "heimdall",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    out_dir = _run_audit(tmp_path, sources_root, "--disable-regex-scan")
+    run_dir = next(out_dir.glob("run_*"))
+    group = json.loads((run_dir / "manifest.json").read_text())["groups"][0]
+
+    # Hint must reach the on-disk prompts so the LLM literally sees it.
+    prompts_dir = run_dir / group["dir"] / "prompts"
+    prompt_text = "\n".join(p.read_text(encoding="utf-8") for p in prompts_dir.glob("*.txt"))
+    assert "[source_form hint]" in prompt_text
+    assert "decompiler (heimdall)" in prompt_text or "heimdall" in prompt_text
+    assert "Trust function selectors" in prompt_text
+    assert "DO NOT trust variable names" in prompt_text
+
+    # And analysis.json should record the source_form structurally.
+    analysis = json.loads((run_dir / group["dir"] / "analysis.json").read_text())
+    assert analysis["source_form"] == {"decompiled": True, "decompiler": "heimdall"}
+
+
 def test_full_match_does_not_inject_hint(tmp_path: Path, fake_provider, monkeypatch) -> None:
     """full_match is the happy path — no prompt pollution."""
     sources_root = _seed_sources(tmp_path)

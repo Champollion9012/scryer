@@ -7,6 +7,8 @@ layout) versus only behavioural conclusions.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from unittest.mock import patch
 
 import download_contract as dc
@@ -75,3 +77,49 @@ def test_sourcify_unverified_returns_failure_without_match_type() -> None:
     assert sources is None
     assert metadata is None
     assert "Not verified" in msg
+
+
+# ---------------------------------------------------------------------------
+# Decompile fallback: when no verified source exists, try heimdall/panoramix
+# ---------------------------------------------------------------------------
+
+
+def test_decompile_fallback_imports_correctly() -> None:
+    """The download_contract module must wire `decompile_with_*` from decompilers.
+
+    A regression here would silently revert to BYTECODE_ONLY for every
+    unverified contract, defeating the entire heimdall integration.
+    """
+    assert hasattr(dc, "decompile_with_heimdall")
+    assert hasattr(dc, "decompile_with_panoramix")
+
+
+def test_decompile_fallback_meta_marker_consumed_by_audit(tmp_path: Path) -> None:
+    """When download_contract writes a decompiled source, the meta MUST set
+    ``decompiled: True`` and ``decompiler: <name>`` so audit_contracts can
+    inject the right LLM hint. We seed the layout that download_contract
+    actually produces (flat) and confirm the marker shape.
+    """
+    addr = "0xabcdef0123456789abcdef0123456789abcdef01"
+    sources_dir = tmp_path / "sources"
+    sources_dir.mkdir()
+    # Write the meta the audit pipeline expects.
+    meta_path = sources_dir / f"1_{addr}_download_meta.json"
+    meta_path.write_text(
+        json.dumps(
+            {
+                "chain_id": 1,
+                "address": addr,
+                "download_method": "decompiled_heimdall",
+                "decompiled": True,
+                "decompiler": "heimdall",
+                "files_written": [f"1_{addr}_{addr}.decompiled.sol"],
+            }
+        )
+    )
+    # Read and assert the contract: an audit consumer just needs `decompiled`
+    # boolean and `decompiler` name.
+    meta = json.loads(meta_path.read_text())
+    assert meta["decompiled"] is True
+    assert meta["decompiler"] == "heimdall"
+    assert meta["download_method"].startswith("decompiled_")

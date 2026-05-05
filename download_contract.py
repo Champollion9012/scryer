@@ -12,6 +12,7 @@ from web3 import Web3
 
 import scryer_config
 import scryer_http
+from decompilers import decompile_with_heimdall, decompile_with_panoramix
 from scryer_logging import get_logger
 
 _log = get_logger(__name__)
@@ -719,12 +720,53 @@ def fetch_contract_source(
         sources, metadata, msg, method = fetch_one(target)
         if not sources:
             _log.warning("❌ 所有途徑失敗 (%s)，嘗試保存原始 bytecode...", msg)
-            # Save bytecode-only with marker
+            # Save bytecode-only with marker, optionally with a decompiled
+            # pseudo-source if Heimdall/Panoramix is available locally.
             try:
                 w3 = Web3(Web3.HTTPProvider(rpc_url))
                 bytecode = w3.eth.get_code(Web3.to_checksum_address(target)).hex()
                 if bytecode and bytecode != "0x":
-                    # Create bytecode-only sources with marker
+                    decompiled_text: str | None = None
+                    decompiler_name: str | None = None
+                    # Heimdall is generally higher-quality on modern bytecode;
+                    # Panoramix is the Linux-only fallback. Either is "better
+                    # than nothing" for unverified contracts.
+                    decompiled_text = decompile_with_heimdall(bytecode)
+                    if decompiled_text:
+                        decompiler_name = "heimdall"
+                    else:
+                        decompiled_text = decompile_with_panoramix(bytecode)
+                        if decompiled_text:
+                            decompiler_name = "panoramix"
+
+                    if decompiled_text:
+                        _log.info("✅ Decompiled via %s (%d chars)", decompiler_name, len(decompiled_text))
+                        # Tree layout puts decompiled .sol next to bytecode for
+                        # downstream tooling that expects a .sol filename.
+                        decompiled_sources = {
+                            f"{target}.decompiled.sol": decompiled_text,
+                            f"{target}.bytecode.hex": bytecode,
+                        }
+                        save_sources(
+                            decompiled_sources,
+                            chain_id,
+                            target,
+                            output_dir=output_dir,
+                            layout=layout,
+                            extra_metadata={
+                                "root_address": root_address,
+                                "download_method": f"decompiled_{decompiler_name}",
+                                "decompiled": True,
+                                "decompiler": decompiler_name,
+                                "reason": msg,
+                                "proxy_resolution": proxy_info,
+                            },
+                        )
+                        _log.info("✅ Saved decompiled source — DOWNSTREAM CONSUMERS MUST TRUST OPCODES, NOT NAMING")
+                        any_success = True
+                        continue
+
+                    # No decompiler available — fall through to BYTECODE_ONLY.
                     bytecode_sources = {
                         f"{target}.bytecode.hex": bytecode,
                         f"{target}.BYTECODE_ONLY": (
@@ -734,13 +776,14 @@ def fetch_contract_source(
                             f"# Chain ID: {chain_id}\n"
                             f"# Reason: {msg}\n"
                             "#\n"
-                            "# This contract's source code is NOT verified on:\n"
-                            "#   - Sourcify\n"
-                            "#   - Blockscout\n"
-                            "#   - BscScan/Etherscan\n"
-                            "#   - IPFS metadata\n"
+                            "# Source code is not verified on Sourcify / Blockscout /\n"
+                            "# Etherscan / IPFS metadata, AND no decompiler\n"
+                            "# (Heimdall via WSL, Panoramix on Linux) is available\n"
+                            "# locally to produce a pseudo-source.\n"
                             "#\n"
-                            "# Consider using a decompiler like Panoramix or Dedaub.\n"
+                            "# Install Heimdall:\n"
+                            "#   wsl.exe -- bash -c 'curl -L https://get.bifrost.sh | bash && bifrost'\n"
+                            "# Then re-run this download to populate {addr}.decompiled.sol.\n"
                         ),
                     }
                     save_sources(
