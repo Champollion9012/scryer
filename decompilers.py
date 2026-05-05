@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -85,8 +86,15 @@ def decompile_with_heimdall(bytecode: str, timeout: int = 120) -> str | None:
         # Convert Windows path to WSL path
         wsl_path = temp_path.replace("\\", "/").replace("C:", "/mnt/c")
 
-        # Build command
-        cmd = ["wsl.exe", HEIMDALL_PATH, "decompile", wsl_path, "--output", "print", "--include-sol"]
+        # Wrap in `bash -lc` so:
+        #   (a) ``$HOME`` / ``~`` in HEIMDALL_PATH expands inside WSL (the
+        #       default path uses ``$HOME/.bifrost/bin/heimdall`` for portability)
+        #   (b) zsh/bash startup files load PATH so users with custom rust
+        #       toolchain locations still work
+        # Without this wrapper, Windows-side Git Bash mangles ``/root/...`` →
+        # ``C:/Program Files/Git/root/...`` because of MSYS path translation.
+        heimdall_cmd = f"{HEIMDALL_PATH} decompile {shlex.quote(wsl_path)} --output print --include-sol"
+        cmd = ["wsl.exe", "--", "bash", "-lc", heimdall_cmd]
 
         result = subprocess.run(
             cmd,
