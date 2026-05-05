@@ -396,7 +396,7 @@ def llm_chat_completion(
                         json_mode=False,
                     )
                 )
-                content += cont
+                content += _strip_continuation_noise(cont)
                 usage = {
                     "prompt_tokens": int(usage.get("prompt_tokens") or 0)
                     + int(cont_usage.get("prompt_tokens") or 0),
@@ -433,6 +433,33 @@ def _strip_code_fences(text: str) -> str:
         lines = s.splitlines()
         if len(lines) >= 3 and lines[0].startswith("```") and lines[-1].strip() == "```":
             return "\n".join(lines[1:-1]).strip()
+    return s
+
+
+def _strip_continuation_noise(text: str) -> str:
+    """Strip markdown fences and common preambles from a continuation chunk.
+
+    Auto-continue prompts explicitly forbid markdown / preamble, but Sonnet
+    (and occasionally GPT) ignore that and prepend ``\\`\\`\\`json\\n`` or a
+    ``Continuing...`` preface anyway. Concatenating that into the middle of
+    the prior partial JSON wedges an unparseable control sequence at the
+    seam (e.g. ``"contracts_\\`\\`\\`json\\nBase.sol"``). This runs a
+    conservative cleanup on each continuation BEFORE concat: only patterns
+    that can't legitimately appear mid-JSON are removed.
+    """
+    s = text
+    # Leading code fence (with optional language tag) — only strip if it
+    # appears in the first 30 chars so we don't accidentally eat a fence
+    # that's a legitimate string literal mid-document.
+    if s.lstrip().startswith("```"):
+        lstripped = s.lstrip()
+        nl = lstripped.find("\n")
+        if 0 < nl < 30:
+            s = lstripped[nl + 1 :]
+    # Trailing code fence
+    s_rstripped = s.rstrip()
+    if s_rstripped.endswith("```"):
+        s = s_rstripped[:-3].rstrip()
     return s
 
 

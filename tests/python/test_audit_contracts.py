@@ -302,6 +302,51 @@ def test_llm_chat_completion_skips_continue_when_disabled() -> None:
     assert provider.continue_calls == []
 
 
+def test_strip_continuation_noise_removes_leading_code_fence() -> None:
+    """Sonnet sometimes ignores 'no preamble' and prepends ```json — we must
+    strip it before concatenating into the prior partial JSON or we wedge an
+    unparseable control sequence at the seam."""
+    cont = '```json\n"line": 35, "excerpt": "..."}'
+    assert ac._strip_continuation_noise(cont) == '"line": 35, "excerpt": "..."}'
+
+
+def test_strip_continuation_noise_removes_trailing_fence() -> None:
+    cont = '"line": 35}\n```'
+    assert ac._strip_continuation_noise(cont) == '"line": 35}'
+
+
+def test_strip_continuation_noise_passthrough_clean_text() -> None:
+    """A continuation that obeyed the prompt must not be mangled."""
+    cont = '"line": 35, "excerpt": "abc"}'
+    assert ac._strip_continuation_noise(cont) == cont
+
+
+def test_strip_continuation_noise_preserves_late_fence_inside_string() -> None:
+    """A literal ``` inside a string body (>30 chars in) must NOT be stripped —
+    that would corrupt legitimate content. We only strip if the fence is at
+    the very start of the chunk."""
+    cont = '"some content here that is long enough that any later ``` is not at the start"'
+    assert "```" in ac._strip_continuation_noise(cont)
+
+
+def test_llm_chat_completion_strips_noise_from_continuation() -> None:
+    """End-to-end: a continuation chunk wrapped in ```json should be cleaned
+    before concatenation so the final string is parseable."""
+    parts = ['{"a":', '```json\n1}']  # Sonnet-style wrapped continuation
+    provider = _TruncatingFakeProvider(truncate_for=1, parts=parts)
+    raw, _ = ac.llm_chat_completion(
+        provider,
+        system_prompt="sys",
+        user_prompt="usr",
+        temperature=0.1,
+        max_output_tokens=500,
+        timeout_s=30,
+        max_retries=1,
+        auto_continue_attempts=3,
+    )
+    assert raw == '{"a":1}'  # fence stripped, JSON parses cleanly
+
+
 def test_llm_chat_completion_skips_continue_when_not_truncated() -> None:
     """A non-truncated first call short-circuits — no continue_completion call."""
     provider = _TruncatingFakeProvider(truncate_for=0, parts=['{"a":1}'])

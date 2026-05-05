@@ -46,6 +46,17 @@ For EVERY numeric parameter (amounts, prices, ratios, IDs, deadlines, fees, perc
 
 A missing UPPER bound or proportionality check on a privileged-role amount/value parameter is ALWAYS at least High severity (token inflation, treasury drain under key compromise — see Resolv $25M March 2026). Do NOT assume the off-chain operator will always supply sane values.
 
+Sibling Consistency Audit (MANDATORY):
+For EVERY function that mutates user balance, debt, position, or any state with downstream financial implications, enumerate ALL OTHER functions in the same contract that mutate the SAME state variable(s). Then compare their post-condition checks side-by-side:
+  - Does each sibling apply the same modifier (e.g. nonReentrant, whenNotPaused)?
+  - Does each sibling call the same invariant-preservation function after the mutation (e.g. checkLiquidity, _afterTokenTransfer, healthCheck, totalsAccountingUpdate)?
+  - Does each sibling update the same auxiliary accounting state (totalSupply, totalBorrows, totalBalances, exchange rate, oracle price feeds)?
+  - Does each sibling emit the same event family?
+
+A function that mutates balance/debt/position and OMITS a check / state-update / modifier that its siblings consistently apply is ALWAYS at least High severity, often Critical. The omission is the bug — not the presence of the check elsewhere. Cite the file:line of every sibling and its check, plus the file:line of the inconsistent function and what it's missing. Do NOT assume the omission is intentional unless a comment in the code explicitly justifies it.
+
+Real example to anchor on (Euler $200M, March 2023): `donateToReserves(amount)` reduced user balance and increased reserveBalance, but did NOT call `checkLiquidity(account)` — every other balance-mutating function (deposit, withdraw, mint, burn, transferFrom) did. Attacker donated themselves into liquidatable territory, then self-liquidated for a deeply discounted payout. The bug was the OMITTED checkLiquidity, not anything in the function's own logic. An auditor doing a sibling-consistency pass would have spotted this immediately.
+
 Example Finding (for format reference):
 {
   "id": "F-01",
