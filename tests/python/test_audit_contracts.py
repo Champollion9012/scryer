@@ -164,6 +164,127 @@ def test_classify_retry_transport_errors_retry() -> None:
 
 
 # ---------------------------------------------------------------------------
+# llm_chat_completion auto-continue
+# ---------------------------------------------------------------------------
+
+
+class _TruncatingFakeProvider:
+    """Fake provider that returns truncated output the first N times,
+    then a complete response. Records calls to chat_completion + continue_completion."""
+
+    def __init__(self, *, truncate_for: int, parts: list[str]) -> None:
+        # parts must have len(parts) == truncate_for + 1; first N are partial,
+        # last one is the final piece (truncated=False).
+        assert len(parts) == truncate_for + 1
+        self.truncate_for = truncate_for
+        self.parts = parts
+        self.chat_calls: list[dict] = []
+        self.continue_calls: list[dict] = []
+
+    async def chat_completion(self, **kwargs):
+        self.chat_calls.append(kwargs)
+        return self.parts[0], {
+            "prompt_tokens": 100,
+            "completion_tokens": 50,
+            "truncated": self.truncate_for > 0,
+        }
+
+    async def continue_completion(self, **kwargs):
+        self.continue_calls.append(kwargs)
+        idx = len(self.continue_calls)  # 1-based
+        is_last = idx >= self.truncate_for
+        return self.parts[idx], {
+            "prompt_tokens": 80,
+            "completion_tokens": 25,
+            "truncated": not is_last,
+        }
+
+
+def test_llm_chat_completion_concatenates_after_truncation() -> None:
+    """One truncated turn + one continuation = stitched response."""
+    provider = _TruncatingFakeProvider(truncate_for=1, parts=['{"a":', '1}'])
+    raw, usage = ac.llm_chat_completion(
+        provider,
+        system_prompt="sys",
+        user_prompt="usr",
+        temperature=0.1,
+        max_output_tokens=500,
+        timeout_s=30,
+        max_retries=1,
+        auto_continue_attempts=3,
+    )
+    assert raw == '{"a":1}'
+    assert usage["continue_attempts"] == 1
+    assert not usage["truncated"]
+    # Tokens summed across the original + continuation
+    assert usage["prompt_tokens"] == 180
+    assert usage["completion_tokens"] == 75
+    assert len(provider.continue_calls) == 1
+    # Continuation was given the prior partial as prior_assistant
+    assert provider.continue_calls[0]["prior_assistant"] == '{"a":'
+
+
+def test_llm_chat_completion_caps_continue_attempts() -> None:
+    """Provider keeps returning truncated; loop must stop at the configured cap."""
+    parts = ['{"a":', '1,', '"b":', "2}"]  # 3 trunc + 1 final = 4 parts
+    provider = _TruncatingFakeProvider(truncate_for=3, parts=parts)
+    raw, usage = ac.llm_chat_completion(
+        provider,
+        system_prompt="sys",
+        user_prompt="usr",
+        temperature=0.1,
+        max_output_tokens=500,
+        timeout_s=30,
+        max_retries=1,
+        auto_continue_attempts=2,  # below the 3 needed to fully recover
+    )
+    # Only 2 continuations consumed → stitched first 3 parts
+    assert raw == '{"a":1,"b":'
+    assert usage["continue_attempts"] == 2
+    # Last continuation reported truncated=True (we hit the cap, not the end)
+    assert usage["truncated"] is True
+    assert len(provider.continue_calls) == 2
+
+
+def test_llm_chat_completion_skips_continue_when_disabled() -> None:
+    """auto_continue_attempts=0 must NOT call continue_completion even if truncated."""
+    provider = _TruncatingFakeProvider(truncate_for=1, parts=['{"a":', '1}'])
+    raw, usage = ac.llm_chat_completion(
+        provider,
+        system_prompt="sys",
+        user_prompt="usr",
+        temperature=0.1,
+        max_output_tokens=500,
+        timeout_s=30,
+        max_retries=1,
+        auto_continue_attempts=0,
+    )
+    # First call returns the truncated piece; we hand it back as-is.
+    assert raw == '{"a":'
+    assert usage["truncated"] is True
+    assert usage["continue_attempts"] == 0
+    assert provider.continue_calls == []
+
+
+def test_llm_chat_completion_skips_continue_when_not_truncated() -> None:
+    """A non-truncated first call short-circuits — no continue_completion call."""
+    provider = _TruncatingFakeProvider(truncate_for=0, parts=['{"a":1}'])
+    raw, usage = ac.llm_chat_completion(
+        provider,
+        system_prompt="sys",
+        user_prompt="usr",
+        temperature=0.1,
+        max_output_tokens=500,
+        timeout_s=30,
+        max_retries=1,
+        auto_continue_attempts=3,
+    )
+    assert raw == '{"a":1}'
+    assert usage["continue_attempts"] == 0
+    assert provider.continue_calls == []
+
+
+# ---------------------------------------------------------------------------
 # RateLimiter under threads
 # ---------------------------------------------------------------------------
 

@@ -299,6 +299,7 @@ def llm_chat_completion(
     rate_limiter: RateLimiter | None = None,
     stream: bool = False,
     on_chunk: callable | None = None,
+    auto_continue_attempts: int = 0,
 ) -> tuple[str, dict]:
     """Run a single chat completion with retries.
 
@@ -306,6 +307,13 @@ def llm_chat_completion(
     (if provided) is called with each text delta for live progress feedback.
     Usage tokens are not returned by the stream — callers fall back to the
     rough estimator when ``usage`` is empty.
+
+    When ``auto_continue_attempts > 0`` and the provider reports
+    ``usage["truncated"]``, transparently call ``continue_completion`` up to
+    ``auto_continue_attempts`` times and concatenate the result so callers see
+    an output that wasn't cut by ``max_output_tokens``. Streaming + auto-
+    continue is not supported (streaming has no truncation flag) and the
+    parameter is ignored on the streaming path.
 
     Errors are classified before retry: 4xx (other than 408/429) bail
     immediately so a malformed request doesn't burn ``max_retries`` worth of
@@ -357,6 +365,47 @@ def llm_chat_completion(
                     json_mode=True,
                 )
             )
+
+            # Auto-continue loop. Each iteration appends the prior partial
+            # response to a fresh API call (provider-specific shape: OpenAI
+            # uses [system, user, assistant, user-continue]; Anthropic uses
+            # prefilling on the assistant turn). We sum prompt/completion
+            # tokens across attempts so cost accounting is accurate.
+            continue_attempts = 0
+            while (
+                auto_continue_attempts > 0
+                and continue_attempts < auto_continue_attempts
+                and usage.get("truncated")
+            ):
+                if rate_limiter:
+                    rate_limiter.wait()
+                _log.warning(
+                    "LLM output truncated after %d completion tokens; auto-continuing (attempt %d/%d)",
+                    int(usage.get("completion_tokens") or 0),
+                    continue_attempts + 1,
+                    auto_continue_attempts,
+                )
+                cont, cont_usage = asyncio.run(
+                    provider.continue_completion(
+                        system_prompt=system_prompt,
+                        user_prompt=user_prompt,
+                        prior_assistant=content,
+                        temperature=temperature,
+                        max_output_tokens=max_output_tokens,
+                        timeout_s=timeout_s,
+                        json_mode=False,
+                    )
+                )
+                content += cont
+                usage = {
+                    "prompt_tokens": int(usage.get("prompt_tokens") or 0)
+                    + int(cont_usage.get("prompt_tokens") or 0),
+                    "completion_tokens": int(usage.get("completion_tokens") or 0)
+                    + int(cont_usage.get("completion_tokens") or 0),
+                    "truncated": bool(cont_usage.get("truncated")),
+                }
+                continue_attempts += 1
+            usage["continue_attempts"] = continue_attempts
             return content, usage
 
         except Exception as e:
@@ -575,6 +624,17 @@ def main() -> int:
     )
     parser.add_argument("--temperature", type=float, default=0.1, help="Sampling temperature.")
     parser.add_argument("--max-output-tokens", type=int, default=3500, help="Max tokens for the report output.")
+    parser.add_argument(
+        "--auto-continue-attempts",
+        type=int,
+        default=3,
+        help=(
+            "If the LLM output is truncated by max-output-tokens, transparently "
+            "call the provider's continue_completion this many times to extend "
+            "the response (default: 3). Set 0 to disable. Streaming path is "
+            "unaffected (streaming has no truncation signal)."
+        ),
+    )
     parser.add_argument("--timeout", type=float, default=180.0, help="Request timeout in seconds.")
     parser.add_argument("--retries", type=int, default=5, help="Max retries for transient API errors.")
     parser.add_argument(
@@ -1023,6 +1083,7 @@ def main() -> int:
                     rate_limiter=rate_limiter,
                     stream=args.stream,
                     on_chunk=_make_chunk_logger(key) if args.stream else None,
+                    auto_continue_attempts=args.auto_continue_attempts,
                 )
                 duration = time.time() - t0
                 (responses_dir / "audit_response.txt").write_text(raw + "\n", encoding="utf-8")
@@ -1054,6 +1115,7 @@ def main() -> int:
                         timeout_s=args.timeout,
                         max_retries=args.retries,
                         rate_limiter=rate_limiter,
+                        auto_continue_attempts=args.auto_continue_attempts,
                     )
                     duration = time.time() - t0
                     (responses_dir / response_name).write_text(raw + "\n", encoding="utf-8")
@@ -1089,6 +1151,7 @@ def main() -> int:
                     timeout_s=args.timeout,
                     max_retries=args.retries,
                     rate_limiter=rate_limiter,
+                    auto_continue_attempts=args.auto_continue_attempts,
                 )
                 duration = time.time() - t0
                 (responses_dir / "reduce_response.txt").write_text(raw + "\n", encoding="utf-8")
