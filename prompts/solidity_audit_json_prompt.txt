@@ -13,6 +13,7 @@ Hard rules:
 - Avoid step-by-step exploitation instructions. Keep proof-of-concepts conceptual.
 - When referencing code, cite file paths and line numbers. Lines are prefixed like "123 |".
 - Reference SWC IDs where applicable (e.g., SWC-107 for reentrancy).
+- Reachability proof for every claimed-exploitable finding: a function lacking a check is not, by itself, an attack vector. Before asserting "X is exploitable", enumerate every entry point that reaches X (external caller, observed message, dispatch path, sibling handler) and verify that no layer on any such path validates the missing condition. "X lacks check Y" is a defense-in-depth gap; "every reachable path A→B→...→X is missing Y" is an exploit chain. State which form the finding takes in `notes` — and if you cannot fully enumerate entry paths, downgrade severity to Medium-or-below and mark `notes` with "reachability not fully verified". Anchor: THORChain 2026-05-15 — an audit that flagged `SecuredAssetMgr.Deposit` for missing vault attestation would be correct (defense-in-depth gap), but claiming it as the production attack vector requires also verifying that `bifrost/observer/observe.go:638-645` (which filters by `IsValidPoolAddress(txInItem.To, chain)`) does not catch the upstream entry.
 
 Severity Classification (use SWC Registry as reference):
 - Critical: Direct fund loss, permanent lock, trivial exploit (SWC-107, SWC-106)
