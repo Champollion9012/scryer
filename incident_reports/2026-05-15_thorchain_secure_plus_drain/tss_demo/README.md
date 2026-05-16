@@ -1,9 +1,12 @@
-# TSS Equivocation Attack — Pedagogical PoC
+# TSS Attack PoCs — local reproductions of the 2026-05-15 bug class
 
-A local-runnable Go demonstration of the **bug class** behind the
-2026-05-15 THORChain $10.8M drain. Mirrors the structure of TSSHOCK
-(Verichains 2023) and CVE-2023-33241 (Fireblocks Paillier), without
-being the real Verichains exploit code.
+Two local-runnable Go test files that reproduce the cryptographic bug
+classes behind the THORChain $10.8M drain:
+
+| File | Attack class | Status |
+|---|---|---|
+| `equivocation_attack_test.go` | α-shuffle / TSSHOCK encoding-ambiguity → controlled nonce → ECDSA key recovery | Pedagogical (final ECDSA step is real, middle step is simulated effect) |
+| `paillier_modulus_attack_test.go` | **CVE-2023-33241 (Paillier modulus check missing) → full share recovery via CRT** | **Real cryptographic reproduction** — recovers a randomly generated 256-bit share byte-for-byte |
 
 ## Run it
 
@@ -17,21 +20,42 @@ with Go 1.21+.
 
 ## What it shows
 
+### equivocation_attack_test.go (α-shuffle bug class)
+
 | # | Test | What it demonstrates |
 |---|---|---|
 | 1 | `TestHonestProtocolBindingHolds` | Length-prefixed commitment binds; Mallory cannot influence joint randomness after seeing Alice's. |
-| 2 | `TestAttackEquivocationLeaksControl` | Without strict binding, Mallory can retro-fit her share so the joint value lands on her target. Joint r becomes attacker-controlled. |
-| 3 | `TestDefenseStrictBindingBlocksAttack` | Strict-binding (length-prefix) commitment makes the retro-fit infeasible — even 1000 trial salts find no collision. |
-| 4 | `TestControlledNonceRecoversPrivateKey` | **REAL ECDSA**: given a known signing nonce `k` (the consequence of #2 in real TSS), Mallory recovers the full ECDSA private key from **one** signature via `x = (s*k − z) * r⁻¹ mod n`. The recovered key matches the victim's key byte-for-byte. |
+| 2 | `TestAttackEquivocationLeaksControl` | Without strict binding, Mallory can retro-fit her share so the joint value lands on her target. Joint r becomes attacker-controlled. (Effect-modeled — see honesty section.) |
+| 3 | `TestDefenseStrictBindingBlocksAttack` | Strict-binding (length-prefix) commitment makes the retro-fit infeasible — 1000 trial salts find no collision. |
+| 4 | `TestControlledNonceRecoversPrivateKey` | **Real P-256 ECDSA**: given a known signing nonce `k`, Mallory recovers the full ECDSA private key from **one** signature via `x = (s*k − z) * r⁻¹ mod n`. Recovered key matches victim's byte-for-byte. |
+
+### paillier_modulus_attack_test.go (CVE-2023-33241 — the **most likely** actual vector)
+
+| # | Test | What it demonstrates |
+|---|---|---|
+| 1 | `TestPaillierHonestRunHidesSecret` | Standard 512-bit Paillier with two equal-size prime factors — ciphertexts hide their plaintexts as the scheme guarantees. |
+| 2 | `TestPaillierAttackLeaksSecretModSmall` | Malicious Paillier with N = p_big × 65537. When the victim encrypts a 256-bit share under this N, the attacker recovers `share mod 65537` — leaking 17 bits per session. |
+| 3 | `TestPaillierFullKeyRecoveryViaCRT` | **Full key recovery, real math, real numbers**: 24 sessions with different small-prime moduli → CRT-combined residues → `knownModulus ≥ 2^256` → full 256-bit ECDSA share recovered byte-for-byte. This is the actual CVE-2023-33241 mechanism that the THORChain v0.1.6 fork is unpatched against. |
 
 ## What is real vs. simulated
 
 | Part | Real or simulated | Notes |
 |---|---|---|
+| **Paillier crypto system** | **Real** | Pure `math/big`. Keygen, encrypt, decrypt are textbook Paillier (1999). |
+| **CVE-2023-33241 mechanism** | **Real** | The attacker generates a Paillier N with a smuggled small prime, encrypts a real victim share under it, recovers the share mod q_small via partial decryption, and CRT-combines residues across sessions. The recovered 256-bit share matches the original byte-for-byte. |
 | ECDSA over P-256 | **Real** | Uses Go stdlib `crypto/ecdsa` + `crypto/elliptic`. Signing math is identical to what hardware wallets / vaults do. |
-| Key recovery formula | **Real** | Textbook `x = (s*k - z) * r⁻¹ mod n`. Same math that stole the PS3 firmware key (2010) and various wallet incidents. |
-| SHA256 commitments | **Real** | Honest commitments are genuinely binding under SHA256 collision resistance. Test #3 demonstrates this empirically. |
-| Test #2 equivocation step | **Simulated** | Test #2 cannot literally find a SHA256 second-preimage in a unit test (would need ~2²⁵⁶ work). Instead it models the *post-condition* of equivocation — that Mallory has effectively bound her commitment to a target — to demonstrate the **downstream effect** of an ambiguity-based attack. In real TSSHOCK / α-shuffle, the same effect is achieved via genuine protocol-level ambiguities in message serialization (not a SHA256 break). |
+| Key recovery from known nonce | **Real** | Textbook `x = (s*k - z) * r⁻¹ mod n`. Same math that stole the PS3 firmware key (2010). |
+| SHA256 commitments (test #1, #3) | **Real** | Honest commitments are genuinely binding under SHA256 collision resistance. Test #3 demonstrates this empirically — 1000 trial salts fail. |
+| **Equivocation effect (test #2 only)** | **Simulated** | A unit test cannot literally find a SHA256 second-preimage (would need ~2²⁵⁶ work). Test #2 models the *post-condition* of equivocation to demonstrate the downstream effect. In real TSSHOCK / α-shuffle, the same effect is achieved via genuine protocol-level ambiguities in message serialization. (The Paillier test is the rigorous one if you want a single real-math reproduction.) |
+
+### Calibration vs the real attack
+
+| Parameter | Real CVE-2023-33241 | This demo | Effect |
+|---|---|---|---|
+| Paillier modulus size | 2048 bit | 512 bit | Demo runs in <1 s |
+| Small-prime factor q_small | ~32 bit | 13–17 bit | Demo needs more sessions but each runs instantly |
+| Sessions needed to recover 256-bit share | ~16 | 24 (this run) | Same math, different parameters |
+| Recovery technique | CRT over multiple sessions | **Identical** | — |
 
 ## Mapping to the real 2026-05-15 attack
 
