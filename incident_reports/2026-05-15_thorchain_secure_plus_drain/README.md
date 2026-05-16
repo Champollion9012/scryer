@@ -235,11 +235,58 @@ See `make run-mocknet` in the thornode repo. Outside the scope of this report (r
 
 | Item | Status |
 |---|---|
-| Vulnerability identified | ✅ via static code analysis (3 missing checks, all confirmed in code) |
-| On-chain forensics | ✅ attacker memo decoded, 18 outbounds confirmed empty memo, 5 recipient addresses |
-| Standalone PoC (simulation) | ✅ in this directory |
-| Real-thornode PoC | ⚠️ artifact ready; requires Linux/macOS to run |
+| SecuredAssetMgr.Deposit lacks defense-in-depth vault check | ✅ confirmed in source — `IsActiveVault*` helper doesn't exist in codebase |
+| thornode's own `TestDepositAndWithdraw` exercises vulnerable path | ✅ confirmed at `manager_secured_asset_current_test.go:33-35` |
+| Standalone PoC (abstract bug class simulation) | ✅ in this directory, PASS on Windows native |
+| Real-thornode PoC artifact | ✅ ready; requires Linux/macOS to run |
+| On-chain forensics: 1 attacker tx decoded (`0xd5447901` with `secure+` memo) | ✅ |
+| On-chain forensics: 18 outbounds with empty memo confirmed | ✅ |
+| **Full attack-chain entry point** | ⚠️ **NOT confirmed** — see § 8 |
 | Official post-mortem | ⏳ pending (24-72h after halt) |
 
-Confidence: **~90%** root cause is Secured-Asset phantom-mint via 3-gate bypass.
-Awaiting official post-mortem to fully confirm or refine attribution.
+## 8. Open question — Where does the attacker's inbound enter?
+
+After deeper inspection of `bifrost/observer/observe.go:638-645`, the generic
+Bifrost observer filter **does** reject inbounds whose destination is not a
+known active pool address (`IsValidPoolAddress(txInItem.To, chain)`). This
+means the attack chain I framed in § 2 — "Router.depositWithExpiry with
+`vault = ATTACKER_OWN_ADDR` triggers Bifrost report" — does NOT work against
+the actual codebase. Bifrost drops the observation before it reaches thornode.
+
+The architectural bug in `SecuredAssetMgr.Deposit` (no vault attestation
+check) is real and demonstrable in isolation (Layer 1 / Layer 2 PoC), but
+the production attack must have used a different entry. Candidate entries
+still open (no specific evidence for any):
+
+- (a) `0x82a5CF67…` was an active Asgard EOA at 07:23 UTC 5/15 (need
+      historical pubkeyMgr snapshot to verify)
+- (b) `pubkeyMgr` stale-cache: retired vault address not removed at rotation
+- (c) Decoded tx `0xd5447901` is unrelated noise; real attack vector uses
+      different memo type (e.g., `add`, refund, migrate)
+- (d) TSS / quorum compromise (high cost, low probability)
+- (e) A different MsgDeposit path on Thorchain native chain that bypasses
+      the filter (e.g., via a sibling module like RUNEPool, TradeAccount,
+      or wasm exec)
+- (f) Bug in `IsValidPoolAddress` itself
+
+Confidence in full attribution: **~30%** for `secure+` as the vehicle, given
+the entry-point filter caught the obvious version. Awaiting official
+post-mortem to narrow this down.
+
+## 9. What stays defensible regardless of which vector is true
+
+- The **SecuredAssetMgr.Deposit defense-in-depth gap is real** and would be a
+  high-severity finding in any audit even if it wasn't this specific incident's
+  vehicle. A handler that mints L1-redeemable shares without verifying the
+  L1-side attestation violates the defense-in-depth principle even when an
+  upstream filter is correct today.
+- The **`IsActiveVault*` helper missing from `x/thorchain/keeper`** is a real
+  primitive gap: there's no canonical way for downstream handlers to do
+  defense-in-depth even if they wanted to.
+- The **on-chain symptom (empty memo on `TransferOut`) genuinely points to
+  an internal-protocol-generated outbound path** — secured-asset withdrawal
+  is one such path, but so are migrate, yggdrasil return, solvency
+  reconciliation, and others.
+
+The standalone simulation PoC demonstrates the bug-class is exploitable
+*if reached*; it doesn't demonstrate this is *the* 5/15 mechanism.
