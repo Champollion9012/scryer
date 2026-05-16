@@ -1,9 +1,25 @@
-# Incident Report — THORChain Secured-Asset Phantom-Mint Drain
+# Incident Report — THORChain 2026-05-15 Multi-Chain Drain
 
 **Date**: 2026-05-15
 **Chains**: Bitcoin, Ethereum, BSC, Base (multi-chain, simultaneous)
 **Status**: Active during 07:23 – ~10:30 UTC, halted by node operators after detection
 **Net loss**: ~$10.8M (3,443 ETH + 36.85 BTC + 96.6 BNB + Base residual)
+
+> ## ⚠️ Status Update (2026-05-16 from THORChain team)
+>
+> **Official root cause (preliminary)**: **GG20 TSS (Threshold Signature Scheme) implementation vulnerability**. Vault participants' sensitive key material leaks over time during signing rounds. A new malicious node operator (`thor16ucjv…`) bonded to the network, participated as a TSS member, collected leaked share material across multiple rounds, eventually **reconstructed the vault's full private key**, and signed unauthorised outbound transactions directly across all four chains.
+>
+> ### Implications for this report
+>
+> The hypothesis chain in § 2 (Secured-Asset Phantom-Mint via Bifrost Filter Bypass) — and the alternative entry vectors enumerated in § 8 — are **REFUTED** as production attack vectors. The attacker did not need ANY application-layer bypass: with the full TSS private key, they can sign outbounds unilaterally, which explains every observed on-chain symptom (empty memos, single recipient, diverse asset sweep across 19 tokens, cross-chain simultaneity, 7,000× amplification).
+>
+> ### What stays valid in this report
+>
+> - § 7.5 on-chain forensics (the 22-tx empty-memo sweep pattern is correctly documented)
+> - § 9 defense-in-depth finding on `SecuredAssetMgr.Deposit` — **still a legitimate audit issue**, unrelated to 5/15
+> - The standalone PoC in this directory demonstrates the abstract bug class on `SecuredAssetMgr`, not the 5/15 mechanism
+>
+> See § 10 below for the proper root cause framing and § 11 for the verification plan ("did the team get it right?").
 
 ---
 
@@ -22,7 +38,9 @@
 
 ---
 
-## 2. Vulnerability — Secured-Asset Phantom-Mint via Bifrost Filter Bypass
+## 2. Vulnerability — Secured-Asset Phantom-Mint via Bifrost Filter Bypass  ⚠️ [REFUTED]
+
+> **This entire section is preserved as a record of the initial hypothesis. The official post-mortem (§ 10) attributes the attack to a GG20 TSS share-leakage vulnerability, NOT to any secured-asset phantom-mint. Reader should treat § 2-§ 8 below as historical reasoning that turned out to be wrong, not as the actual 5/15 root cause.**
 
 The bug is **not in any Solidity contract**. It is a multi-layer failure across THORChain's off-chain stack (thornode + bifrost), enabling free minting of "Secured Assets" — internal claims on the real Asgard vault — without ever depositing the corresponding L1 asset.
 
@@ -312,9 +330,166 @@ post-mortem to narrow this down.
   primitive gap: there's no canonical way for downstream handlers to do
   defense-in-depth even if they wanted to.
 - The **on-chain symptom (empty memo on `TransferOut`) genuinely points to
-  an internal-protocol-generated outbound path** — secured-asset withdrawal
-  is one such path, but so are migrate, yggdrasil return, solvency
-  reconciliation, and others.
+  an internal-protocol-generated outbound path** — but the actual 5/15
+  reason is **the attacker holding the vault key and signing outbounds
+  directly** (no thornode involvement → no memo generation), not a buggy
+  internal handler.
 
 The standalone simulation PoC demonstrates the bug-class is exploitable
 *if reached*; it doesn't demonstrate this is *the* 5/15 mechanism.
+
+---
+
+## 10. Official root cause — GG20 TSS share leakage
+
+Per the THORChain team update on 2026-05-16:
+
+### Attack mechanism (official explanation)
+
+1. **Attacker bonded a new node** `thor16ucjv…` to the THORChain network.
+   The Ethereum address used to acquire/stake the RUNE bond is linked to
+   addresses that later received the stolen funds — strongly indicating a
+   single malicious actor.
+2. The new node joined the active validator set and **participated as a
+   member of the TSS signing committee** for Asgard vaults.
+3. THORChain uses **GG20** (Gennaro-Goldfeder 2020) for threshold ECDSA
+   signing. The team's investigation indicates the implementation has a
+   flaw that causes **vault participants' sensitive key material to leak
+   over time** — i.e. each signing round produces protocol messages that
+   contain extractable side information about other participants' shares.
+4. After accumulating enough leaked material across many signing rounds,
+   the attacker **reconstructed the vault's full private key**.
+5. With the full ECDSA private key, the attacker signed outbound
+   transactions **unilaterally** — bypassing thornode's outbound scheduling,
+   memo generation, and quorum entirely. This explains:
+    - Empty memos: thornode never produced these outbounds, so no
+      `OUT:<inbound>`/`MIGRATE:<height>`/etc. memo was attached
+    - Single recipient: the attacker chose where to send, and chose one
+      consolidation address per chain
+    - Asset diversity (19 tokens swept on ETH): with the private key, the
+      attacker drained the vault's full ERC-20 holdings in one sweep, one
+      `Router.transferOut` per asset
+    - Cross-chain simultaneity: the same TSS key share material derives
+      addresses on every supported chain via standard ECDSA → address rules
+
+### Why this slipped past my earlier analysis
+
+I dismissed "TSS / quorum compromise" in § 8 candidate (d) as "high cost,
+low probability — needs ≥⅓ node compromise". I assumed TSS compromise
+meant compromising a supermajority of nodes. **GG20 has a known class
+of attacks where a SINGLE malicious participant can exfiltrate share
+information from honest participants' protocol messages over many
+signing rounds** — see Lindell et al. (2019, 2020) and Castagnos et al.
+on GG18/GG20 leakage. The economic logic also favoured the attacker:
+bonding one node costs O(low six figures) of RUNE; if successful, the
+payoff is the entire vault contents (O($10M+)).
+
+The empty-memo + diverse-asset + single-recipient symptom should have
+immediately suggested "vault key control" instead of "thornode handler
+bug". I over-engineered a hypothesis that fit the visible Solidity/Go
+surface area without seriously considering the cryptographic layer.
+
+### Network status (per official update)
+
+| Item | Status |
+|---|---|
+| Network pause | Active; will auto-release in ~12h |
+| RUNE transfers + chain observation | To resume after auto-release |
+| Trading / signing / LP operations | Remain frozen until fix |
+| Loss handling options | Slashing affected nodes; POL absorption; community proposal |
+
+---
+
+## 11. Verification plan — is the official root cause complete?
+
+The team's statement is a **status update**, not a full forensic post-mortem.
+"Leading theory" / "indicates" / "preliminary" language suggests they are
+not yet 100% certain. Possible refinements / counter-hypotheses to verify:
+
+### Open questions
+
+1. **Is GG20 specifically the buggy primitive**, or is the leak in a
+   non-GG20 part of the signing flow (e.g. share resharing / re-randomisation
+   / blame protocol)?
+2. **Is `thor16ucjv…` really the *only* attacker node**, or did multiple
+   nodes coordinate? (Single-node GG20 leak attacks usually need MANY
+   signing rounds; if the bond is too recent, the timeline doesn't fit.)
+3. **How long was the attacker bonded?** If bonded just days before 5/15,
+   the "leak over time" model needs the leak rate to be high enough to
+   extract a 256-bit key from N rounds.
+4. **Which exact GG20 library version** is thornode using? If it's a known
+   academic-flagged version, we can cite the specific CVE / paper. If it's
+   custom or modified, the vector may not match published GG20 issues.
+5. **Why did THORChain still use the vulnerable variant** when newer
+   protocols (CGGMP, FROST, DKLs23) have been available since 2023?
+6. **Could the "leakage over time" framing be a face-saving narrative**
+   for what's actually a simpler bug (e.g. key share material accidentally
+   logged or persisted)? The team may prefer a "subtle cryptographic flaw"
+   explanation over "we leaked the share to disk in plain text".
+
+### Concrete verification steps (executable from here)
+
+| # | Step | Tool / source | What it tells us |
+|---|---|---|---|
+| V1 | Lookup full address `thor16ucjv…` on Thorchain REST API | `thornode/v1/nodes/{addr}` | Bond timestamp, RUNE amount, slash-point history, sign history |
+| V2 | Get exact GG20 lib version in thornode's `go.mod` | `cat /c/tmp/poc/thornode/go.mod \| grep -i tss` | Identifies the specific implementation |
+| V3 | Diff thornode TSS-related code 2026-04-01 → 2026-05-14 | `git log -p bifrost/tss/` | Find any recent changes to keygen / sign |
+| V4 | Cross-reference TSS lib version with known CVEs | scholar / GH security advisories | Confirms which vuln class |
+| V5 | Lookup the actual 5/15 outbound tx signatures on-chain | Etherscan / Btcscan | Compare signing key recovery hashes against active vault pubkeys |
+| V6 | Query Thorchain explorer for the 5/15 active Asgard members | `/v1/vaults/asgard` archive | See whether attacker node was IN the signing set during attack window |
+| V7 | Check pre-attack node bond activity | Thorchain explorer | If a small bond increase happened ~weeks before 5/15, consistent. If days before, harder to reconcile with "leak over time" |
+| V8 | Read official post-mortem (when released, 2-7 days out) | Medium / blog | Definitive answer |
+
+### Acceptance criteria for each hypothesis
+
+| Hypothesis | Confirm if | Refute if |
+|---|---|---|
+| Official: GG20 leakage by single node | V1 shows `thor16ucjv` bonded ≥ N weeks before 5/15 AND V2-V4 identify a matching known vuln AND V6 shows the node was in the active signing set | V1 shows bond < few days OR V6 shows node not in signing set OR V2 shows a TSS variant with no known leak |
+| Alt: multiple-node collusion | V1 + V6 show ≥ 2 nodes bonded together with linked funding | V1 shows single bond, V6 single signer |
+| Alt: simpler ops bug (logged share, leaked from infrastructure) | Team's eventual post-mortem cites infrastructure (key file leak, container escape, log file disclosure) | Team's post-mortem cites a specific GG20 paper / CVE |
+| Alt: thornode signing bypass (no TSS compromise — sign via direct privilege escalation) | A path is found in thornode that allows non-quorum signing | Code review confirms TSS quorum strictly enforced |
+
+### Confidence I'll have at each milestone
+
+| Milestone | When | Expected confidence in official story |
+|---|---|---|
+| Now (status update only) | 2026-05-16 | ~70% |
+| V1+V2+V3 done locally | 2026-05-16 (~1h) | ~80% if consistent |
+| Official post-mortem with code citations | 2026-05-18 ~ 22 | ~95% |
+| Independent third-party crypto audit confirms specific GG20 flaw | weeks later | ~99% |
+
+### My priors going in
+
+- I was wrong about almost everything specific (H1-H6); my analytical
+  process under-weighted the cryptographic layer entirely.
+- The team has direct access to logs / signing-round transcripts /
+  bond records that I don't.
+- "GG20 leakage" is consistent with everything I observed on-chain.
+- But: the team may also be **wrong or incomplete** — sometimes the
+  initial "we know what happened" announcement is replaced 1-2 weeks
+  later with a more accurate one.
+- I will treat the official story as the working baseline (70%) until
+  V1-V4 either corroborate or contradict.
+
+---
+
+## 12. Lessons added to Scryer audit pipeline
+
+This incident is now anchored in two prompt directives:
+
+1. [`prompts/solidity_audit_json_prompt.txt` — Hard rule: "Reachability proof
+   for every claimed-exploitable finding"](../../prompts/solidity_audit_json_prompt.txt) — added as commit `aa920e9`. This rule would have caught my early
+   over-claim of H1 by requiring me to verify the entry path before asserting
+   exploitability.
+2. [`prompts/solidity_audit_json_prompt.txt` — Off-Chain Trust Boundary
+   directive](../../prompts/solidity_audit_json_prompt.txt) — added as commit
+   `e4ec7e2`. Still valid for protocol-architecture analysis even though the
+   5/15 attack was lower in the stack.
+
+**Pending addition (TODO)**: a MPC/TSS directive for protocols that use
+threshold signing — anchored on this incident. Audit auditors should
+flag any Solidity contract whose fund safety depends on an off-chain MPC
+implementation (vault contracts custodied by TSS, restaking validator
+sets, multi-party-computed governance) and note that the cryptographic
+protocol correctness is part of the trust surface even if out of audit
+scope.
