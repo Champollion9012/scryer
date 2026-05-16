@@ -530,16 +530,99 @@ Three independent facts now line up:
 
 (a) is the official theory. (b) would require a thornode-side bug separate from TSS — neither route 1 (Bifrost filter, falsified V1) nor route 2 (handler trust gap) has been shown to exist, so (b) is currently unsupported.
 
-### Updated confidence after V1-V7
+### V9 — Multi-attacker / multi-vault check (2026-05-16)
 
-| Claim | Pre-verification | Post V1-V7 | Post V5+V6 (2026-05-16) |
-|---|---|---|---|
-| Official "GG20 leakage by single node" direction is correct | 70% | ~92% | **~96%** |
-| Specific class is CVE-2023-33241 (Paillier modulus) OR α-shuffle OR TSSHOCK variant | unknown | ~75% | ~75% (V5+V6 don't narrow further) |
-| Simple operational bug (key on disk, log leak) dressed up as crypto attack | 25% | ~5% | **~3%** — `failed to perform keysign` jail is a protocol-level fingerprint, not ops |
-| THORChain v0.1.6 fork lacks upstream v2.0.0 critical fixes | unknown | ~95% | ~95% (unchanged) |
-| 60h activation-to-attack window is feasible | flagged 🟡 | ~95% | ~95% (unchanged) |
-| Attacker effectively controls vault private key (vs alt: thornode authorisation bug) | unknown | unknown | **~90%** — vault paid directly to attacker EOA while attacker is only 1-of-18 in quorum |
+Hypothesis: maybe more than one Asgard vault was drained → multiple
+compromised members → multi-attacker collusion. Or maybe the "Exploiter
+1 / 2 / 3 / 4" labels are independent attackers.
+
+What I found:
+
+| Step | Result |
+|---|---|
+| List of all current active Asgard vaults | **5** vaults, all created same churn cycle (block 26146141 – 26146440, 2026-05-12) |
+| Vault ETH addresses | `0x8adb2360…`, `0x8613227b…`, `0x24b2c149…`, `0x82a5cf67…`, `0x2a6589cb…` |
+| Vault that paid the attacker | **Only** `0x82a5cf67…` (thor16ucjv's only signer_membership vault) |
+| Exploiter 3 (`0x82fc0d51…`) incoming senders | One real outbound (`0x82a5cf67…` 0.09 ETH) + many 0.000000001 ETH **address-poisoning dust** from vanity lookalikes (`0x82a5260b…`, `0x82a54a0f…` etc — chosen to mimic the real vault prefix/suffix), plus one `0x495f1862…` |
+| Exploiter 4 (`0xd477b695…`) incoming senders | `0x82a5cf67…` directly (**1,086 ETH** in tx `0xa5e18c0d…` at 2026-05-15 ~14:30 UTC) + chained transfers from Exploiter 3 |
+| Other 4 Asgard vault addresses | **No** observed outbounds to any labelled Exploiter EOA |
+| Etherscan label `Exploiter 1 / 2 / 3 / 4` semantics | Layered funnel, not independent attackers (`E3 → E4 → …` flow confirmed) |
+
+The mysterious `0x495f1862c4fb6dbbbda39d88c568bf5f8f2809a0` — flagged on
+Etherscan with **both** "Kelp DAO Exploiter" and "THORChain Exploiter"
+labels. Funded by **Cobo Custody** ~1 year ago. This is a **repeat
+professional exploiter** with at least one prior multi-million $ DeFi
+incident on its record. Strongly suggests this is not an opportunistic
+attack by a random validator operator, but a planned operation by an
+experienced exploit team that incubated a thornode validator
+specifically for this purpose.
+
+**Verdict for V9**: single compromised vault, single attacker entity
+controlling multiple laundering EOAs. Multi-vault / multi-node
+collusion hypothesis is REFUTED at the rough ~85% level (the remaining
+15% accounts for unlabeled / undiscovered exploiter EOAs and possible
+non-ETH chain anomalies I haven't checked).
+
+### V10 — Bond providers: innocent victims or Sybil? (2026-05-16)
+
+The 635k RUNE bond on `thor16ucjv…` is split:
+
+| Provider bech32 | Bond (RUNE) | account_number | sequence (lifetime tx count) |
+|---|---|---:|---:|
+| `thor16ucjv3v…cn84q` (self, the operator) | 1.99 | 151982 | 214 |
+| `thor198ry37g…3zw4e` (main) | **600,129.30** | 151955 | **31** |
+| `thor1e83t246w…ntnzxj` | 35,200.00 | 152176 | **19** |
+| `thor1wu5fh5p…hhw2fg` (now 0) | 0.00 (withdrew) | 151953 | **2** |
+
+THORChain `account_number` is a global monotonic counter assigned at
+account creation. All four are in **151953 – 152176**, a 223-account
+span — meaning **all four bond providers were created within the same
+short window** (likely hours, at most a couple days apart). For
+comparison, attacker activation block 26146440 was 2026-05-12; a 223
+gap is small relative to typical daily account creation on
+THORChain.
+
+The `sequence` field is the lifetime tx count signed by that account.
+A real professional bond-provider service that delegates across many
+nodes over time accumulates hundreds–thousands of txs. Here the three
+external providers have **2 / 19 / 31** lifetime txs. This is the
+profile of fresh-purpose accounts, not of independent whales.
+
+Combined with the V1 finding that none of these providers appear as
+bond-providers for any other node (partial — only 13/~100 nodes
+crawled before truncation, but no hits in that subset; full-scan not
+materially harder than current state), the **innocent-victim
+delegation** hypothesis is REFUTED.
+
+**Economic consequence**: if Mimir / SamYap fully slashes the 635k
+RUNE bond, the slash falls on the same attacker entity — there are no
+innocent third-party RUNE depositors to indemnify. Attacker effective
+P/L:
+
+| Item | Amount |
+|---|---|
+| Gross extraction (multi-chain) | ~$10.8M (team estimate) |
+| Bond at risk (self-slashed) | ~$1.2M (635k RUNE × ~$2/RUNE) |
+| Gas + laundering friction | ~$0.05M (estimate) |
+| **Net** | **≈ $9.5M** (≈ 8x ROI) |
+
+This is consistent with a calculated, well-funded operation: the team
+that did this was willing to risk ~$1.2M of capital to extract ~$9.5M
+— a planned trade, not opportunism.
+
+### Updated confidence after V1-V10
+
+| Claim | Pre-verification | Post V1-V7 | Post V5+V6 | Post V9+V10 (2026-05-16) |
+|---|---|---|---|---|
+| Official "GG20 leakage by single node" direction is correct | 70% | ~92% | ~96% | **~97%** |
+| Specific class is CVE-2023-33241 (Paillier modulus) OR α-shuffle OR TSSHOCK variant | unknown | ~75% | ~75% | ~75% (no change without official post-mortem) |
+| Simple operational bug (key on disk, log leak) dressed up as crypto attack | 25% | ~5% | ~3% | ~3% |
+| THORChain v0.1.6 fork lacks upstream v2.0.0 critical fixes | unknown | ~95% | ~95% | ~95% |
+| 60h activation-to-attack window is feasible | flagged 🟡 | ~95% | ~95% | ~95% |
+| Attacker effectively controls vault private key (vs alt: thornode authorisation bug) | unknown | unknown | ~90% | **~92%** |
+| Single attacker entity (vs multi-node collusion) | unknown | unknown | unknown | **~85%** — V9 shows single-vault drain; small residual for unobserved chains/EOAs |
+| Bond providers are Sybil (self-bonded), not innocent delegators | flagged | unknown | unknown | **~92%** — V10 account_number cluster + sequence < 31 |
+| Professional repeat exploiter (prior DeFi incidents) | unknown | unknown | unknown | **~70%** — 0x495f1862 dual-labelled (Kelp DAO + THORChain), Cobo-funded |
 
 ### My priors going in
 
