@@ -1,12 +1,13 @@
 # TSS Attack PoCs — local reproductions of the 2026-05-15 bug class
 
-Two local-runnable Go test files that reproduce the cryptographic bug
-classes behind the THORChain $10.8M drain:
+Three local-runnable Go test files that reproduce the cryptographic bug
+class behind the THORChain $10.8M drain:
 
 | File | Attack class | Status |
 |---|---|---|
 | `equivocation_attack_test.go` | α-shuffle / TSSHOCK encoding-ambiguity → controlled nonce → ECDSA key recovery | Pedagogical (final ECDSA step is real, middle step is simulated effect) |
 | `paillier_modulus_attack_test.go` | **CVE-2023-33241 (Paillier modulus check missing) → full share recovery via CRT** | **Real cryptographic reproduction** — recovers a randomly generated 256-bit share byte-for-byte |
+| `verify_bypass_test.go` | **End-to-end binding to the actual vulnerable lib** | **Lifts the verify logic verbatim from gitlab.com/thorchain/tss/tss-lib v0.1.6** and proves the malicious Paillier modulus passes the *real* vulnerable check (both trial-division Part A and Goldwasser-style Part B) |
 
 ## Run it
 
@@ -36,6 +37,13 @@ with Go 1.21+.
 | 1 | `TestPaillierHonestRunHidesSecret` | Standard 512-bit Paillier with two equal-size prime factors — ciphertexts hide their plaintexts as the scheme guarantees. |
 | 2 | `TestPaillierAttackLeaksSecretModSmall` | Malicious Paillier with N = p_big × 65537. When the victim encrypts a 256-bit share under this N, the attacker recovers `share mod 65537` — leaking 17 bits per session. |
 | 3 | `TestPaillierFullKeyRecoveryViaCRT` | **Full key recovery, real math, real numbers**: 24 sessions with different small-prime moduli → CRT-combined residues → `knownModulus ≥ 2^256` → full 256-bit ECDSA share recovered byte-for-byte. This is the actual CVE-2023-33241 mechanism that the THORChain v0.1.6 fork is unpatched against. |
+
+### verify_bypass_test.go (proves the malicious N passes the *real* vulnerable lib)
+
+| # | Test | What it demonstrates |
+|---|---|---|
+| 1 | `TestMaliciousPaillierPassesVulnerableLibVerify` | Reproduces `(*Proof).Verify` from `gitlab.com/thorchain/tss/tss-lib v0.1.6` (crypto/paillier/paillier.go:240-277) **verbatim**: trial-division for primes < 1000 (Part A) + Goldwasser-style "knows factorization" proof (Part B, ProofIters=13). Generates a malicious N = p_big × 1009 (smallest q_small that bypasses Part A). **Both parts accept the malicious N.** The same `Verify` is called per-peer in `ecdsa/keygen/round_4.go:42`, so this is the exact code path that admits the attack into the protocol. |
+| 2 | `TestObviouslySmallFactorIsRejected` | Sanity: q_small=7 (< 1000) **is** rejected by Part A — confirms our reproduction of the vulnerable lib's check is faithful (not permissive of everything). |
 
 ## What is real vs. simulated
 
