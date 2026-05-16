@@ -244,7 +244,35 @@ See `make run-mocknet` in the thornode repo. Outside the scope of this report (r
 | **Full attack-chain entry point** | ⚠️ **NOT confirmed** — see § 8 |
 | Official post-mortem | ⏳ pending (24-72h after halt) |
 
-## 8. Open question — Where does the attacker's inbound enter?
+## 7.5. On-chain forensics update (2026-05-16, via Etherscan API V2 batch)
+
+After batch-decoding all txs to/from the Router in block range 25099000-25101000 (the attack window, 07:23-10:30 UTC May 15):
+
+| Metric | Value |
+|---|---|
+| TransferOut calls from Router | 25 |
+| → to attacker `0x82Fc0d5150...` with **empty memo** | **22** |
+| → legitimate user swap completions (proper `OUT:<hash>` memos) | 3 |
+| depositWithExpiry calls into Router | **2 only** |
+| → swap memo to LTC, 0.00196 ETH (~$4.50) | 1 |
+| → `secure+:thor19...` memo, 3,804 XRUNE (~$1,140) | 1 |
+| Total ETH-side attacker INPUT | **~$1,144** |
+| Total ETH-side attacker OUTPUT | **~$8M** (stables + WBTC + XRUNE + CRV + ...) |
+| Effective amplification | **~7,000×** |
+
+**Empty-memo outbound asset diversity**: USDC, USDT, WBTC, XRUNE, CRV, DAI, LINK, AAVE, SNX, LUSD, GUSD, USDP, THORSwap, THR_old, LOOM, GRT, DPI, YFI, wstETH (~19 distinct assets all swept to one attacker address).
+
+### Implication
+
+The "redeem 1:1 your phantom shares" framing in § 2 cannot explain a 7,000× amplification on ETH side with only 2 small inbound deposits. The 22 outbounds are not the output of `secure+ → SECURE-` round-trips. The pattern (**single recipient + empty memo + diverse asset sweep**) matches a **vault-rotation / migrate-style sweep** more than a per-tx secured-asset redemption — except `MIGRATE:<height>` would normally have a non-empty memo.
+
+The attack must originate from one of:
+
+- (i) A different inbound chain (BTC most likely — attacker has confirmed BTC address; thornode generates ETH outbounds as cross-chain swap fulfilment)
+- (ii) Thorchain-native `MsgDeposit` with internal logic that emits asset moves
+- (iii) An **internal thornode trigger** (a bug-injected migration / rescue / consolidation path that defaults memo to empty when the height/identifier is zero)
+
+(iii) is the most parsimonious given the on-chain symptom (empty memo across 22 distinct asset transfers to one address — looks like a single buggy operation enumerating all vault holdings and emitting per-asset transferOut calls).
 
 After deeper inspection of `bifrost/observer/observe.go:638-645`, the generic
 Bifrost observer filter **does** reject inbounds whose destination is not a
