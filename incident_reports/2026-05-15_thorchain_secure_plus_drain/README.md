@@ -493,15 +493,53 @@ The **CVE-2023-33241 "16 signatures suffice" finding resolves my earlier timelin
 
 **V7 — Bond timeline (already captured above with V1)**.
 
+**V5 — ECDSA signature recovery on attack outbounds**:
+- Pulled the first vault → attacker ETH outbound: `0x89d88ac8071d79af973410c787627548131539849a623c523d8c8f94f7548f6d` (0.09 ETH at 2026-05-15 09:32:11 UTC)
+- `from = 0x82a5CF67f3e6970c0529122178075c0a94878bDA` (an Asgard vault, see V6)
+- `to   = 0x82fc0d5150f3548027e971ec04c065f3c93154eb` (**Etherscan label: "THORChain Exploiter 3"** — implies ≥3 layered exploiter EOAs)
+- Any Ethereum tx's from-address is by definition the ECDSA-recovered signer — so this tx **was signed by the vault's private key**. ECDSA recovery vs vault pubkey is therefore implicit and confirmed.
+- **V5 cannot discriminate** "honest TSS quorum signed" vs "single party with extracted private key signed": both produce signatures recoverable to the same aggregate ECDSA pubkey. The discriminator has to come from Thorchain-side authorisation records (was there a corresponding `tx_out` queue entry and a triggering inbound observation?). Midgard `/v2/actions` was unreachable from this sandbox; thornode `/thorchain/tx/{id}` returned 400 on the outbound hash, which itself is suggestive — successful Thorchain-authorised outbounds usually have a record there — but I cannot rule out an API-shape mismatch in my probe.
+- Side observation: attacker fund-flow is `Exploiter 3 → Exploiter 4` (+ ~45 ETH consolidation in 3 txs ~24h later), then `Exploiter 4 → Exploiter 5/6…` — layered washing rather than direct cash-out, indicating planning.
+
+**V6 — Active Asgard committee membership of `thor16ucjv…`**:
+Query: `/thorchain/node/thor16ucjv3v695mq283me7esh0wdhajjalengcn84q` against `thornode.thorchain.liquify.com`.
+
+| Field | Value | Interpretation |
+|---|---|---|
+| `status` | `Active` | Node is currently in the active signing set |
+| `bond` | 635,331.30 RUNE | Matches V1 |
+| `active_block_height` | 26,146,440 | When the node entered active set (≈ 2026-05-12 17:36 UTC) |
+| `jail.release_height` | 26,180,025 | Jailed; release was ≈ **2026-05-15** (within attack window) |
+| **`jail.reason`** | **`failed to perform keysign`** | **TSS-abort fingerprint** — a malicious party that aborts during keysign (e.g. to leak round-1 material, α-shuffle style) gets jailed for exactly this reason |
+| `signer_membership` | **1 vault**: `thorpub1add…u3g5ka22v28` | Member of exactly one Asgard vault |
+
+Cross-checked the vault: `/thorchain/vault/thorpub1add…u3g5ka22v28`
+- `status: ActiveVault`, `type: AsgardVault`
+- `status_since: 26146440`, `block_height: 26146239` → **vault was created in the same churn cycle the attacker entered active set (201 blocks ≈ 20 min apart)**. This means **the attacker participated in this vault's keygen ceremony**.
+- `membership: 18 members`, attacker is 1 of 18 (well below the 2/3 ≈ 12 threshold required to sign)
+- `addresses.ETH: 0x82a5cf67f3e6970c0529122178075c0a94878bda` ← exactly the from-address of the attack outbound in V5
+- `outbound_tx_count: 565` over ~3 days → ~190/day = ample signing rounds for a 16-signature extraction CVE-class attack
+
+### Synthesis of V5 + V6
+
+Three independent facts now line up:
+
+1. The vault that paid the attacker is a real Asgard vault created the same churn cycle the attacker became active.
+2. The attacker is `failed to perform keysign`-jailed within the attack window — the exact failure mode of TSS-protocol abuse.
+3. The attacker is 1-of-18 in the vault (cannot reach 2/3 threshold legitimately), yet the vault paid out **directly** to a known-attacker EOA — which is **impossible under correct TSS** unless either (a) the attacker has effective control of the ECDSA private key, or (b) thornode authorised the payout via a path that doesn't require the vault's quorum.
+
+(a) is the official theory. (b) would require a thornode-side bug separate from TSS — neither route 1 (Bifrost filter, falsified V1) nor route 2 (handler trust gap) has been shown to exist, so (b) is currently unsupported.
+
 ### Updated confidence after V1-V7
 
-| Claim | Pre-verification | Post V1-V7 |
-|---|---|---|
-| Official "GG20 leakage by single node" direction is correct | 70% | **~92%** |
-| Specific class is CVE-2023-33241 (Paillier modulus) OR α-shuffle OR TSSHOCK variant | unknown | **~75%** that it's one of these or close variant |
-| Simple operational bug (key on disk, log leak) dressed up as crypto attack | 25% | **~5%** — V3 shows real cryptographic patches were being applied; not consistent with ops-only attack |
-| THORChain v0.1.6 fork lacks upstream v2.0.0 critical fixes | unknown | **~95%** — direct evidence from go.mod |
-| 60h activation-to-attack window is feasible | flagged 🟡 | **~95%** — given 16-sig extraction class |
+| Claim | Pre-verification | Post V1-V7 | Post V5+V6 (2026-05-16) |
+|---|---|---|---|
+| Official "GG20 leakage by single node" direction is correct | 70% | ~92% | **~96%** |
+| Specific class is CVE-2023-33241 (Paillier modulus) OR α-shuffle OR TSSHOCK variant | unknown | ~75% | ~75% (V5+V6 don't narrow further) |
+| Simple operational bug (key on disk, log leak) dressed up as crypto attack | 25% | ~5% | **~3%** — `failed to perform keysign` jail is a protocol-level fingerprint, not ops |
+| THORChain v0.1.6 fork lacks upstream v2.0.0 critical fixes | unknown | ~95% | ~95% (unchanged) |
+| 60h activation-to-attack window is feasible | flagged 🟡 | ~95% | ~95% (unchanged) |
+| Attacker effectively controls vault private key (vs alt: thornode authorisation bug) | unknown | unknown | **~90%** — vault paid directly to attacker EOA while attacker is only 1-of-18 in quorum |
 
 ### My priors going in
 
@@ -520,7 +558,7 @@ The **CVE-2023-33241 "16 signatures suffice" finding resolves my earlier timelin
 
 ## 12. Lessons added to Scryer audit pipeline
 
-This incident is now anchored in two prompt directives:
+This incident is now anchored in three prompt directives:
 
 1. [`prompts/solidity_audit_json_prompt.txt` — Hard rule: "Reachability proof
    for every claimed-exploitable finding"](../../prompts/solidity_audit_json_prompt.txt) — added as commit `aa920e9`. This rule would have caught my early
@@ -530,11 +568,12 @@ This incident is now anchored in two prompt directives:
    directive](../../prompts/solidity_audit_json_prompt.txt) — added as commit
    `e4ec7e2`. Still valid for protocol-architecture analysis even though the
    5/15 attack was lower in the stack.
-
-**Pending addition (TODO)**: a MPC/TSS directive for protocols that use
-threshold signing — anchored on this incident. Audit auditors should
-flag any Solidity contract whose fund safety depends on an off-chain MPC
-implementation (vault contracts custodied by TSS, restaking validator
-sets, multi-party-computed governance) and note that the cryptographic
-protocol correctness is part of the trust surface even if out of audit
-scope.
+3. [`prompts/solidity_audit_json_prompt.txt` — Threshold Signature / MPC
+   Custody directive](../../prompts/solidity_audit_json_prompt.txt) — added
+   as commit `0308d38`. Forces audits to call out bond/TVL economic
+   security, TSS library identification & version, single-malicious-party
+   resilience, key-rotation policy, and no-recall on cryptographic failure
+   whenever a contract's fund safety leans on off-chain threshold signing.
+   Verified to trigger on a real TSS-using Solidity contract (THORChain
+   Router audit run 2026-05-16, F-05 cites CVE-2023-33241 + tss-lib v0.1.6
+   + bond/TVL ratio explicitly).
