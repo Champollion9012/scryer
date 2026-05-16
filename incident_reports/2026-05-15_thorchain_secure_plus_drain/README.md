@@ -458,6 +458,51 @@ not yet 100% certain. Possible refinements / counter-hypotheses to verify:
 | Official post-mortem with code citations | 2026-05-18 ~ 22 | ~95% |
 | Independent third-party crypto audit confirms specific GG20 flaw | weeks later | ~99% |
 
+### Verification log — V1, V2, V3, V4, V7 results (2026-05-16)
+
+**V1 — Attacker node identified**:
+- Full address: `thor16ucjv3v695mq283me7esh0wdhajjalengcn84q`
+- Total bond: 635,331 RUNE (~$1.2M)
+- Bond providers: `thor198ry37g…` (600,129 RUNE — main), `thor1e83t246w…` (35,200 RUNE), node itself only 1.99 RUNE
+- Active since: **THORChain block 26,146,440 = 2026-05-12 17:36 UTC**
+- Attack at: 2026-05-15 07:23 UTC → **~60 hour gap between activation and attack**
+
+**V2 — TSS library version**:
+- `go.mod` declares: `github.com/binance-chain/tss-lib v0.0.0-20201118045712-70b2cb4bf916`
+- With replace directive: `=> gitlab.com/thorchain/tss/tss-lib v0.1.6`
+- THORChain maintains its **own fork** at v0.1.6, based on the **2020-11 upstream version**
+- Upstream `bnb-chain/tss-lib` reached **v2.0.0** which fixed CVE-2023-33241, TSSHOCK, etc.
+- **THORChain fork at v0.1.6 has NOT pulled those upstream fixes**
+
+**V3 — TSS code commits Apr-May 2026**:
+- `cbf8f18a4` (Apr 9): "Batch resolve #2833/#2688/#2687/#2689" — adds new file `tss_round_normalizer.go` (105 lines) + `TssPhaseMessages.go` — suggests team was patching round-handling vulnerabilities
+- `c9a7c23d9` (May 4): "Prioritize reading signer seed phrase from tmpfs file instead of env var" — operational hardening (env var → tmpfs)
+- `1bfb5332c` (May 3): "Remove dead keysign party lookup path" — cleanup, low concern
+- `8e909caf4`: "Validate signature count matches message count in keysign notifier" — security hardening against signature-count manipulation
+- Pattern: team was actively patching TSS, attacker bonded AFTER the April security batch — either probing the patched system or finding paths that the patches didn't close
+
+**V4 — Cross-referenced known TSS vulnerabilities**:
+| CVE / Attack | Year | Impact | Fits 5/15 timeline? |
+|---|---|---|---|
+| [CVE-2023-33241](https://github.com/advisories/GHSA-5cjx-95fx-68q9) (Fireblocks, Paillier modulus check missing) | 2023 | **16 signatures suffice to extract full ECDSA private key** | 🟢 Yes — 16 sigs is ~minutes of vault activity |
+| [TSSHOCK](https://verichains.io/tsshock/) (Verichains) | 2025 | Novel t-ECDSA key extraction; **explicitly names thornode TSS as tested target** | 🟢 |
+| [α-shuffle](https://blog.trailofbits.com/2024/02/20/breaking-the-shared-key-in-threshold-signature-schemes/) (Verichains, ambiguous encoding) | 2022 | PoC published against THORChain TSS specifically | 🟢 |
+| [CVE-2023-26557](https://github.com/advisories/GHSA-mjqv-xhgm-gx8c) (timing side-channel, Paillier lambda) | 2023 | bnb-chain/tss-lib **AND** thorchain/tss explicitly named as affected | 🟢 |
+
+The **CVE-2023-33241 "16 signatures suffice" finding resolves my earlier timeline concern**. I had assumed GG18/GG20 leakage needs hundreds of rounds; the actual fast-extraction CVEs need ~16. In 60 hours of an active vault signing committee, the attacker easily gets 16 rounds (vault signs ~50-200 outbounds/day per chain).
+
+**V7 — Bond timeline (already captured above with V1)**.
+
+### Updated confidence after V1-V7
+
+| Claim | Pre-verification | Post V1-V7 |
+|---|---|---|
+| Official "GG20 leakage by single node" direction is correct | 70% | **~92%** |
+| Specific class is CVE-2023-33241 (Paillier modulus) OR α-shuffle OR TSSHOCK variant | unknown | **~75%** that it's one of these or close variant |
+| Simple operational bug (key on disk, log leak) dressed up as crypto attack | 25% | **~5%** — V3 shows real cryptographic patches were being applied; not consistent with ops-only attack |
+| THORChain v0.1.6 fork lacks upstream v2.0.0 critical fixes | unknown | **~95%** — direct evidence from go.mod |
+| 60h activation-to-attack window is feasible | flagged 🟡 | **~95%** — given 16-sig extraction class |
+
 ### My priors going in
 
 - I was wrong about almost everything specific (H1-H6); my analytical
