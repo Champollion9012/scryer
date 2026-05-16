@@ -597,14 +597,19 @@ delegation** hypothesis is REFUTED.
 **Economic consequence**: if Mimir / SamYap fully slashes the 635k
 RUNE bond, the slash falls on the same attacker entity — there are no
 innocent third-party RUNE depositors to indemnify. Attacker effective
-P/L:
+P/L (RUNE/USD priced at 2026-05-09 ~ 5/10 highs of ~$0.62, the realistic
+attacker acquisition window since they had to be bonded by 5/12):
 
 | Item | Amount |
 |---|---|
 | Gross extraction (multi-chain) | ~$10.8M (team estimate) |
-| Bond at risk (self-slashed) | ~$1.2M (635k RUNE × ~$2/RUNE) |
-| Gas + laundering friction | ~$0.05M (estimate) |
-| **Net** | **≈ $9.5M** (≈ 8x ROI) |
+| Bond at risk (self-slashed) | **~$0.40M** (635k RUNE × ~$0.62/RUNE at pre-attack peak) |
+| Gas + laundering friction (5 chains × ~150 outbound iterations + bridges/swaps) | ~$0.10M (estimate) |
+| Infrastructure (cloud nodes, bandwidth, ~2-month prep) | ~$0.002M (rounding to zero) |
+| **Net** | **≈ $10.3M** (**~26× return on at-risk capital**) |
+
+(Earlier draft used a $2/RUNE assumption that over-stated the bond cost
+by ~3×; corrected here to the actual pre-attack market price.)
 
 This is consistent with a calculated, well-funded operation: the team
 that did this was willing to risk ~$1.2M of capital to extract ~$9.5M
