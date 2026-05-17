@@ -1,13 +1,14 @@
 # TSS Attack PoCs — local reproductions of the 2026-05-15 bug class
 
-Three local-runnable Go test files that reproduce the cryptographic bug
-class behind the THORChain $10.8M drain:
+Four local-runnable Go test files / setups that reproduce the
+cryptographic bug class behind the THORChain $10.8M drain:
 
 | File | Attack class | Status |
 |---|---|---|
 | `equivocation_attack_test.go` | α-shuffle / TSSHOCK encoding-ambiguity → controlled nonce → ECDSA key recovery | Pedagogical (final ECDSA step is real, middle step is simulated effect) |
 | `paillier_modulus_attack_test.go` | **CVE-2023-33241 (Paillier modulus check missing) → full share recovery via CRT** | **Real cryptographic reproduction** — recovers a randomly generated 256-bit share byte-for-byte |
-| `verify_bypass_test.go` | **End-to-end binding to the actual vulnerable lib** | **Lifts the verify logic verbatim from gitlab.com/thorchain/tss/tss-lib v0.1.6** and proves the malicious Paillier modulus passes the *real* vulnerable check (both trial-division Part A and Goldwasser-style Part B) |
+| `verify_bypass_test.go` | **Verbatim Go transcription of the vulnerable lib's verify logic** | Reproduces `(*Proof).Verify` from `gitlab.com/thorchain/tss/tss-lib v0.1.6` (paillier.go:240-277) verbatim and shows the malicious N passes both Part A (trial division) and Part B (Goldwasser proof) |
+| `real_lib_run/attack_real_lib_test.go` | **Linked against the actual vulnerable lib code** (WSL/Linux only) | The real `(*Proof).Verify` from the cloned `tss-lib v0.1.6` returns `true` for the malicious N. Captured run output in `real_lib_run/run_output.txt`. Setup instructions in `real_lib_run/README.md`. |
 
 ## Run it
 

@@ -1,0 +1,15 @@
+=== RUN   TestMaliciousNAcceptedByRealLib
+[1] start
+[2] inputs built, N bits = 1024
+[3] testing ModInverse(N, PhiN)
+    M bits: 1020
+[4] calling paillier.GenerateXs(13)
+    xs len = 13
+[5] building proof manually
+    proof built
+[6] calling proof.Verify (REAL vulnerable lib code)
+[7] Verify returned: true
+[8] === ATTACK CONFIRMED AGAINST REAL LIB v0.1.6 ===
+--- PASS: TestMaliciousNAcceptedByRealLib (0.10s)
+PASS
+ok  	tss_real_lib_attack	0.127s
