@@ -467,12 +467,37 @@ not yet 100% certain. Possible refinements / counter-hypotheses to verify:
 - Active since: **THORChain block 26,146,440 = 2026-05-12 17:36 UTC**
 - Attack at: 2026-05-15 07:23 UTC → **~60 hour gap between activation and attack**
 
-**V2 — TSS library version**:
+**V2 — TSS library version + maintenance history (CORRECTED 2026-05-17)**:
 - `go.mod` declares: `github.com/binance-chain/tss-lib v0.0.0-20201118045712-70b2cb4bf916`
 - With replace directive: `=> gitlab.com/thorchain/tss/tss-lib v0.1.6`
-- THORChain maintains its **own fork** at v0.1.6, based on the **2020-11 upstream version**
+- THORChain maintains its **own fork** at v0.1.6, base-branched from upstream at 2020-07
 - Upstream `bnb-chain/tss-lib` reached **v2.0.0** which fixed CVE-2023-33241, TSSHOCK, etc.
-- **THORChain fork at v0.1.6 has NOT pulled those upstream fixes**
+- **THORChain fork did NOT pull upstream v2.0.0** — they cherry-picked / patched their own
+  fork tree instead.
+- Earlier framing in this report ("Thorchain never updated the lib") was over-stated.
+  Looking at the fork's git log against `crypto/`, the fork was **actively patched** in
+  response to Verichains disclosures:
+
+  | Date | Commit | Patched | Likely responding to |
+  |---|---|---|---|
+  | 2021-10-20 | `442019c` | `ecdsa/keygen/round_2.go` validation | General hardening |
+  | 2022-09-15 | `7036a3b` | `crypto/dlnp/proof.go` (+31 lines) | dlnp proof finding |
+  | 2022-09-15 | `2bb27f0` | `crypto/mta/proofs.go` + range_proof | MTA proof finding |
+  | 2023-08-17 | `680a6bf` | mta proofs / range_proof (+61 lines) | **TSSHOCK MTA finding** |
+  | 2023-08-17 | `0a91f19` | `crypto/zkp/pdl_w_slack_proof.go` (+17 lines) | **TSSHOCK PDL-with-slack finding** |
+
+- But `crypto/paillier/paillier.go` — the file containing the actual vulnerable
+  `verifyPrimesUntil = 1000` line — has **NOT been touched since 2020-07-07** (commit
+  `c56ccd1` "ecdsa/signing: type 7 abort almost done", an unrelated change).
+  The `verifyPrimesUntil` symbol itself was last touched in 2019-10-27 (just a refactor).
+  **In effect: 5+ years of frozen Paillier modulus verification code shipped to
+  production despite multiple subsequent CVEs/disclosures pointing exactly at it.**
+
+This rewrites the framing. The accurate story is not "the team ignored TSS security" —
+it is "**the team was actively maintaining the fork in response to disclosures, but the
+Paillier-modulus-check line specifically was never reviewed**". That is in some ways
+worse: a team that's paying attention enough to ship five other security patches but
+missing this one is an unforced error, not benign neglect.
 
 **V3 — TSS code commits Apr-May 2026**:
 - `cbf8f18a4` (Apr 9): "Batch resolve #2833/#2688/#2687/#2689" — adds new file `tss_round_normalizer.go` (105 lines) + `TssPhaseMessages.go` — suggests team was patching round-handling vulnerabilities
