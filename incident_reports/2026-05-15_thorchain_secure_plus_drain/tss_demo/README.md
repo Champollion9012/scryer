@@ -8,7 +8,7 @@ cryptographic bug class behind the THORChain $10.8M drain:
 | `equivocation_attack_test.go` | α-shuffle / TSSHOCK encoding-ambiguity → controlled nonce → ECDSA key recovery | Pedagogical (final ECDSA step is real, middle step is simulated effect) |
 | `paillier_modulus_attack_test.go` | **CVE-2023-33241 (Paillier modulus check missing) → full share recovery via CRT** | **Real cryptographic reproduction** — recovers a randomly generated 256-bit share byte-for-byte |
 | `verify_bypass_test.go` | **Verbatim Go transcription of the vulnerable lib's verify logic** | Reproduces `(*Proof).Verify` from `gitlab.com/thorchain/tss/tss-lib v0.1.6` (paillier.go:240-277) verbatim and shows the malicious N passes both Part A (trial division) and Part B (Goldwasser proof) |
-| `real_lib_run/attack_real_lib_test.go` | **Linked against the actual vulnerable lib code** (WSL/Linux only) | The real `(*Proof).Verify` from the cloned `tss-lib v0.1.6` returns `true` for the malicious N. Captured run output in `real_lib_run/run_output.txt`. Setup instructions in `real_lib_run/README.md`. |
+| `real_lib_run/attack_real_lib_test.go` | **Full end-to-end against the actual vulnerable lib** (WSL/Linux only) | Three tests using real `paillier.PublicKey.Encrypt` + `(*Proof).Verify` + `PrivateKey.Decrypt`: (1) 1024-bit `share mod 1009` leak in 0.08s; (2) **2048-bit production-scale** leak in 3.85s; (3) **full 256-bit ECDSA share recovered byte-for-byte via 26 sessions + CRT in 19.21s**. Captured outputs in `real_lib_run/run_output.txt`. |
 
 ## Run it
 

