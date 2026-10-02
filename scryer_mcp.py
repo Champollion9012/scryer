@@ -169,6 +169,27 @@ def _proxy_block(chain_id: int, meta_path: str | None, requested: bool) -> dict:
     return block
 
 
+def _register_from_disk(chain_id: int, address: str) -> str | None:
+    """Register a just-downloaded contract into the local registry, keyed by its
+    source hash. Grows scryer's corpus memory from use, so registry_clones finds
+    this contract and any future clones of the same code. Best-effort; never raises.
+    Returns the source_hash on success.
+    """
+    addr = address.lower()
+    srcs: dict[str, str] = {}
+    for f in sorted(SOURCES_DIR.glob(f"{chain_id}_{addr}_*.sol")):
+        try:
+            srcs[f.name] = f.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+    if not srcs:
+        return None
+    try:
+        return ContractRegistry().register_contract(chain_id, addr, srcs)
+    except Exception:
+        return None
+
+
 @mcp.tool()
 def download_contract(address: str, chain_id: int = 56, follow_proxy: bool = True) -> dict:
     """Fetch verified source for a contract (Sourcify -> Blockscout -> explorer -> IPFS metadata).
@@ -178,7 +199,8 @@ def download_contract(address: str, chain_id: int = 56, follow_proxy: bool = Tru
     their on-disk paths + a short preview of each + the source_hash. **Read the full
     source from the returned paths and analyze it yourself** - this server does not
     scan or audit. Feed the source_hash to registry_clones to find the same code
-    deployed elsewhere.
+    deployed elsewhere. Downloaded contracts (and any followed implementation) are
+    registered into the local registry, so registry_clones finds them and their clones.
 
     For a proxy, the top-level `files` are only the proxy shell - the `proxy` field
     reports the implementation address and its `implementation_files` (that's the
@@ -196,8 +218,13 @@ def download_contract(address: str, chain_id: int = 56, follow_proxy: bool = Tru
         out["found"] = bool(ok and out["file_count"] > 0)
         if not out["found"]:
             out["note"] = "No verified source from any provider - only runtime bytecode exists on-chain."
+        if out["found"]:
+            out["registered"] = _register_from_disk(chain_id, out["address"]) is not None
         if follow_proxy:
             out["proxy"] = _proxy_block(chain_id, out.get("meta_path"), follow_proxy)
+            impl = out["proxy"].get("implementation")
+            if impl and out["proxy"].get("implementation_source_fetched"):
+                out["proxy"]["implementation_registered"] = _register_from_disk(chain_id, impl) is not None
         return out
     except Exception as e:
         return _err(e)
