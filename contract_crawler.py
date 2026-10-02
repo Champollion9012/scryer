@@ -17,6 +17,7 @@ from pathlib import Path
 import httpx
 
 import scryer_http
+from scryer_http import RateLimited, rate_limit_reason, retry_after_seconds
 from contract_registry import ContractRegistry
 from scryer_logging import get_logger
 
@@ -105,6 +106,12 @@ async def fetch_sourcify_verified_contracts(
         try:
             resp = await client.get(url, timeout=30.0)
             if resp.status_code != 200:
+                reason = rate_limit_reason(resp)
+                if reason:
+                    # Throttled mid-pagination: the list is INCOMPLETE. Raise so the caller does
+                    # not treat a truncated list as the full set of verified contracts (which
+                    # would leave the un-paginated remainder permanently un-crawled).
+                    raise RateLimited(provider="sourcify", retry_after=retry_after_seconds(resp), detail=reason)
                 _log.warning("  Sourcify API error: %s", resp.status_code)
                 break
 
@@ -139,6 +146,8 @@ async def fetch_sourcify_verified_contracts(
             if page > 500 or len(addresses) >= 100000:
                 break
 
+        except RateLimited:
+            raise  # propagate so the chain is not marked fully listed off a truncated page
         except Exception as e:
             _log.warning("  Sourcify error: %s", e)
             break
@@ -159,6 +168,11 @@ async def fetch_sourcify_source(
     url = f"{SOURCIFY_API}/v2/contract/{chain_id}/{address}?fields=sources"
     try:
         resp = await client.get(url, timeout=30.0)
+        reason = rate_limit_reason(resp)
+        if reason:
+            # A throttle must not be swallowed as "not on Sourcify" — that would fall through
+            # to the explorer/decompile path and register a throttled contract as source-less.
+            raise RateLimited(provider="sourcify", retry_after=retry_after_seconds(resp), detail=reason)
         if resp.status_code == 200:
             data = resp.json()
             sources: dict[str, str] = {}
@@ -187,6 +201,8 @@ async def fetch_sourcify_source(
 
             if sources:
                 return sources, metadata
+    except RateLimited:
+        raise
     except Exception:
         # Silent fail, will try fallback
         pass
@@ -247,11 +263,24 @@ async def fetch_explorer_source(
 
     try:
         resp = await client.get(url, timeout=30.0)
+        reason = rate_limit_reason(resp)
+        if reason:
+            raise RateLimited(provider=f"etherscan:{chain.name}", retry_after=retry_after_seconds(resp), detail=reason)
         if resp.status_code != 200:
             return {}, None
 
         data = resp.json()
         if data.get("status") != "1":
+            # Etherscan V2 signals a throttle as HTTP 200 + status:"0" with "Max rate limit
+            # reached"/daily-limit in message/result — classify from those SHORT fields only
+            # (never SourceCode) so it is not mistaken for a genuinely-unverified contract.
+            result_field = data.get("result")
+            result_text = result_field if isinstance(result_field, str) else ""
+            body_reason = rate_limit_reason(resp, body_text=f"{data.get('message') or ''} {result_text}")
+            if body_reason:
+                raise RateLimited(
+                    provider=f"etherscan:{chain.name}", retry_after=retry_after_seconds(resp), detail=body_reason
+                )
             return {}, None
 
         result = data.get("result", [])
@@ -302,6 +331,8 @@ async def fetch_explorer_source(
 
         return sources, metadata
 
+    except RateLimited:
+        raise  # don't fold a throttle into "no source" (which triggers decompile+register)
     except Exception as e:
         _log.warning("    Explorer error for %s: %s", address, e)
         return {}, None
@@ -378,6 +409,7 @@ class ContractCrawler:
             "total_registered": 0,
             "duplicates_source_skipped": 0,
             "errors": 0,
+            "rate_limited": 0,
             "from_sourcify": 0,
             "from_explorer": 0,
         }
@@ -395,7 +427,14 @@ class ContractCrawler:
 
         # Step 1: Get verified contract addresses from Sourcify
         _log.info("Fetching verified contracts from Sourcify...")
-        addresses = await fetch_sourcify_verified_contracts(chain_id, client, self.rate_limiter, self.min_date)
+        try:
+            addresses = await fetch_sourcify_verified_contracts(chain_id, client, self.rate_limiter, self.min_date)
+        except RateLimited as e:
+            # Listing was throttled -> the set is incomplete. Skip this chain for THIS run (don't
+            # crawl a truncated list as if complete); a later run resumes. Not a poison, a deferral.
+            _log.warning("  Sourcify listing rate-limited for %s (%s); skipping chain this run, retry later", chain.name, e.reason)
+            self.stats["rate_limited"] = self.stats.get("rate_limited", 0) + 1
+            return 0
         _log.info("Found %d verified contracts on Sourcify", len(addresses))
 
         # Limit per chain
@@ -439,7 +478,12 @@ class ContractCrawler:
 
             if isinstance(result, BaseException):
                 async with self._lock:
-                    self.stats["errors"] += 1
+                    # A throttled fetch is skipped (never registered -> no poison), but counted
+                    # distinctly from a genuine error so the operator sees the chain is incomplete.
+                    if isinstance(result, RateLimited):
+                        self.stats["rate_limited"] = self.stats.get("rate_limited", 0) + 1
+                    else:
+                        self.stats["errors"] += 1
                 continue
 
             addr, sources, metadata, source_origin = result
@@ -522,6 +566,7 @@ class ContractCrawler:
         print(f"Total saved (unique): {self.stats['total_saved']}")
         print(f"Duplicates (source skipped): {self.stats['duplicates_source_skipped']}")
         print(f"Errors: {self.stats['errors']}")
+        print(f"Rate-limited (skipped, retry later): {self.stats.get('rate_limited', 0)}")
         print(f"\nRegistry stats: {self.registry.stats()}")
 
         return self.stats

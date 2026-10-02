@@ -19,6 +19,7 @@ import httpx
 
 import scryer_config
 import scryer_http
+from scryer_http import RateLimited, rate_limit_reason, rpc_rate_limit_reason, retry_after_seconds
 from contract_crawler import (
     CHAINS,
     AsyncRateLimiter,
@@ -183,6 +184,13 @@ class BlockScanner:
                 if resp.status_code == 429:
                     delay = base_delay * (2**attempt)
 
+                    if attempt == retries - 1:
+                        # Retries exhausted on a persistent 429 — raise REGARDLESS of the proxy
+                        # path (the socks branches below both `continue`, so this must come first)
+                        # so callers don't read the resulting None as "empty block" and record the
+                        # range as scanned, silently dropping the throttled blocks' contracts.
+                        raise RateLimited(provider=f"rpc:{url}", retry_after=retry_after_seconds(resp), detail="HTTP 429")
+
                     if socks_proxy:
                         if not using_proxy:
                             # We failed on direct connection
@@ -213,6 +221,9 @@ class BlockScanner:
                     continue
 
                 if resp.status_code != 200:
+                    reason = rate_limit_reason(resp)
+                    if reason:
+                        raise RateLimited(provider=f"rpc:{url}", retry_after=retry_after_seconds(resp), detail=reason)
                     msg = f"HTTP {resp.status_code}"
                     if using_proxy:
                         _log.error("  ❌ Proxy request failed: %s", msg)
@@ -223,6 +234,11 @@ class BlockScanner:
                 data = resp.json()
                 if "error" in data:
                     err_msg = data["error"].get("message")
+                    rl = rpc_rate_limit_reason(data["error"])
+                    if rl:
+                        # A JSON-RPC rate-limit error body (e.g. Alchemy -32005 "capacity") must
+                        # not be swallowed to None and read as an empty result.
+                        raise RateLimited(provider=f"rpc:{url}", detail=rl)
                     if using_proxy:
                         _log.error("  ❌ Proxy request returned RPC error: %s", err_msg)
                     else:
@@ -345,6 +361,11 @@ class BlockScanner:
                         progress_callback(blocks_processed, total_blocks, contracts_found)
 
                     return contracts
+                except RateLimited:
+                    # Do NOT swallow a throttle as an empty block — that would count the block
+                    # processed and let discover_chain record the range as fully scanned, so the
+                    # blocks' contracts are never discovered. Propagate to abort/retry the range.
+                    raise
                 except Exception:
                     # Error is already logged in _make_request usually, but catch top level here
                     # print(f"  Error scanning block {block_num}: {e}")
@@ -378,7 +399,18 @@ class BlockScanner:
             timeout=30.0,
         )
 
-        result = resp.json().get("result", "0x")
+        reason = rate_limit_reason(resp)
+        if reason:
+            # Don't let a throttle collapse to '0x'/'' (which reads as an EOA / no-code and
+            # drives decompile+register of a throttled contract).
+            raise RateLimited(provider=f"rpc:{self.get_rpc_url()}", retry_after=retry_after_seconds(resp), detail=reason)
+        body = resp.json()
+        err = body.get("error")
+        if err is not None:
+            rl = rpc_rate_limit_reason(err)
+            if rl:
+                raise RateLimited(provider="rpc", detail=rl)
+        result = body.get("result", "0x")
         return result if result != "0x" else ""
 
     async def close(self):
@@ -421,6 +453,7 @@ class ContractDiscovery:
             "decompiled": 0,
             "already_crawled": 0,
             "errors": 0,
+            "rate_limited": 0,
         }
 
     async def discover_chain(
@@ -501,16 +534,27 @@ class ContractDiscovery:
             _log.info("Scanning blocks %s to %s...", f"{range_from:,}", f"{range_to:,}")
 
             # Start producer (scanner)
-            contracts = await scanner.scan_blocks(
-                range_from,
-                range_to,
-                client,
-                progress,
-                self.concurrency,
-                queue if not dry_run else None,
-                stop_event,
-                limit,
-            )
+            try:
+                contracts = await scanner.scan_blocks(
+                    range_from,
+                    range_to,
+                    client,
+                    progress,
+                    self.concurrency,
+                    queue if not dry_run else None,
+                    stop_event,
+                    limit,
+                )
+            except RateLimited as e:
+                # Throttled mid-range -> the range is INCOMPLETE. Do NOT record it as scanned
+                # (that would permanently drop the un-scanned blocks' contracts); stop this run's
+                # scanning and leave the range for a later run.
+                _log.warning(
+                    "  RPC rate-limited scanning %s-%s (%s); leaving range unscanned for a later run",
+                    f"{range_from:,}", f"{range_to:,}", e.reason,
+                )
+                self.stats["rate_limited"] += 1
+                break
             if _is_tty:
                 print(file=sys.stderr)  # newline after carriage-return progress
             all_contracts.extend(contracts)
@@ -606,37 +650,48 @@ class ContractDiscovery:
     ) -> bool:
         """Process a single contract: try Sourcify -> Explorer -> Decompile."""
 
-        # Try Sourcify first
-        sources, metadata = await fetch_sourcify_source(rpc_config.chain_id, address, client, self.api_rate_limiter)
-        source_origin = "sourcify"
+        # Fetch source (Sourcify -> Explorer -> decompile bytecode). A provider/RPC THROTTLE in
+        # this sequence must NOT be registered as a source-less/decompiled contract: that poisons
+        # registry_clones/registry_vulnerable with a false "no source" entry that is never
+        # re-fetched. On a throttle, skip this address (don't register) so a later run retries it.
+        try:
+            # Try Sourcify first
+            sources, metadata = await fetch_sourcify_source(rpc_config.chain_id, address, client, self.api_rate_limiter)
+            source_origin = "sourcify"
 
-        # Fallback to Explorer
-        if not sources and chain.explorer_api:
-            sources, metadata = await fetch_explorer_source(chain, address, client, self.api_rate_limiter)
-            source_origin = "explorer"
+            # Fallback to Explorer
+            if not sources and chain.explorer_api:
+                sources, metadata = await fetch_explorer_source(chain, address, client, self.api_rate_limiter)
+                source_origin = "explorer"
 
-        # Fallback to decompilation
-        if not sources:
-            bytecode = await scanner.get_bytecode(address, client)
-            if bytecode:
-                # Try to decompile
-                # Run in thread to avoid blocking event loop with subprocess
-                decompiled = await asyncio.to_thread(decompile_bytecode, bytecode)
-                if decompiled:
-                    sources = {"Contract_DECOMPILED.sol": decompiled}
-                    metadata = {
-                        "decompiled": True,
-                        "ContractName": "Decompiled",
-                    }
+            # Fallback to decompilation
+            if not sources:
+                bytecode = await scanner.get_bytecode(address, client)
+                if bytecode:
+                    # Try to decompile
+                    # Run in thread to avoid blocking event loop with subprocess
+                    decompiled = await asyncio.to_thread(decompile_bytecode, bytecode)
+                    if decompiled:
+                        sources = {"Contract_DECOMPILED.sol": decompiled}
+                        metadata = {
+                            "decompiled": True,
+                            "ContractName": "Decompiled",
+                        }
+                    else:
+                        # Save raw bytecode if decompilation fails
+                        sources = {"bytecode.txt": bytecode}
+                        metadata = {"needs_decompilation": True}
+                    source_origin = "decompiled"
+                    self.stats["decompiled"] += 1
                 else:
-                    # Save raw bytecode if decompilation fails
-                    sources = {"bytecode.txt": bytecode}
-                    metadata = {"needs_decompilation": True}
-                source_origin = "decompiled"
-                self.stats["decompiled"] += 1
-            else:
-                self.stats["errors"] += 1
-                return False
+                    self.stats["errors"] += 1
+                    return False
+        except RateLimited as e:
+            _log.warning(
+                "  Skipping %s — rate-limited (%s); NOT registering, will retry on a later run", address, e.reason
+            )
+            self.stats["rate_limited"] += 1
+            return False
 
         # Update stats
         if source_origin == "sourcify":
