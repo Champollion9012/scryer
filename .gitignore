@@ -46,3 +46,4 @@ lib/
 *.swp
 .DS_Store
 Thumbs.db
+.claude/scheduled_tasks.lock
