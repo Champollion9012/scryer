@@ -91,14 +91,30 @@ _TOKENS: dict[int, list[tuple[str, str, int, bool]]] = {
 
 def _w3(chain_id: int) -> tuple[Web3, str]:
     url = scryer_config.get_rpc_url(chain_id)
-    w3 = Web3(Web3.HTTPProvider(url))
+    if url:
+        provider = Web3.HTTPProvider(url)
+        label = url
+    else:
+        # No native RPC configured for this (niche) chain -> fall back to Etherscan V2's proxy
+        # module as an RPC backend: ONE key covers 70+ chains, so get_state/call_view/
+        # read_storage/token_exposure work even on chains scryer has no public node for.
+        key = scryer_config.get("ETHERSCAN_API_KEY")
+        if not key:
+            raise RuntimeError(
+                f"no RPC configured for chain {chain_id} and no ETHERSCAN_API_KEY for the Etherscan-proxy fallback"
+            )
+        from etherscan_proxy_provider import EtherscanProxyProvider
+
+        provider = EtherscanProxyProvider(chain_id, key)
+        label = f"etherscan-v2-proxy:{chain_id}"
+    w3 = Web3(provider)
     # Many supported chains are POA (BSC, Polygon, several L2s): their long extraData field
     # trips web3's default block validation, which breaks get_block (needed for timestamps).
     try:
         w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
     except Exception:
         pass
-    return w3, url
+    return w3, label
 
 
 def _parse_block(block) -> tuple[object, str | None]:

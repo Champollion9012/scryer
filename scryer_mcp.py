@@ -152,20 +152,31 @@ def health() -> dict:
 
     Call first when planning. Every chain-taking tool accepts `chain` (an alias from the
     chains list) or `chain_id` (int), plus `block` (number/tag; historical needs an archive
-    RPC). Analysis is the agent's job.
+    RPC). The `chains` list is the chains with a native RPC, BUT the live-state tools also
+    reach any other Etherscan-V2 chain via a proxy fallback (see `state_rpc_fallback`).
+    Analysis is the agent's job.
     """
     try:
         reg = ContractRegistry().stats()
     except Exception:
         reg = None
+    has_key = bool(os.getenv("ETHERSCAN_API_KEY"))
     return {
         "repo": str(REPO),
         "python": sys.version.split()[0],
         "role": "data/retrieval layer - analysis is performed by the connecting agent",
-        "etherscan_v2_key": bool(os.getenv("ETHERSCAN_API_KEY")),  # one V2 key covers all chains
+        "etherscan_v2_key": has_key,  # one V2 key covers all chains
         "solc": bool(which("solc")),
         "registry": reg,
         "chains": _supported_chains(),
+        "state_rpc_fallback": (
+            "get_state/call_view/read_storage/token_exposure also work on ANY Etherscan-V2-supported "
+            "chain (70+) with no native RPC in `chains` — pass its chain_id and reads fall back to the "
+            "Etherscan V2 proxy module (eth_getCode/eth_call/eth_getStorageAt), paced to the key's "
+            "per-sec limit (a multi-getter read takes a few seconds; tune via SCRYER_ETHERSCAN_MIN_INTERVAL)."
+            if has_key
+            else "set ETHERSCAN_API_KEY to query state on chains without a native RPC (proxy fallback)"
+        ),
     }
 
 
