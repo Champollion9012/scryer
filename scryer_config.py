@@ -28,6 +28,7 @@ New::
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from threading import Lock
 
@@ -149,6 +150,80 @@ def get_list(key: str, separator: str = ",") -> list[str]:
     if not raw:
         return []
     return [item.strip() for item in raw.split(separator) if item.strip()]
+
+
+# --------------------------------------------------------------------------- #
+# Per-chain RPC resolution (single source of truth)
+# --------------------------------------------------------------------------- #
+# The codebase used to carry two RPC conventions: download_contract/data_sources
+# read ``RPC_URL`` (single-chain), while rpc_contract_discovery read the
+# documented per-chain ``<CHAIN>_URL`` names. These helpers unify both so that
+# setting ``BSC_URL`` / ``POLYGON_URL`` / ``ETH_URL`` / … works everywhere.
+#
+# Resolution order per chain: the per-chain env names (``<CHAIN>_URL`` first,
+# then legacy ``*_RPC_URL`` aliases) -> generic ``RPC_URL`` (back-compat) ->
+# a public endpoint. Each env value may be a comma- OR whitespace/newline-
+# separated list of URLs; first entry is the primary.
+_RPC_ENV_NAMES: dict[int, list[str]] = {
+    1: ["ETH_URL", "ETH_RPC_URL"],
+    10: ["OPTIMISM_URL", "OP_URL", "OPTIMISM_RPC_URL"],
+    56: ["BSC_URL", "BSC_RPC_URL"],
+    137: ["POLYGON_URL", "POLYGON_RPC_URL"],
+    250: ["FANTOM_URL", "FTM_URL", "FANTOM_RPC_URL"],
+    8453: ["BASE_URL", "BASE_RPC_URL"],
+    42161: ["ARB_URL", "ARBITRUM_RPC_URL", "ARB_RPC_URL"],
+    43114: ["AVALANCHE_URL", "AVAX_URL", "AVALANCHE_RPC_URL"],
+}
+
+_PUBLIC_RPC: dict[int, str] = {
+    1: "https://ethereum-rpc.publicnode.com",
+    10: "https://mainnet.optimism.io",
+    56: "https://bsc-dataseed.binance.org",
+    137: "https://polygon-rpc.com",
+    250: "https://rpc.ftm.tools",
+    8453: "https://mainnet.base.org",
+    42161: "https://arb1.arbitrum.io/rpc",
+    43114: "https://api.avax.network/ext/bc/C/rpc",
+}
+
+_RPC_SPLIT = re.compile(r"[,\s]+")
+
+
+def _split_urls(raw: str | None) -> list[str]:
+    """Split a comma/whitespace/newline-separated env value into http(s) URLs."""
+    if not raw:
+        return []
+    return [u.strip() for u in _RPC_SPLIT.split(raw.strip()) if u.strip().startswith(("http://", "https://"))]
+
+
+def rpc_env_names(chain_id: int) -> list[str]:
+    """The per-chain RPC env var names honored for ``chain_id`` (documented first)."""
+    return list(_RPC_ENV_NAMES.get(chain_id, []))
+
+
+def get_rpc_urls(chain_id: int) -> list[str]:
+    """Ordered, de-duplicated RPC URLs for ``chain_id`` (see resolution order above).
+
+    Always returns at least the public endpoint for a known chain, so callers get
+    a working URL even with no env configured.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for name in [*_RPC_ENV_NAMES.get(chain_id, []), "RPC_URL"]:
+        for u in _split_urls(get(name)):
+            if u not in seen:
+                seen.add(u)
+                out.append(u)
+    pub = _PUBLIC_RPC.get(chain_id)
+    if pub and pub not in seen:
+        out.append(pub)
+    return out
+
+
+def get_rpc_url(chain_id: int) -> str:
+    """Primary RPC URL for ``chain_id`` (first of :func:`get_rpc_urls`), or ``""``."""
+    urls = get_rpc_urls(chain_id)
+    return urls[0] if urls else ""
 
 
 # Auto-load on import so legacy modules continue to work without explicit

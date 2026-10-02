@@ -46,7 +46,11 @@ from scryer_logging import get_logger
 
 _log = get_logger(__name__)
 
-VerifyVerdict = Literal["full_match", "partial_match", "mismatch", "no_solc", "no_bytecode"]
+# "mismatch" means we compiled AND compared and the deployed code differs from the
+# source — a genuine red flag. "indeterminate" means we could not complete a
+# comparison (missing compile target, no sources, compile error) — NOT a trust
+# failure, so callers must not treat it like a mismatch.
+VerifyVerdict = Literal["full_match", "partial_match", "mismatch", "indeterminate", "no_solc", "no_bytecode"]
 
 
 @dataclass
@@ -549,11 +553,14 @@ def _verify_contract_uncached(
     target_map = settings.get("compilationTarget") or {}
     if not target_map:
         return VerifyResult(
-            verdict="mismatch",
+            verdict="indeterminate",
             chain_id=chain_id,
             address=address_lower,
             compiler_version=compiler_version,
-            notes=["metadata.settings.compilationTarget missing — can't pick contract to compile"],
+            notes=[
+                "metadata.settings.compilationTarget missing (legacy single-file/flattened export) "
+                "— cannot pick a contract to compile, so verification was skipped. This is NOT a mismatch.",
+            ],
         )
     target_file, target_contract = next(iter(target_map.items()))
 
@@ -569,11 +576,11 @@ def _verify_contract_uncached(
         )
     if not sources:
         return VerifyResult(
-            verdict="mismatch",
+            verdict="indeterminate",
             chain_id=chain_id,
             address=address_lower,
             compiler_version=compiler_version,
-            notes=["no source files found (neither inline nor on disk)"],
+            notes=["no source files found (neither inline nor on disk) — verification skipped, not a mismatch"],
         )
 
     if solc_path is None:
@@ -604,11 +611,11 @@ def _verify_contract_uncached(
         immutable_ranges = artifact.immutable_ranges
     except Exception as e:
         return VerifyResult(
-            verdict="mismatch",
+            verdict="indeterminate",
             chain_id=chain_id,
             address=address_lower,
             compiler_version=compiler_version,
-            notes=[f"compile failed: {e}"],
+            notes=[f"compile failed: {e} — verification could not complete, not a mismatch"],
         )
 
     # Fetch on-chain

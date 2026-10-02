@@ -640,9 +640,18 @@ def fetch_contract_source(
     output_dir: str = "sources",
     layout: str = "flat",
     quiet: bool = False,
+    archive_rpc_url: str = "",
+    archive_tx_hash: str | None = None,
+    archive_block: int | None = None,
 ) -> bool:
     root_address = normalize_address(address)
     _log.info("開始抓取 chainId=%s, 地址=%s 的源碼...", chain_id, root_address)
+
+    # Honor the documented per-chain RPC env names (BSC_URL / POLYGON_URL / ETH_URL / …)
+    # when the caller left the default — one RPC convention shared with
+    # rpc_contract_discovery, and the correct chain's node instead of a single global.
+    if rpc_url == DEFAULT_RPC_URL:
+        rpc_url = scryer_config.get_rpc_url(chain_id) or rpc_url
 
     proxy_info = None
     targets = [root_address]
@@ -700,7 +709,14 @@ def fetch_contract_source(
 
         # 步驟 3: Bytecode metadata
         _log.info("Blockscout 無，嘗試從 bytecode 解析...")
-        sources, metadata, msg = extract_from_bytecode_metadata(chain_id, target, rpc_url=rpc_url)
+        try:
+            sources, metadata, msg = extract_from_bytecode_metadata(chain_id, target, rpc_url=rpc_url)
+        except Exception as e:
+            # A dead/unreachable RPC must not crash the whole fetch — degrade to
+            # "no source via this method" so the caller gets a clean found:false
+            # (e.g. an EOA, or a transient RPC outage) instead of a raw exception.
+            _log.warning("bytecode-metadata 解析失敗 (RPC 問題?): %s", e)
+            sources, metadata, msg = None, None, f"bytecode-metadata RPC failed: {e}"
         if sources:
             _log.info("✅ %s", msg)
             if not quiet:

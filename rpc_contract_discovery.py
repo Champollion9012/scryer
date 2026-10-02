@@ -50,48 +50,40 @@ class RPCConfig:
 
 
 def get_rpc_configs() -> list[RPCConfig]:
-    """Get RPC configurations from environment."""
-    configs = []
+    """Get RPC configurations from environment.
 
-    import re
-
-    # BSC
-    bsc_env = os.getenv("BSC_URL") or os.getenv("RPC_URL", "https://bsc-dataseed.binance.org")
-    bsc_urls = [url.strip() for url in re.split(r"[,\s]+", bsc_env) if url.strip()]
-
-    configs.append(
+    URL resolution is delegated to ``scryer_config.get_rpc_urls`` (the single
+    cross-module RPC convention). BSC is always present with its public-RPC
+    fallback; Polygon / Arbitrum are included only when the operator has
+    explicitly configured a URL for them (preserving historical behavior).
+    """
+    configs = [
         RPCConfig(
             chain_id=56,
             name="bsc",
-            rpc_urls=bsc_urls,
+            rpc_urls=scryer_config.get_rpc_urls(56),
             block_time_seconds=3.0,
             blocks_per_day=28800,
         )
-    )
+    ]
 
-    # Polygon
-    polygon_env = os.getenv("POLYGON_URL")
-    if polygon_env:
-        polygon_urls = [url.strip() for url in polygon_env.split(",") if url.strip()]
+    if any(scryer_config.get(n) for n in scryer_config.rpc_env_names(137)):
         configs.append(
             RPCConfig(
                 chain_id=137,
                 name="polygon",
-                rpc_urls=polygon_urls,
+                rpc_urls=scryer_config.get_rpc_urls(137),
                 block_time_seconds=2.0,
                 blocks_per_day=43200,
             )
         )
 
-    # Arbitrum
-    arb_env = os.getenv("ARB_URL")
-    if arb_env:
-        arb_urls = [url.strip() for url in arb_env.split(",") if url.strip()]
+    if any(scryer_config.get(n) for n in scryer_config.rpc_env_names(42161)):
         configs.append(
             RPCConfig(
                 chain_id=42161,
                 name="arbitrum",
-                rpc_urls=arb_urls,
+                rpc_urls=scryer_config.get_rpc_urls(42161),
                 block_time_seconds=0.25,
                 blocks_per_day=345600,
             )
