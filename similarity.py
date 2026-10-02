@@ -249,7 +249,7 @@ def chunk_solidity_code(code: str, max_chars: int = 8000) -> list[str]:
 
     # Group functions into chunks
     chunks = []
-    current_chunk = []
+    current_chunk: list[str] = []
     current_len = 0
 
     for _func_name, func_code in functions:
@@ -600,7 +600,7 @@ def index_directory(
         existing_ids = index.get_all_ids()
         _log.info("  Found %d already indexed contracts", len(existing_ids))
 
-    batch: list[tuple[str, str, dict]] = []
+    batch: list[tuple[str, str, dict | None]] = []
     indexed = 0
     skipped = 0
 
