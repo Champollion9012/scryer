@@ -257,7 +257,6 @@ The bundled [`TxSimulation.t.sol`](tests/TxSimulation.t.sol) reproduces a real B
 ├── similarity.py               # GraphCodeBERT embedding + ChromaDB
 ├── similarity_cli.py           # Similarity search CLI
 ├── scanners.py                 # Regex + Slither vulnerability scanner
-├── report_renderer.py          # Markdown / HTML report generation
 ├── web.py                      # Flask web dashboard
 ├── cache.py                    # Generic on-disk cache helper
 │

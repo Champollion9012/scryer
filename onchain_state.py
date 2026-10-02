@@ -13,8 +13,13 @@ All functions are best-effort and never raise — they return an ``error`` key.
 
 from __future__ import annotations
 
+import re
+
 import httpx
+from eth_abi import decode as abi_decode
+from eth_abi import encode as abi_encode
 from web3 import Web3
+from web3.middleware import ExtraDataToPOAMiddleware
 
 import scryer_config
 
@@ -36,12 +41,26 @@ _BOOL = {"paused"}
 _UINT = {"decimals", "totalSupply"}
 _STR = {"name", "symbol"}
 
-_NATIVE = {1: "ETH", 10: "ETH", 56: "BNB", 137: "MATIC", 250: "FTM", 8453: "ETH", 42161: "ETH", 43114: "AVAX"}
+_NATIVE = {
+    1: "ETH", 10: "ETH", 56: "BNB", 137: "MATIC", 250: "FTM", 8453: "ETH", 42161: "ETH", 43114: "AVAX",
+    59144: "ETH", 534352: "ETH", 81457: "ETH", 5000: "MNT", 100: "xDAI", 324: "ETH", 1101: "ETH",
+    204: "BNB", 42220: "CELO", 25: "CRO", 1284: "GLMR", 1088: "METIS",
+}
 
 # DeFiLlama (free, no API key) price API: per-chain prefix for tokens, and the
 # coingecko id used to price each chain's native coin.
-_DL_CHAIN = {1: "ethereum", 10: "optimism", 56: "bsc", 137: "polygon", 250: "fantom", 8453: "base", 42161: "arbitrum", 43114: "avax"}
-_DL_NATIVE_CGID = {1: "ethereum", 10: "ethereum", 42161: "ethereum", 8453: "ethereum", 56: "binancecoin", 137: "matic-network", 250: "fantom", 43114: "avalanche-2"}
+_DL_CHAIN = {
+    1: "ethereum", 10: "optimism", 56: "bsc", 137: "polygon", 250: "fantom", 8453: "base",
+    42161: "arbitrum", 43114: "avax", 59144: "linea", 534352: "scroll", 81457: "blast", 5000: "mantle",
+    100: "xdai", 324: "era", 1101: "polygon_zkevm", 204: "op_bnb", 42220: "celo", 25: "cronos",
+    1284: "moonbeam", 1088: "metis",
+}
+_DL_NATIVE_CGID = {
+    1: "ethereum", 10: "ethereum", 42161: "ethereum", 8453: "ethereum", 56: "binancecoin",
+    137: "matic-network", 250: "fantom", 43114: "avalanche-2", 59144: "ethereum", 534352: "ethereum",
+    81457: "ethereum", 324: "ethereum", 1101: "ethereum", 5000: "mantle", 100: "xdai",
+    204: "binancecoin", 42220: "celo", 25: "crypto-com-chain", 1284: "moonbeam", 1088: "metis-token",
+}
 
 # Major tokens per chain: (symbol, address, decimals, is_stable). Stablecoin
 # balances approximate USD at risk; non-stables are reported unpriced.
@@ -71,37 +90,89 @@ _TOKENS: dict[int, list[tuple[str, str, int, bool]]] = {
 
 def _w3(chain_id: int) -> tuple[Web3, str]:
     url = scryer_config.get_rpc_url(chain_id)
-    return Web3(Web3.HTTPProvider(url)), url
-
-
-def _call(w3: Web3, address: str, selector: str, suffix: str = "") -> bytes | None:
+    w3 = Web3(Web3.HTTPProvider(url))
+    # Many supported chains are POA (BSC, Polygon, several L2s): their long extraData field
+    # trips web3's default block validation, which breaks get_block (needed for timestamps).
     try:
-        raw = w3.eth.call({"to": Web3.to_checksum_address(address), "data": bytes.fromhex(selector + suffix)})
+        w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+    except Exception:
+        pass
+    return w3, url
+
+
+def _parse_block(block) -> tuple[object, str | None]:
+    """Normalize a block arg to a web3 block_identifier. Returns (block_id, error).
+
+    Accepts None/"latest" (default), an int block number, a decimal or 0x-hex string,
+    or a tag (latest/earliest/pending/safe/finalized). Historical blocks need an
+    archive RPC.
+    """
+    if block in (None, "", "latest"):
+        return "latest", None
+    if isinstance(block, int):
+        return block, None
+    s = str(block).strip().lower()
+    if s in ("latest", "earliest", "pending", "safe", "finalized"):
+        return s, None
+    try:
+        return (int(s, 16) if s.startswith("0x") else int(s)), None
+    except ValueError:
+        return None, f"invalid block: {block!r} (use a block number, 0x-hex, or a tag like 'latest')"
+
+
+def _call(w3: Web3, address: str, selector: str, suffix: str = "", block: object = "latest") -> bytes | None:
+    try:
+        raw = w3.eth.call(
+            {"to": Web3.to_checksum_address(address), "data": bytes.fromhex(selector + suffix)},
+            block_identifier=block,
+        )
         return bytes(raw)
     except Exception:
         return None
 
 
-def _as_addr(b: bytes) -> str | None:
-    if not b or len(b) < 20:
-        return None
-    a = b[-20:]
-    return "0x" + a.hex() if int.from_bytes(a, "big") else None
-
-
 def _as_str(b: bytes) -> str | None:
     try:
-        if len(b) >= 64:
+        if len(b) >= 64:  # ABI dynamic string: [offset][length][data]
             length = int.from_bytes(b[32:64], "big")
-            if 0 < length <= 256 and len(b) >= 64 + length:
+            if length == 0:
+                return None  # a valid empty string -> no value to report
+            if 0 < length <= 4096 and len(b) >= 64 + length:
                 return b[64 : 64 + length].decode("utf-8", "replace") or None
-        s = b.rstrip(b"\x00").decode("utf-8", "replace").strip()  # bytes32-style (old tokens)
-        return s or None
+            return None  # truncated/malformed dynamic string -> don't emit NUL garbage
+        if len(b) == 32:  # bytes32-style name/symbol (old tokens like MKR)
+            s = b.rstrip(b"\x00").decode("utf-8", "replace").strip()
+            return s or None
+        return None
     except Exception:
         return None
 
 
-def get_state(chain_id: int, address: str) -> dict:
+_PAIR_TOKEN0 = "0dfe1681"  # token0()
+_PAIR_TOKEN1 = "d21220a7"  # token1()
+_PAIR_RESERVES = "0902f1ac"  # getReserves()
+
+
+def _pair_state(w3: Web3, address: str, block: object = "latest") -> dict | None:
+    """UniswapV2-style pair state (token0/token1/reserves) — the most useful state for a
+    pair, which the generic ERC20 getters don't surface. None if it isn't a pair."""
+    t0 = _call(w3, address, _PAIR_TOKEN0, block=block)
+    t1 = _call(w3, address, _PAIR_TOKEN1, block=block)
+    res = _call(w3, address, _PAIR_RESERVES, block=block)
+    if not (t0 and t1 and res and len(res) >= 96):
+        return None
+    out: dict = {}
+    if len(t0) >= 20:
+        out["token0"] = "0x" + t0[-20:].hex()
+    if len(t1) >= 20:
+        out["token1"] = "0x" + t1[-20:].hex()
+    out["reserve0"] = int.from_bytes(res[0:32], "big")
+    out["reserve1"] = int.from_bytes(res[32:64], "big")
+    out["blockTimestampLast"] = int.from_bytes(res[64:96], "big")
+    return out
+
+
+def get_state(chain_id: int, address: str, block: object = "latest") -> dict:
     """Probe an unknown contract's live state: owner/admin/pause, proxy impl, ERC20 meta.
 
     Best-effort eth_call against common no-arg getters — only the ones that answer
@@ -109,21 +180,27 @@ def get_state(chain_id: int, address: str) -> dict:
     who's owner) rather than in theory.
     """
     w3, url = _w3(chain_id)
-    out: dict = {"chain_id": chain_id, "address": address.lower(), "rpc_url": url, "state": {}}
+    blk, berr = _parse_block(block)
+    if berr:
+        return {"chain_id": chain_id, "address": address.lower(), "error": berr}
+    out: dict = {"chain_id": chain_id, "address": address.lower(), "rpc_url": url, "block": blk, "state": {}}
     try:
-        out["has_code"] = len(w3.eth.get_code(Web3.to_checksum_address(address))) > 0
+        out["has_code"] = len(w3.eth.get_code(Web3.to_checksum_address(address), block_identifier=blk)) > 0
     except Exception as e:
-        return {**out, "error": f"rpc: {type(e).__name__}: {e}"}
+        return {**out, "error": f"rpc: {type(e).__name__}: {e} (historical reads need an archive RPC)"}
     if not out["has_code"]:
-        out["note"] = "no contract code at this address (EOA or self-destructed)"
+        out["note"] = "no contract code at this address at this block (EOA, not-yet-deployed, or self-destructed)"
         return out
     for name, sel in _VIEWS.items():
-        b = _call(w3, address, sel)
+        b = _call(w3, address, sel, block=blk)
         if not b:
             continue
         v: str | bool | int | None
         if name in _ADDR:
-            v = _as_addr(b)
+            # The call succeeded, so report the address even if it is 0x0 — a renounced
+            # owner()/admin() (== address(0)) is meaningful and must be distinguishable
+            # from a contract that has no such getter (where the call reverts -> b is None).
+            v = "0x" + b[-20:].hex() if len(b) >= 20 else None
         elif name in _BOOL:
             v = bool(int.from_bytes(b[-32:], "big"))
         elif name in _UINT:
@@ -134,49 +211,179 @@ def get_state(chain_id: int, address: str) -> dict:
             v = None
         if v is not None:
             out["state"][name] = v
+
+    pair = _pair_state(w3, address, block=blk)
+    if pair:
+        out["pair"] = pair
     return out
 
 
-def read_storage(chain_id: int, address: str, slot: int | str) -> dict:
-    """Read a raw storage slot (eth_getStorageAt) and decode it as uint/address.
+def _parse_slot(slot: int | str) -> int | None:
+    if isinstance(slot, int):
+        return slot
+    s = str(slot).strip()
+    try:
+        return int(s, 16) if s.lower().startswith("0x") else int(s)  # 0x-hex, else decimal
+    except ValueError:
+        try:
+            return int(s, 16)  # bare hex like 'ff'
+        except ValueError:
+            return None
 
-    For confirming the actual stored value behind getters, custom proxy slots,
-    packed flags, role mappings, etc. `slot` accepts an int or a hex string.
+
+_INT_TYPE_RE = re.compile(r"u?int(\d+)$")
+
+
+def _type_bits(t: str) -> int | None:
+    t = t.strip()
+    if t == "address":
+        return 160
+    if t == "bool":
+        return 8
+    m = _INT_TYPE_RE.match(t)
+    return int(m.group(1)) if m else None
+
+
+def _decode_packed(raw: bytes, decode_as: str):
+    """Unpack a 32-byte storage word into Solidity-packed fields (first field = LOW bits)."""
+    val = int.from_bytes(raw, "big")
+    out = []
+    for t in (p.strip() for p in decode_as.split(",")):
+        if not t:
+            continue
+        bits = _type_bits(t)
+        if bits is None:
+            return {"error": f"unsupported packed type: {t!r} (use uintN/intN/bool/address)"}
+        piece = val & ((1 << bits) - 1)
+        if t == "address":
+            out.append("0x" + format(piece, "040x"))
+        elif t == "bool":
+            out.append(bool(piece))
+        else:
+            out.append(piece)
+        val >>= bits
+    return out
+
+
+def read_storage(chain_id: int, address: str, slot: int | str, decode_as: str = "", block: object = "latest") -> dict:
+    """Read a raw storage slot (eth_getStorageAt) and decode it.
+
+    `slot` accepts an int, a decimal string, or a hex string (0x-prefixed or bare like
+    'ff'). `as_address` is reported ONLY when the upper 96 bits are zero (otherwise the
+    word is packed, not an address). Pass `decode_as` (e.g. 'uint112,uint112,uint32' for
+    a UniV2 reserves slot) to unpack a packed word into fields (first field = low bits).
+    `block` pins the read to a historical block (needs an archive RPC); default latest.
     """
     w3, url = _w3(chain_id)
-    try:
-        s = int(slot, 16) if isinstance(slot, str) and slot.startswith("0x") else int(slot)
-    except Exception:
+    s = _parse_slot(slot)
+    if s is None:
         return {"error": f"invalid slot: {slot!r}"}
+    blk, berr = _parse_block(block)
+    if berr:
+        return {"error": berr}
     try:
-        raw = bytes(w3.eth.get_storage_at(Web3.to_checksum_address(address), s))
+        raw = bytes(w3.eth.get_storage_at(Web3.to_checksum_address(address), s, block_identifier=blk))
     except Exception as e:
-        return {"error": f"rpc: {type(e).__name__}: {e}"}
-    return {
+        return {"error": f"rpc: {type(e).__name__}: {e} (historical reads need an archive RPC)"}
+    out: dict = {
         "chain_id": chain_id,
         "address": address.lower(),
         "slot": hex(s),
+        "block": blk,
         "raw": "0x" + raw.hex(),
         "as_uint": int.from_bytes(raw, "big"),
-        "as_address": _as_addr(raw),
     }
+    # Only a clean word whose upper 96 bits are zero (and lower 160 nonzero) is an address.
+    if len(raw) >= 32 and int.from_bytes(raw[:12], "big") == 0 and int.from_bytes(raw[12:], "big") != 0:
+        out["as_address"] = "0x" + raw[-20:].hex()
+    if decode_as:
+        out["decoded"] = _decode_packed(raw, decode_as)
+    return out
 
 
-def _defillama_prices(keys: list[str]) -> dict[str, float]:
+def _sig_input_types(signature: str) -> list[str]:
+    i, j = signature.find("("), signature.rfind(")")
+    if i < 0 or j < i:
+        raise ValueError(f"bad signature {signature!r} (expected e.g. 'getReserves()')")
+    inner = signature[i + 1 : j].strip()
+    return [t for t in (p.strip() for p in inner.split(",")) if t] if inner else []
+
+
+def _jsonable(v):
+    if isinstance(v, (list, tuple)):
+        return [_jsonable(x) for x in v]
+    if isinstance(v, (bytes, bytearray)):
+        return "0x" + bytes(v).hex()
+    return v
+
+
+def call_view(
+    chain_id: int, address: str, signature: str, args: list | None = None, returns: str = "", block: object = "latest"
+) -> dict:
+    """Call a view/pure function and (optionally) decode the return — no manual slot math.
+
+    signature: e.g. "token0()", "getReserves()", "balanceOf(address)".
+    args: argument values matching the signature's input types (ignored if none).
+    returns: comma-separated output types for decoding, e.g. "address" or
+             "uint112,uint112,uint32". Omit to get only the raw hex.
+    block: pin to a historical block (needs an archive RPC); default latest.
+    """
+    args = args or []
+    w3, url = _w3(chain_id)
+    blk, berr = _parse_block(block)
+    if berr:
+        return {"error": berr}
+    sig = signature.strip().replace(" ", "")
+    try:
+        in_types = _sig_input_types(sig)
+        selector = Web3.keccak(text=sig)[:4]
+        data = selector + (abi_encode(in_types, args) if in_types else b"")
+    except Exception as e:
+        return {"error": f"encode failed: {type(e).__name__}: {e}"}
+    try:
+        raw = bytes(
+            w3.eth.call({"to": Web3.to_checksum_address(address), "data": "0x" + data.hex()}, block_identifier=blk)
+        )
+    except Exception as e:
+        return {"error": f"eth_call failed/reverted: {type(e).__name__}: {e}"}
+    out: dict = {
+        "chain_id": chain_id,
+        "address": address.lower(),
+        "signature": sig,
+        "block": blk,
+        "raw": "0x" + raw.hex(),
+        "rpc_url": url,
+    }
+    out_types = [t for t in (p.strip() for p in returns.split(",")) if t] if returns else []
+    if out_types:
+        try:
+            out["decoded"] = _jsonable(abi_decode(out_types, raw))
+        except Exception as e:
+            out["decode_error"] = f"{type(e).__name__}: {e}"
+    return out
+
+
+def _defillama_prices(keys: list[str], timestamp: int | None = None) -> dict[str, float]:
     """Batch USD prices from DeFiLlama (free, no key). Keys like 'ethereum:0x..' or
-    'coingecko:ethereum'. Returns {key: price}; empty on any failure (best-effort)."""
+    'coingecko:ethereum'. With a unix `timestamp`, uses the historical endpoint so
+    prices match a pinned block. Returns {key: price}; empty on any failure."""
     keys = [k for k in keys if k]
     if not keys:
         return {}
     try:
-        r = httpx.get("https://coins.llama.fi/prices/current/" + ",".join(keys), timeout=15)
+        base = (
+            f"https://coins.llama.fi/prices/historical/{int(timestamp)}/"
+            if timestamp
+            else "https://coins.llama.fi/prices/current/"
+        )
+        r = httpx.get(base + ",".join(keys), timeout=15)
         coins = r.json().get("coins", {})
         return {k: v["price"] for k, v in coins.items() if isinstance(v, dict) and "price" in v}
     except Exception:
         return {}
 
 
-def token_exposure(chain_id: int, address: str) -> dict:
+def token_exposure(chain_id: int, address: str, block: object = "latest") -> dict:
     """How much value the contract holds right now, in USD — the $-at-risk input to severity.
 
     Reads native-coin balance + balanceOf for major tokens, then prices everything via
@@ -185,17 +392,20 @@ def token_exposure(chain_id: int, address: str) -> dict:
     Checks a fixed major-token list per chain, so total_usd is a FLOOR, not exhaustive TVL.
     """
     w3, url = _w3(chain_id)
-    out: dict = {"chain_id": chain_id, "address": address.lower(), "rpc_url": url}
+    blk, berr = _parse_block(block)
+    if berr:
+        return {"chain_id": chain_id, "address": address.lower(), "error": berr}
+    out: dict = {"chain_id": chain_id, "address": address.lower(), "rpc_url": url, "block": blk}
     checks = Web3.to_checksum_address(address)
     try:
-        native = w3.eth.get_balance(checks)
+        native = w3.eth.get_balance(checks, block_identifier=blk)
     except Exception as e:
-        return {**out, "error": f"rpc: {type(e).__name__}: {e}"}
+        return {**out, "error": f"rpc: {type(e).__name__}: {e} (historical reads need an archive RPC)"}
     native_amt = native / 1e18
     suffix = checks[2:].lower().rjust(64, "0")
     holdings: list[dict] = []
     for sym, taddr, dec, stable in _TOKENS.get(chain_id, []):
-        b = _call(w3, taddr, "70a08231", suffix)  # balanceOf(address)
+        b = _call(w3, taddr, "70a08231", suffix, block=blk)  # balanceOf(address)
         if not b:
             continue
         bal = int.from_bytes(b[-32:], "big")
@@ -203,12 +413,19 @@ def token_exposure(chain_id: int, address: str) -> dict:
             continue
         holdings.append({"symbol": sym, "amount": bal / (10**dec), "token": taddr.lower(), "stable": stable})
 
-    # Price native + every held token in one DeFiLlama batch.
+    # Price native + every held token. If a specific block was pinned, price it at that
+    # block's timestamp so balances AND prices are historical (correct $-at-risk for repro).
+    ts = None
+    if blk != "latest":
+        try:
+            ts = w3.eth.get_block(blk)["timestamp"]
+        except Exception:
+            ts = None
     dl_chain = _DL_CHAIN.get(chain_id)
     cgid = _DL_NATIVE_CGID.get(chain_id)
     native_key = f"coingecko:{cgid}" if cgid else ""
     token_keys = {h["token"]: f"{dl_chain}:{h['token']}" for h in holdings} if dl_chain else {}
-    prices = _defillama_prices([native_key, *token_keys.values()])
+    prices = _defillama_prices([native_key, *token_keys.values()], timestamp=ts)
 
     native_price = prices.get(native_key)
     native_usd = round(native_amt * native_price, 2) if native_price else None
@@ -223,6 +440,7 @@ def token_exposure(chain_id: int, address: str) -> dict:
     out["token_holdings"] = holdings
     out["total_usd"] = round(total, 2)
     out["price_source"] = "defillama"
+    out["price_block_timestamp"] = ts
     out["note"] = (
         "total_usd = native + priced tokens (DeFiLlama, best-effort; usd=null means no price). "
         "Fixed major-token list per chain, not the full token set - total_usd is a floor, not exhaustive TVL."
