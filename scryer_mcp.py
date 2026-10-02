@@ -273,7 +273,7 @@ def _register_from_disk(chain_id: int, address: str) -> str | None:
 
 
 @mcp.tool()
-def download_contract(address: str, chain: str = "", chain_id: int = 0, follow_proxy: bool = True) -> dict:
+def download_contract(address: str, chain: str = "", chain_id: int = 0, follow_proxy: bool = True, refresh: bool = False) -> dict:
     """Fetch verified source for a contract (Sourcify -> Blockscout -> explorer -> IPFS metadata).
 
     chain/chain_id: pass either (alias like "bsc" or the int; default BSC). Resolves
@@ -282,7 +282,9 @@ def download_contract(address: str, chain: str = "", chain_id: int = 0, follow_p
     paths + a short preview of each + the source_hash. **Read the full source from
     the returned paths and analyze it yourself.** Feed the source_hash to
     registry_clones to find the same code elsewhere; downloads auto-register into the
-    local corpus.
+    local corpus. An already-downloaded contract is served from the on-disk cache
+    instantly (verified source is immutable; look for `cached:true`); pass refresh=True
+    to force a re-fetch (e.g. an upgradeable proxy whose implementation may have changed).
 
     For a proxy, the top-level `files` are only the proxy shell - the `proxy` field
     reports the implementation address and its `implementation_files` (the real logic).
@@ -294,10 +296,22 @@ def download_contract(address: str, chain: str = "", chain_id: int = 0, follow_p
     """
     try:
         cid = _resolve_chain(chain, chain_id)
+        # On-disk cache: verified source is immutable, so if we already have it (files +
+        # meta) we skip the network fetch and return instantly. refresh=True forces a
+        # re-fetch (e.g. an upgradeable proxy whose implementation address may have changed).
+        if not refresh:
+            cached = _collect_download(cid, address)
+            if cached["file_count"] > 0 and cached["meta_path"]:
+                cached["found"] = True
+                cached["cached"] = True
+                if follow_proxy:
+                    cached["proxy"] = _proxy_block(cid, cached.get("meta_path"), follow_proxy)
+                return cached
         ok = dc.fetch_contract_source(
             cid, address, follow_proxy=follow_proxy, output_dir=str(SOURCES_DIR), layout="flat", quiet=True
         )
         out = _collect_download(cid, address)
+        out["cached"] = False
         out["found"] = bool(ok and out["file_count"] > 0)
         if out["found"]:
             out["registered"] = _register_from_disk(cid, out["address"]) is not None
