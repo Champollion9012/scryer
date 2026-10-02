@@ -238,7 +238,7 @@ class _TruncatingFakeProvider:
 
 def test_llm_chat_completion_concatenates_after_truncation() -> None:
     """One truncated turn + one continuation = stitched response."""
-    provider = _TruncatingFakeProvider(truncate_for=1, parts=['{"a":', '1}'])
+    provider = _TruncatingFakeProvider(truncate_for=1, parts=['{"a":', "1}"])
     raw, usage = ac.llm_chat_completion(
         provider,
         system_prompt="sys",
@@ -262,7 +262,7 @@ def test_llm_chat_completion_concatenates_after_truncation() -> None:
 
 def test_llm_chat_completion_caps_continue_attempts() -> None:
     """Provider keeps returning truncated; loop must stop at the configured cap."""
-    parts = ['{"a":', '1,', '"b":', "2}"]  # 3 trunc + 1 final = 4 parts
+    parts = ['{"a":', "1,", '"b":', "2}"]  # 3 trunc + 1 final = 4 parts
     provider = _TruncatingFakeProvider(truncate_for=3, parts=parts)
     raw, usage = ac.llm_chat_completion(
         provider,
@@ -284,7 +284,7 @@ def test_llm_chat_completion_caps_continue_attempts() -> None:
 
 def test_llm_chat_completion_skips_continue_when_disabled() -> None:
     """auto_continue_attempts=0 must NOT call continue_completion even if truncated."""
-    provider = _TruncatingFakeProvider(truncate_for=1, parts=['{"a":', '1}'])
+    provider = _TruncatingFakeProvider(truncate_for=1, parts=['{"a":', "1}"])
     raw, usage = ac.llm_chat_completion(
         provider,
         system_prompt="sys",
@@ -332,7 +332,7 @@ def test_strip_continuation_noise_preserves_late_fence_inside_string() -> None:
 def test_llm_chat_completion_strips_noise_from_continuation() -> None:
     """End-to-end: a continuation chunk wrapped in ```json should be cleaned
     before concatenation so the final string is parseable."""
-    parts = ['{"a":', '```json\n1}']  # Sonnet-style wrapped continuation
+    parts = ['{"a":', "```json\n1}"]  # Sonnet-style wrapped continuation
     provider = _TruncatingFakeProvider(truncate_for=1, parts=parts)
     raw, _ = ac.llm_chat_completion(
         provider,
@@ -600,9 +600,12 @@ def test_llm_chat_completion_bails_immediately_on_4xx() -> None:
     assert p.attempts == 1, "4xx should not retry"
 
 
-def test_llm_chat_completion_retries_on_5xx_until_max() -> None:
+def test_llm_chat_completion_retries_on_5xx_until_max(monkeypatch: pytest.MonkeyPatch) -> None:
     err = _make_status_error(503)
     p = _FailingProvider(err)
+    # The real backoff sleeps 1-3s per attempt; we only care about the attempt count.
+    slept: list[float] = []
+    monkeypatch.setattr(ac.time, "sleep", slept.append)
     with pytest.raises(RuntimeError, match="failed after"):
         ac.llm_chat_completion(
             p,
@@ -886,7 +889,9 @@ def _stub_verify(verdict: str, **extra):
 def test_source_verify_off_skips_verification(tmp_path: Path, fake_provider, monkeypatch) -> None:
     sources_root = _seed_sources(tmp_path)
     called = []
-    monkeypatch.setattr(ac, "verify_contract", lambda *a, **kw: called.append(1) or _stub_verify("full_match")(*a, **kw))
+    monkeypatch.setattr(
+        ac, "verify_contract", lambda *a, **kw: called.append(1) or _stub_verify("full_match")(*a, **kw)
+    )
 
     out_dir = _run_audit(tmp_path, sources_root, "--disable-regex-scan")
     run_dir = next(out_dir.glob("run_*"))
@@ -952,11 +957,11 @@ def test_source_verify_skipped_when_address_unknown(tmp_path: Path, fake_provide
     """Group keyed without chain_id+address (e.g. group_by=all) records skipped reason."""
     sources_root = _seed_sources(tmp_path)
     called = []
-    monkeypatch.setattr(ac, "verify_contract", lambda *a, **kw: called.append(1) or _stub_verify("full_match")(*a, **kw))
-
-    out_dir = _run_audit(
-        tmp_path, sources_root, "--disable-regex-scan", "--source-verify", "warn", "--group-by", "all"
+    monkeypatch.setattr(
+        ac, "verify_contract", lambda *a, **kw: called.append(1) or _stub_verify("full_match")(*a, **kw)
     )
+
+    out_dir = _run_audit(tmp_path, sources_root, "--disable-regex-scan", "--source-verify", "warn", "--group-by", "all")
     run_dir = next(out_dir.glob("run_*"))
     group = json.loads((run_dir / "manifest.json").read_text())["groups"][0]
     analysis = json.loads((run_dir / group["dir"] / "analysis.json").read_text())
@@ -973,9 +978,7 @@ def test_partial_match_injects_llm_hint(tmp_path: Path, fake_provider, monkeypat
     sources_root = _seed_sources(tmp_path)
     monkeypatch.setattr(ac, "verify_contract", _stub_verify("partial_match", notes=["trailer differs"]))
 
-    out_dir = _run_audit(
-        tmp_path, sources_root, "--disable-regex-scan", "--source-verify", "warn", "--no-verify-cache"
-    )
+    out_dir = _run_audit(tmp_path, sources_root, "--disable-regex-scan", "--source-verify", "warn", "--no-verify-cache")
     run_dir = next(out_dir.glob("run_*"))
     group = json.loads((run_dir / "manifest.json").read_text())["groups"][0]
 
@@ -994,9 +997,7 @@ def test_mismatch_warn_injects_stronger_hint(tmp_path: Path, fake_provider, monk
     sources_root = _seed_sources(tmp_path)
     monkeypatch.setattr(ac, "verify_contract", _stub_verify("mismatch", notes=["differs at index 4"]))
 
-    out_dir = _run_audit(
-        tmp_path, sources_root, "--disable-regex-scan", "--source-verify", "warn", "--no-verify-cache"
-    )
+    out_dir = _run_audit(tmp_path, sources_root, "--disable-regex-scan", "--source-verify", "warn", "--no-verify-cache")
     run_dir = next(out_dir.glob("run_*"))
     group = json.loads((run_dir / "manifest.json").read_text())["groups"][0]
     prompts_dir = run_dir / group["dir"] / "prompts"
@@ -1050,9 +1051,7 @@ def test_full_match_does_not_inject_hint(tmp_path: Path, fake_provider, monkeypa
     sources_root = _seed_sources(tmp_path)
     monkeypatch.setattr(ac, "verify_contract", _stub_verify("full_match"))
 
-    out_dir = _run_audit(
-        tmp_path, sources_root, "--disable-regex-scan", "--source-verify", "warn", "--no-verify-cache"
-    )
+    out_dir = _run_audit(tmp_path, sources_root, "--disable-regex-scan", "--source-verify", "warn", "--no-verify-cache")
     run_dir = next(out_dir.glob("run_*"))
     group = json.loads((run_dir / "manifest.json").read_text())["groups"][0]
     prompts_dir = run_dir / group["dir"] / "prompts"
@@ -1078,6 +1077,7 @@ def test_verify_cache_passed_when_enabled(tmp_path: Path, fake_provider, monkeyp
     _run_audit(tmp_path, sources_root, "--disable-regex-scan", "--source-verify", "warn")
 
     from verify_source import VerifyCache as _VC
+
     assert isinstance(captured["cache"], _VC), "default behaviour must pass a VerifyCache"
     # And the SQLite file must have been created at the default path
     assert (tmp_path / ".verify_cache.db").exists()
@@ -1089,9 +1089,7 @@ def test_no_verify_cache_flag_disables_persistence(tmp_path: Path, fake_provider
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(ac, "verify_contract", _stub_verify("partial_match"))
 
-    _run_audit(
-        tmp_path, sources_root, "--disable-regex-scan", "--source-verify", "warn", "--no-verify-cache"
-    )
+    _run_audit(tmp_path, sources_root, "--disable-regex-scan", "--source-verify", "warn", "--no-verify-cache")
     assert not (tmp_path / ".verify_cache.db").exists()
 
 

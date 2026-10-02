@@ -11,7 +11,7 @@ import random
 import re
 import threading
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from string import Template
 
@@ -298,7 +298,7 @@ def llm_chat_completion(
     max_retries: int,
     rate_limiter: RateLimiter | None = None,
     stream: bool = False,
-    on_chunk: callable | None = None,
+    on_chunk: Callable[[str], None] | None = None,
     auto_continue_attempts: int = 0,
 ) -> tuple[str, dict]:
     """Run a single chat completion with retries.
@@ -372,11 +372,7 @@ def llm_chat_completion(
             # prefilling on the assistant turn). We sum prompt/completion
             # tokens across attempts so cost accounting is accurate.
             continue_attempts = 0
-            while (
-                auto_continue_attempts > 0
-                and continue_attempts < auto_continue_attempts
-                and usage.get("truncated")
-            ):
+            while auto_continue_attempts > 0 and continue_attempts < auto_continue_attempts and usage.get("truncated"):
                 if rate_limiter:
                     rate_limiter.wait()
                 _log.warning(
@@ -398,8 +394,7 @@ def llm_chat_completion(
                 )
                 content += _strip_continuation_noise(cont)
                 usage = {
-                    "prompt_tokens": int(usage.get("prompt_tokens") or 0)
-                    + int(cont_usage.get("prompt_tokens") or 0),
+                    "prompt_tokens": int(usage.get("prompt_tokens") or 0) + int(cont_usage.get("prompt_tokens") or 0),
                     "completion_tokens": int(usage.get("completion_tokens") or 0)
                     + int(cont_usage.get("completion_tokens") or 0),
                     "truncated": bool(cont_usage.get("truncated")),
@@ -837,9 +832,7 @@ def main() -> int:
     groups_root = run_root / "groups"
 
     audit_cache: AuditCache | None = None if args.no_cache else AuditCache()
-    verify_cache: VerifyCache | None = (
-        None if args.no_verify_cache or args.source_verify == "off" else VerifyCache()
-    )
+    verify_cache: VerifyCache | None = None if args.no_verify_cache or args.source_verify == "off" else VerifyCache()
 
     if args.dry_run:
         for key, files in groups.items():
@@ -1140,15 +1133,15 @@ def main() -> int:
         report_obj: dict | None = None
 
         def record_call(call_name: str, *, prompt: str, response: str, usage: dict, duration_s: float) -> None:
-            prompt_tokens = (
-                usage.get("prompt_tokens")
-                if isinstance(usage.get("prompt_tokens"), int)
+            raw_prompt_tokens = usage.get("prompt_tokens")
+            prompt_tokens: int = (
+                raw_prompt_tokens
+                if isinstance(raw_prompt_tokens, int)
                 else estimate_tokens_rough(system_prompt + prompt)
             )
-            completion_tokens = (
-                usage.get("completion_tokens")
-                if isinstance(usage.get("completion_tokens"), int)
-                else estimate_tokens_rough(response)
+            raw_completion_tokens = usage.get("completion_tokens")
+            completion_tokens: int = (
+                raw_completion_tokens if isinstance(raw_completion_tokens, int) else estimate_tokens_rough(response)
             )
             cost_est = estimate_cost_usd(
                 int(prompt_tokens),
@@ -1360,9 +1353,7 @@ def main() -> int:
         if entry.get("_aborted"):
             # strict --source-verify mismatch: track separately so the user
             # can see what got skipped without it disappearing silently.
-            manifest["aborted_groups"].append(
-                {k: v for k, v in entry.items() if k != "_aborted"}
-            )
+            manifest["aborted_groups"].append({k: v for k, v in entry.items() if k != "_aborted"})
             manifest["totals"]["aborted_by_source_verify"] += 1
             continue
         manifest["groups"].append(entry)

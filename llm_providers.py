@@ -305,8 +305,8 @@ class ClaudeProvider(LLMProvider):
     ) -> tuple[str, dict]:
         del json_mode  # Anthropic has no JSON-mode toggle; param exists for interface parity
         url = f"{self.base_url}/messages"
-        headers = {
-            "x-api-key": self.api_key,
+        headers: dict[str, str] = {
+            "x-api-key": self.api_key or "",
             "anthropic-version": "2023-06-01",
             "Content-Type": "application/json",
         }
@@ -360,8 +360,8 @@ class ClaudeProvider(LLMProvider):
         """
         del json_mode  # not honoured for continuations (partial alone is invalid JSON)
         url = f"{self.base_url}/messages"
-        headers = {
-            "x-api-key": self.api_key,
+        headers: dict[str, str] = {
+            "x-api-key": self.api_key or "",
             "anthropic-version": "2023-06-01",
             "Content-Type": "application/json",
         }
@@ -411,8 +411,8 @@ class ClaudeProvider(LLMProvider):
     ) -> AsyncIterator[str]:
         del json_mode  # Anthropic has no JSON-mode toggle; param exists for interface parity
         url = f"{self.base_url}/messages"
-        headers = {
-            "x-api-key": self.api_key,
+        headers: dict[str, str] = {
+            "x-api-key": self.api_key or "",
             "anthropic-version": "2023-06-01",
             "Content-Type": "application/json",
         }
@@ -553,10 +553,14 @@ class GeminiProvider(LLMProvider):
                 {"role": "model", "parts": [{"text": prior_assistant}]},
                 {
                     "role": "user",
-                    "parts": [{"text": (
-                        "Continue your previous response from EXACTLY where you stopped. "
-                        "Do not repeat any prior content. Output only the next characters of the JSON."
-                    )}],
+                    "parts": [
+                        {
+                            "text": (
+                                "Continue your previous response from EXACTLY where you stopped. "
+                                "Do not repeat any prior content. Output only the next characters of the JSON."
+                            )
+                        }
+                    ],
                 },
             ],
             "generationConfig": {
