@@ -42,13 +42,27 @@ import download_contract as dc  # noqa: E402
 import onchain_state as oc  # noqa: E402
 import verify_source as vs  # noqa: E402
 from contract_registry import ContractRegistry  # noqa: E402
+from scryer_http import RateLimited, RateLimitTally, rpc_rate_limit_reason  # noqa: E402
 
 mcp = FastMCP("scryer")
 SOURCES_DIR = REPO / "sources"
 
 
 def _err(e: Exception) -> dict:
-    return {"error": f"{type(e).__name__}: {e}"}
+    out = {"error": f"{type(e).__name__}: {e}"}
+    # Backstop: if a throttle ever slips through as a raw exception, flag it so the caller
+    # (the hunter agent) can tell "rate-limited, retry later" from a permanent failure.
+    if isinstance(e, RateLimited):
+        out["rate_limited"] = True
+        out["warnings"] = [e.reason]
+        if e.retry_after is not None:
+            out["retry_after"] = e.retry_after
+    else:
+        reason = rpc_rate_limit_reason(e)
+        if reason:
+            out["rate_limited"] = True
+            out["warnings"] = [reason]
+    return out
 
 
 # One chain convention for every tool: alias OR numeric id, default BSC.
@@ -307,8 +321,9 @@ def download_contract(address: str, chain: str = "", chain_id: int = 0, follow_p
                 if follow_proxy:
                     cached["proxy"] = _proxy_block(cid, cached.get("meta_path"), follow_proxy)
                 return cached
+        tally = RateLimitTally()
         ok = dc.fetch_contract_source(
-            cid, address, follow_proxy=follow_proxy, output_dir=str(SOURCES_DIR), layout="flat", quiet=True
+            cid, address, follow_proxy=follow_proxy, output_dir=str(SOURCES_DIR), layout="flat", quiet=True, tally=tally
         )
         out = _collect_download(cid, address)
         out["cached"] = False
@@ -328,8 +343,26 @@ def download_contract(address: str, chain: str = "", chain_id: int = 0, follow_p
                         "Proxy shell has no verified source of its own, but the implementation "
                         "source WAS fetched - analyze proxy.implementation_files."
                     )
-        if not out["found"] and "note" not in out:
-            out["note"] = "No verified source from any provider - only runtime bytecode exists on-chain."
+        if not out["found"]:
+            if "note" not in out:
+                # A throttle must not be asserted as a confirmed miss — the source may well
+                # exist; the agent should retry rather than conclude "only bytecode".
+                if tally.hit:
+                    out["note"] = (
+                        "No source returned, but a provider was RATE-LIMITED - this is NOT a confirmed miss; "
+                        "retry (see warnings/retry_after)."
+                    )
+                else:
+                    out["note"] = "No verified source from any provider - only runtime bytecode exists on-chain."
+            # found:false -> stamp the full retry signal (rate_limited + retry_after).
+            tally.apply(out)
+        elif tally.hit:
+            # found:true: the returned SOURCE is complete (a later provider succeeded after an
+            # earlier one throttled). Surface the throttle as INFORMATIONAL only — do NOT set
+            # rate_limited/retry_after, which would wrongly tell the agent to retry a success.
+            # (Proxy-resolution throttles are signalled separately via out["proxy"]["rate_limited"].)
+            out["warnings"] = list(tally.reasons)
+            out.setdefault("note", "Source obtained (complete); an earlier provider was throttled - see warnings, no retry needed.")
         return out
     except Exception as e:
         return _err(e)
@@ -352,7 +385,7 @@ def verify_source(address: str, chain: str = "", chain_id: int = 0) -> dict:
     try:
         cid = _resolve_chain(chain, chain_id)
         r = vs.verify_contract(cid, address, cache=vs.VerifyCache())
-        return {
+        out = {
             "verdict": r.verdict,
             "chain_id": r.chain_id,
             "address": r.address,
@@ -363,6 +396,14 @@ def verify_source(address: str, chain: str = "", chain_id: int = 0) -> dict:
             "cache_hit": r.cache_hit,
             "notes": r.notes,
         }
+        if r.rate_limited:
+            # verdict is 'indeterminate' here, NOT no_bytecode/mismatch — the throttle is
+            # surfaced so the agent retries instead of trusting a code verdict.
+            out["rate_limited"] = True
+            out["warnings"] = list(r.notes)
+            if r.retry_after is not None:
+                out["retry_after"] = r.retry_after
+        return out
     except Exception as e:
         return _err(e)
 

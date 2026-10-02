@@ -42,6 +42,7 @@ from typing import Literal
 
 import scryer_config
 import scryer_http
+from scryer_http import RateLimited, rate_limit_reason, retry_after_seconds, rpc_rate_limit_reason
 from scryer_logging import get_logger
 
 _log = get_logger(__name__)
@@ -66,6 +67,8 @@ class VerifyResult:
     notes: list[str] = field(default_factory=list)
     cache_hit: bool = False
     immutables_zeroed: int = 0  # how many immutable byte ranges were zeroed before compare
+    rate_limited: bool = False  # on-chain fetch was throttled -> verdict is 'indeterminate', NOT a code/trust claim
+    retry_after: int | None = None  # seconds to back off, when the throttling provider supplied Retry-After
 
 
 @dataclass
@@ -227,14 +230,33 @@ def strip_metadata_trailer(bytecode_hex: str) -> str:
 
 
 def fetch_runtime_bytecode(rpc_url: str, address: str) -> str:
-    """``eth_getCode @ latest``; returns lowercase hex without ``0x``."""
+    """``eth_getCode @ latest``; returns lowercase hex without ``0x``.
+
+    Raises :class:`RateLimited` on a throttle — an HTTP 429/403/503 (A) or an
+    HTTP-200 JSON-RPC rate-limit error body (B, e.g. Alchemy code -32005) — so a
+    throttled node is never read as empty bytecode, which would masquerade as an
+    EOA / selfdestructed contract.
+    """
     with scryer_http.sync_client() as client:
         resp = client.post(
             rpc_url,
             json={"jsonrpc": "2.0", "id": 1, "method": "eth_getCode", "params": [address, "latest"]},
         )
+    # (A) status-based throttle: classify BEFORE raise_for_status, else a 429 is just an
+    # opaque HTTPStatusError the caller maps to no_bytecode.
+    reason = rate_limit_reason(resp)
+    if reason:
+        raise RateLimited(provider="rpc", retry_after=retry_after_seconds(resp), detail=reason)
     resp.raise_for_status()
     body = resp.json()
+    # (B) HTTP 200 + a JSON-RPC error member (result is None). Previously collapsed to
+    # '' -> a confident but false "empty bytecode (EOA/selfdestructed)" verdict.
+    err = body.get("error")
+    if err is not None and body.get("result") is None:
+        rpc_reason = rpc_rate_limit_reason(err)
+        if rpc_reason:
+            raise RateLimited(provider="rpc", detail=rpc_reason)
+        raise RuntimeError(f"eth_getCode JSON-RPC error: {err}")  # surface, don't fake empty code
     code = body.get("result") or "0x"
     return code[2:].lower() if code.startswith("0x") else code.lower()
 
@@ -634,6 +656,19 @@ def _verify_contract_uncached(
         )
     try:
         on_chain = fetch_runtime_bytecode(rpc_url, address_lower)
+    except RateLimited as e:
+        # A throttle is NOT a verdict on the code. Never report no_bytecode
+        # ('EOA/selfdestructed') for it — return indeterminate so the agent retries.
+        # indeterminate is not in _CACHEABLE_VERDICTS, so a throttle is never cached.
+        return VerifyResult(
+            verdict="indeterminate",
+            chain_id=chain_id,
+            address=address_lower,
+            compiler_version=compiler_version,
+            notes=[f"on-chain bytecode fetch rate-limited: {e.reason} — retry; NOT a verdict on the code"],
+            rate_limited=True,
+            retry_after=e.retry_after,
+        )
     except Exception as e:
         return VerifyResult(
             verdict="no_bytecode",

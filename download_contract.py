@@ -16,6 +16,7 @@ from web3 import Web3
 
 import scryer_config
 import scryer_http
+from scryer_http import RateLimitTally, rate_limit_reason, retry_after_seconds, rpc_rate_limit_reason
 from contract_registry import ContractRegistry
 from decompilers import decompile_with_heimdall, decompile_with_panoramix
 from scryer_logging import get_logger
@@ -60,6 +61,7 @@ def _fetch_archive_bytecode(
     block_number: int | None,
     primary_rpc_url: str,
     tx_hash: str | None,
+    tally: RateLimitTally | None = None,
 ) -> tuple[str, int] | None:
     """Try to fetch historic bytecode for ``address`` against an archive node.
 
@@ -99,6 +101,9 @@ def _fetch_archive_bytecode(
             return None
         return bytecode_hex, target_block
     except Exception as e:
+        reason = rpc_rate_limit_reason(e)
+        if reason and tally is not None:
+            tally.note(reason, provider="archive-rpc")
         _log.warning("Archive recovery failed (%s): %s", type(e).__name__, e)
         return None
 
@@ -133,20 +138,26 @@ def _parse_storage_address(value: bytes) -> str | None:
     return "0x" + addr_bytes.hex()
 
 
-def try_get_storage_address(w3: Web3, address: str, slot: int) -> str | None:
+def try_get_storage_address(w3: Web3, address: str, slot: int, tally: RateLimitTally | None = None) -> str | None:
     try:
         raw = w3.eth.get_storage_at(Web3.to_checksum_address(address), slot)
-    except Exception:
+    except Exception as e:
+        # A throttled slot read must not look like an unset (zero) slot — that would
+        # mis-report an upgradeable proxy as a non-proxy and the agent would analyze the shell.
+        if tally is not None:
+            tally.note(rpc_rate_limit_reason(e), provider="rpc")
         return None
     return _parse_storage_address(raw)
 
 
-def try_call_implementation(w3: Web3, address: str) -> str | None:
+def try_call_implementation(w3: Web3, address: str, tally: RateLimitTally | None = None) -> str | None:
     # bytes4(keccak256("implementation()")) == 0x5c60da1b
     data = bytes.fromhex("5c60da1b")
     try:
         raw = w3.eth.call({"to": Web3.to_checksum_address(address), "data": data})
-    except Exception:
+    except Exception as e:
+        if tally is not None:
+            tally.note(rpc_rate_limit_reason(e), provider="rpc")
         return None
     if not isinstance(raw, (bytes, bytearray)) or len(raw) < 32:
         return None
@@ -163,7 +174,9 @@ def try_extract_eip1167_implementation(bytecode: bytes) -> str | None:
     return None
 
 
-def resolve_proxy_targets(chain_id: int, address: str, rpc_url: str) -> tuple[list[str], dict]:
+def resolve_proxy_targets(
+    chain_id: int, address: str, rpc_url: str, tally: RateLimitTally | None = None
+) -> tuple[list[str], dict]:
     """
     Best-effort proxy resolution:
     - EIP-1967 implementation slot
@@ -177,7 +190,15 @@ def resolve_proxy_targets(chain_id: int, address: str, rpc_url: str) -> tuple[li
     try:
         code = w3.eth.get_code(Web3.to_checksum_address(address))
     except Exception as e:
-        result["proxy"]["error"] = f"get_code failed: {type(e).__name__}"
+        reason = rpc_rate_limit_reason(e)
+        if reason:
+            # Throttled: don't let is_proxy:false be trusted — the agent would analyze the shell.
+            if tally is not None:
+                tally.note(reason, provider="rpc")
+            result["proxy"]["rate_limited"] = True
+            result["proxy"]["error"] = f"get_code rate-limited: {reason}"
+        else:
+            result["proxy"]["error"] = f"get_code failed: {type(e).__name__}"
         return [address], result
 
     eip1167_impl = try_extract_eip1167_implementation(bytes(code))
@@ -186,32 +207,32 @@ def resolve_proxy_targets(chain_id: int, address: str, rpc_url: str) -> tuple[li
         result["proxy"]["implementation"] = normalize_address(eip1167_impl)
         return [address, normalize_address(eip1167_impl)], result
 
-    eip1967_impl = try_get_storage_address(w3, address, EIP1967_IMPLEMENTATION_SLOT)
+    eip1967_impl = try_get_storage_address(w3, address, EIP1967_IMPLEMENTATION_SLOT, tally=tally)
     if eip1967_impl:
         result["proxy"]["eip1967_implementation_slot"] = True
         result["proxy"]["implementation"] = normalize_address(eip1967_impl)
         return [address, normalize_address(eip1967_impl)], result
 
     # Legacy zeppelinos implementation slot (pre-EIP-1967; e.g. USDC FiatTokenProxy).
-    zos_impl = try_get_storage_address(w3, address, ZOS_IMPLEMENTATION_SLOT)
+    zos_impl = try_get_storage_address(w3, address, ZOS_IMPLEMENTATION_SLOT, tally=tally)
     if zos_impl:
         result["proxy"]["zeppelinos_implementation_slot"] = True
         result["proxy"]["implementation"] = normalize_address(zos_impl)
         return [address, normalize_address(zos_impl)], result
 
-    beacon = try_get_storage_address(w3, address, EIP1967_BEACON_SLOT)
+    beacon = try_get_storage_address(w3, address, EIP1967_BEACON_SLOT, tally=tally)
     if beacon:
         result["proxy"]["eip1967_beacon_slot"] = True
         result["proxy"]["beacon"] = normalize_address(beacon)
-        beacon_impl = try_call_implementation(w3, beacon) or try_get_storage_address(
-            w3, beacon, EIP1967_IMPLEMENTATION_SLOT
+        beacon_impl = try_call_implementation(w3, beacon, tally=tally) or try_get_storage_address(
+            w3, beacon, EIP1967_IMPLEMENTATION_SLOT, tally=tally
         )
         if beacon_impl:
             result["proxy"]["implementation"] = normalize_address(beacon_impl)
             return [address, normalize_address(beacon_impl)], result
 
     # Some proxies expose implementation() directly (non-standard but common).
-    direct_impl = try_call_implementation(w3, address)
+    direct_impl = try_call_implementation(w3, address, tally=tally)
     if direct_impl:
         result["proxy"]["implementation_method"] = "implementation()"
         result["proxy"]["implementation"] = normalize_address(direct_impl)
@@ -283,7 +304,7 @@ def extract_address(value: str) -> str:
 BSC_SCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY") or os.getenv("BSCSCAN_API_KEY") or os.getenv("BSC_SCAN_API_KEY")
 
 
-def get_sourcify_source(chain_id: int, address: str):
+def get_sourcify_source(chain_id: int, address: str, tally: RateLimitTally | None = None):
     """優先 Sourcify API 抓取源碼"""
     address = address.lower()
 
@@ -292,7 +313,10 @@ def get_sourcify_source(chain_id: int, address: str):
     params = {"addresses": address, "chainIds": str(chain_id)}
     response = HTTP.get(check_url, params=params)
     if response.status_code != 200:
-        return None, None, "Sourcify check failed"
+        reason = rate_limit_reason(response)
+        if reason and tally is not None:
+            tally.note(reason, provider="sourcify", retry_after=retry_after_seconds(response))
+        return None, None, (f"Sourcify check rate-limited: {reason}" if reason else "Sourcify check failed")
 
     status = json_loads(response.text) if response.text else None
     match_type = None
@@ -321,6 +345,10 @@ def get_sourcify_source(chain_id: int, address: str):
     # 2a. 嘗試 sources.json (若存在會包含 content)
     sources_url = f"{base_url}/sources.json"
     r_sources = HTTP.get(sources_url)
+    if r_sources.status_code != 200:
+        reason = rate_limit_reason(r_sources)
+        if reason and tally is not None:
+            tally.note(reason, provider="sourcify", retry_after=retry_after_seconds(r_sources))
     if r_sources.status_code == 200 and r_sources.text.strip():
         try:
             sources_data = json_loads(r_sources.text)
@@ -333,6 +361,10 @@ def get_sourcify_source(chain_id: int, address: str):
     # 2b. 下載 metadata（總會存在），並用其中的檔名去 /sources/{path} 拉檔案
     metadata_url = f"{base_url}/metadata.json"
     metadata_r = HTTP.get(metadata_url)
+    if metadata_r.status_code != 200:
+        reason = rate_limit_reason(metadata_r)
+        if reason and tally is not None:
+            tally.note(reason, provider="sourcify", retry_after=retry_after_seconds(metadata_r))
     metadata = json_loads(metadata_r.text) if metadata_r.status_code == 200 and metadata_r.text else {}
 
     if not sources and metadata.get("sources"):
@@ -346,6 +378,9 @@ def get_sourcify_source(chain_id: int, address: str):
                 file_r = HTTP.get(f"{base_url}/sources/{path}")
                 if file_r.status_code == 200:
                     return path, file_r.text
+                reason = rate_limit_reason(file_r)
+                if reason and tally is not None:
+                    tally.note(reason, provider="sourcify", retry_after=retry_after_seconds(file_r))
             except Exception:
                 pass
             # fallback: metadata.urls as-is (kept identical to the pre-parallel code so the
@@ -393,7 +428,7 @@ _BLOCKSCOUT_BASE_URLS: dict[int, list[str]] = {
 }
 
 
-def get_blockscout_source(chain_id: int, address: str):
+def get_blockscout_source(chain_id: int, address: str, tally: RateLimitTally | None = None):
     """Fallback: per-chain Blockscout instance API."""
     bases = _BLOCKSCOUT_BASE_URLS.get(chain_id, [])
     if not bases:
@@ -403,6 +438,9 @@ def get_blockscout_source(chain_id: int, address: str):
     for api_url in api_urls:
         r = HTTP.get(api_url)
         if r.status_code != 200:
+            reason = rate_limit_reason(r)
+            if reason and tally is not None:
+                tally.note(reason, provider="blockscout", retry_after=retry_after_seconds(r))
             errors.append(f"{api_url} -> HTTP {r.status_code}")
             continue
         data = json_loads(r.text) if r.text else {}
@@ -420,7 +458,7 @@ def get_blockscout_source(chain_id: int, address: str):
     return None, None, " ; ".join(errors) if errors else "Blockscout failed"
 
 
-def get_bscscan_source(chain_id: int, address: str):
+def get_bscscan_source(chain_id: int, address: str, tally: RateLimitTally | None = None):
     """使用 Etherscan API V2 / BscScan API 抓取源碼 (需要 API Key)"""
     if not BSC_SCAN_API_KEY:
         return None, None, "Etherscan API key not provided (set ETHERSCAN_API_KEY in .env)"
@@ -455,6 +493,9 @@ def get_bscscan_source(chain_id: int, address: str):
     for api_url, params, label in candidates:
         r = HTTP.get(api_url, params=params)
         if r.status_code != 200:
+            reason = rate_limit_reason(r)
+            if reason and tally is not None:
+                tally.note(reason, provider="etherscan", retry_after=retry_after_seconds(r))
             errors.append(f"{label}: HTTP {r.status_code}")
             continue
 
@@ -465,7 +506,15 @@ def get_bscscan_source(chain_id: int, address: str):
             continue
 
         if resp.get("status") != "1" or not resp.get("result"):
-            errors.append(f"{label}: {resp.get('message')}")
+            # Etherscan V2 signals a throttle as HTTP 200 + status:"0" with "Max rate limit
+            # reached" / a daily-limit message in message/result — classify it from those
+            # SHORT fields only (never the source) so it is not mistaken for an unverified contract.
+            result_field = resp.get("result")
+            result_text = result_field if isinstance(result_field, str) else ""
+            reason = rate_limit_reason(r, body_text=f"{resp.get('message') or ''} {result_text}")
+            if reason and tally is not None:
+                tally.note(reason, provider="etherscan", retry_after=retry_after_seconds(r))
+            errors.append(f"{label}: {resp.get('message')}" + (f" ({result_text})" if reason else ""))
             continue
 
         result = resp["result"][0] if isinstance(resp["result"], list) else resp["result"]
@@ -533,10 +582,20 @@ def get_bscscan_source(chain_id: int, address: str):
     return None, None, " ; ".join(errors) if errors else "BscScan failed"
 
 
-def extract_from_bytecode_metadata(chain_id: int, address: str, rpc_url: str = DEFAULT_RPC_URL):
+def extract_from_bytecode_metadata(
+    chain_id: int, address: str, rpc_url: str = DEFAULT_RPC_URL, tally: RateLimitTally | None = None
+):
     """最後手段: 從鏈上 bytecode 解析 metadata → IPFS/Swarm"""
     w3 = Web3(Web3.HTTPProvider(rpc_url))
-    bytecode = w3.eth.get_code(Web3.to_checksum_address(address)).hex()
+    try:
+        bytecode = w3.eth.get_code(Web3.to_checksum_address(address)).hex()
+    except Exception as e:
+        # Note a throttle (so a rate-limited RPC isn't read as "EOA/no code") then re-raise;
+        # fetch_one's handler degrades to its normal RPC-failed path.
+        reason = rpc_rate_limit_reason(e)
+        if reason and tally is not None:
+            tally.note(reason, provider="rpc")
+        raise
 
     # 提取 metadata (Solidity metadata 在 bytecode 結尾，CBOR 編碼)
     # 最後 2 bytes 是 offset (通常 0x00 0xA1)，然後 CBOR data
@@ -589,6 +648,9 @@ def extract_from_bytecode_metadata(chain_id: int, address: str, rpc_url: str = D
                 gateway_errors.append(f"{gateway}: {type(e).__name__}")
                 continue
             if r.status_code != 200 or not r.text:
+                reason = rate_limit_reason(r)
+                if reason and tally is not None:
+                    tally.note(reason, provider="ipfs", retry_after=retry_after_seconds(r))
                 msg = r.text.strip() if r.text else ""
                 gateway_errors.append(f"{gateway}: HTTP {r.status_code}{' ' + msg[:120] if msg else ''}")
                 continue
@@ -621,6 +683,9 @@ def extract_from_bytecode_metadata(chain_id: int, address: str, rpc_url: str = D
                         if fr.status_code == 200 and fr.text is not None:
                             sources[path] = fr.text
                             break
+                        reason = rate_limit_reason(fr)
+                        if reason and tally is not None:
+                            tally.note(reason, provider="ipfs", retry_after=retry_after_seconds(fr))
                     if path in sources:
                         break
 
@@ -732,6 +797,7 @@ def fetch_contract_source(
     archive_rpc_url: str = "",
     archive_tx_hash: str | None = None,
     archive_block: int | None = None,
+    tally: RateLimitTally | None = None,
 ) -> bool:
     root_address = normalize_address(address)
     _log.info("開始抓取 chainId=%s, 地址=%s 的源碼...", chain_id, root_address)
@@ -745,7 +811,7 @@ def fetch_contract_source(
     proxy_info = None
     targets = [root_address]
     if follow_proxy:
-        targets, proxy_info = resolve_proxy_targets(chain_id, root_address, rpc_url)
+        targets, proxy_info = resolve_proxy_targets(chain_id, root_address, rpc_url, tally=tally)
         targets = [normalize_address(a) for a in targets]
         targets = list(dict.fromkeys(targets))  # preserve order, de-dup
         if len(targets) > 1:
@@ -771,7 +837,7 @@ def fetch_contract_source(
 
     def fetch_one(target: str):
         # 步驟 1: Sourcify
-        sources, metadata, msg = get_sourcify_source(chain_id, target)
+        sources, metadata, msg = get_sourcify_source(chain_id, target, tally=tally)
         if sources:
             _log.info("✅ %s", msg)
             if not quiet:
@@ -784,7 +850,7 @@ def fetch_contract_source(
 
         # 步驟 2: Blockscout
         _log.info("Sourcify 無，嘗試 Blockscout...")
-        sources, metadata, msg = get_blockscout_source(chain_id, target)
+        sources, metadata, msg = get_blockscout_source(chain_id, target, tally=tally)
         if sources:
             _log.info("✅ %s", msg)
             if not quiet:
@@ -796,7 +862,7 @@ def fetch_contract_source(
 
         # 步驟 2b: BscScan (需 API key)
         _log.info("嘗試 BscScan API...")
-        sources, metadata, msg = get_bscscan_source(chain_id, target)
+        sources, metadata, msg = get_bscscan_source(chain_id, target, tally=tally)
         if sources:
             _log.info("✅ %s", msg)
             if not quiet:
@@ -809,7 +875,7 @@ def fetch_contract_source(
         # 步驟 3: Bytecode metadata
         _log.info("Blockscout 無，嘗試從 bytecode 解析...")
         try:
-            sources, metadata, msg = extract_from_bytecode_metadata(chain_id, target, rpc_url=rpc_url)
+            sources, metadata, msg = extract_from_bytecode_metadata(chain_id, target, rpc_url=rpc_url, tally=tally)
         except Exception as e:
             # A dead/unreachable RPC must not crash the whole fetch — degrade to
             # "no source via this method" so the caller gets a clean found:false
@@ -834,6 +900,19 @@ def fetch_contract_source(
 
         sources, metadata, msg, method = fetch_one(target)
         if not sources:
+            if tally is not None and tally.hit:
+                # Source providers were RATE-LIMITED (not genuinely missing). Do NOT commit a
+                # degraded decompiled/bytecode result: a .decompiled.sol would make found:true,
+                # get auto-registered (polluting registry_clones with a decompiled hash) AND
+                # cached on disk — permanently masking a throttled-but-verified contract on
+                # later calls. Leave this target with no output so the MCP layer surfaces
+                # found:false + rate_limited + "retry", and a later call re-fetches cleanly.
+                _log.warning(
+                    "⏳ Skipping bytecode/decompile fallback for %s — source providers were "
+                    "rate-limited; leaving found:false so the caller retries.",
+                    target,
+                )
+                continue
             _log.warning("❌ 所有途徑失敗 (%s)，嘗試保存原始 bytecode...", msg)
             # Save bytecode-only with marker, optionally with a decompiled
             # pseudo-source if Heimdall/Panoramix is available locally.
@@ -854,6 +933,7 @@ def fetch_contract_source(
                         block_number=archive_block,
                         primary_rpc_url=rpc_url,
                         tx_hash=archive_tx_hash,
+                        tally=tally,
                     )
                     if archive_result:
                         bytecode, recovered_from_archive_block = archive_result
@@ -952,6 +1032,9 @@ def fetch_contract_source(
                             "並提供 --archive-tx <hash> 可嘗試 recover)"
                         )
             except Exception as e:
+                reason = rpc_rate_limit_reason(e)
+                if reason and tally is not None:
+                    tally.note(reason, provider="rpc")
                 _log.error("❌ 保存 bytecode 失敗: %s", e)
             continue
 

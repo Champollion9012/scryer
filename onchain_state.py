@@ -22,6 +22,7 @@ from web3 import Web3
 from web3.middleware import ExtraDataToPOAMiddleware
 
 import scryer_config
+from scryer_http import RateLimitTally, rate_limit_reason, retry_after_seconds, rpc_rate_limit_reason
 
 # No-argument view selectors worth probing on an unknown contract.
 _VIEWS: dict[str, str] = {
@@ -120,14 +121,20 @@ def _parse_block(block) -> tuple[object, str | None]:
         return None, f"invalid block: {block!r} (use a block number, 0x-hex, or a tag like 'latest')"
 
 
-def _call(w3: Web3, address: str, selector: str, suffix: str = "", block: object = "latest") -> bytes | None:
+def _call(
+    w3: Web3, address: str, selector: str, suffix: str = "", block: object = "latest", tally: RateLimitTally | None = None
+) -> bytes | None:
     try:
         raw = w3.eth.call(
             {"to": Web3.to_checksum_address(address), "data": bytes.fromhex(selector + suffix)},
             block_identifier=block,
         )
         return bytes(raw)
-    except Exception:
+    except Exception as e:
+        # A throttled eth_call must not look like a reverted/absent getter. Record it
+        # (don't abort — callers probe several selectors) so the tool can surface it.
+        if tally is not None:
+            tally.note(rpc_rate_limit_reason(e), provider="rpc")
         return None
 
 
@@ -153,12 +160,12 @@ _PAIR_TOKEN1 = "d21220a7"  # token1()
 _PAIR_RESERVES = "0902f1ac"  # getReserves()
 
 
-def _pair_state(w3: Web3, address: str, block: object = "latest") -> dict | None:
+def _pair_state(w3: Web3, address: str, block: object = "latest", tally: RateLimitTally | None = None) -> dict | None:
     """UniswapV2-style pair state (token0/token1/reserves) — the most useful state for a
     pair, which the generic ERC20 getters don't surface. None if it isn't a pair."""
-    t0 = _call(w3, address, _PAIR_TOKEN0, block=block)
-    t1 = _call(w3, address, _PAIR_TOKEN1, block=block)
-    res = _call(w3, address, _PAIR_RESERVES, block=block)
+    t0 = _call(w3, address, _PAIR_TOKEN0, block=block, tally=tally)
+    t1 = _call(w3, address, _PAIR_TOKEN1, block=block, tally=tally)
+    res = _call(w3, address, _PAIR_RESERVES, block=block, tally=tally)
     if not (t0 and t1 and res and len(res) >= 96):
         return None
     out: dict = {}
@@ -184,15 +191,21 @@ def get_state(chain_id: int, address: str, block: object = "latest") -> dict:
     if berr:
         return {"chain_id": chain_id, "address": address.lower(), "error": berr}
     out: dict = {"chain_id": chain_id, "address": address.lower(), "rpc_url": url, "block": blk, "state": {}}
+    tally = RateLimitTally()
     try:
         out["has_code"] = len(w3.eth.get_code(Web3.to_checksum_address(address), block_identifier=blk)) > 0
     except Exception as e:
+        reason = rpc_rate_limit_reason(e)
+        if reason:
+            # Throttled: NOT a factual "no code / not a contract" claim. Surface it and
+            # drop the misleading archive-RPC hint so the agent retries instead of concluding EOA.
+            return {**out, "rate_limited": True, "warnings": [f"rpc: {reason}"], "error": f"rpc rate-limited: {reason}"}
         return {**out, "error": f"rpc: {type(e).__name__}: {e} (historical reads need an archive RPC)"}
     if not out["has_code"]:
         out["note"] = "no contract code at this address at this block (EOA, not-yet-deployed, or self-destructed)"
         return out
     for name, sel in _VIEWS.items():
-        b = _call(w3, address, sel, block=blk)
+        b = _call(w3, address, sel, block=blk, tally=tally)
         if not b:
             continue
         v: str | bool | int | None
@@ -212,10 +225,10 @@ def get_state(chain_id: int, address: str, block: object = "latest") -> dict:
         if v is not None:
             out["state"][name] = v
 
-    pair = _pair_state(w3, address, block=blk)
+    pair = _pair_state(w3, address, block=blk, tally=tally)
     if pair:
         out["pair"] = pair
-    return out
+    return tally.apply(out)
 
 
 def _parse_slot(slot: int | str) -> int | None:
@@ -284,6 +297,12 @@ def read_storage(chain_id: int, address: str, slot: int | str, decode_as: str = 
     try:
         raw = bytes(w3.eth.get_storage_at(Web3.to_checksum_address(address), s, block_identifier=blk))
     except Exception as e:
+        reason = rpc_rate_limit_reason(e)
+        if reason:
+            return {
+                "chain_id": chain_id, "address": address.lower(), "slot": hex(s), "block": blk,
+                "rate_limited": True, "warnings": [f"rpc: {reason}"], "error": f"rpc rate-limited: {reason}",
+            }
         return {"error": f"rpc: {type(e).__name__}: {e} (historical reads need an archive RPC)"}
     out: dict = {
         "chain_id": chain_id,
@@ -345,6 +364,13 @@ def call_view(
             w3.eth.call({"to": Web3.to_checksum_address(address), "data": "0x" + data.hex()}, block_identifier=blk)
         )
     except Exception as e:
+        reason = rpc_rate_limit_reason(e)
+        if reason:
+            # A throttle is NOT a revert — the view may well return a value; retry, don't conclude "no value".
+            return {
+                "chain_id": chain_id, "address": address.lower(), "signature": sig, "block": blk,
+                "rate_limited": True, "warnings": [f"rpc: {reason}"], "error": f"rpc rate-limited: {reason} (not a revert)",
+            }
         return {"error": f"eth_call failed/reverted: {type(e).__name__}: {e}"}
     out: dict = {
         "chain_id": chain_id,
@@ -363,10 +389,14 @@ def call_view(
     return out
 
 
-def _defillama_prices(keys: list[str], timestamp: int | None = None) -> dict[str, float]:
+def _defillama_prices(
+    keys: list[str], timestamp: int | None = None, tally: RateLimitTally | None = None
+) -> dict[str, float]:
     """Batch USD prices from DeFiLlama (free, no key). Keys like 'ethereum:0x..' or
     'coingecko:ethereum'. With a unix `timestamp`, uses the historical endpoint so
-    prices match a pinned block. Returns {key: price}; empty on any failure."""
+    prices match a pinned block. Returns {key: price}; empty on any failure. A DeFiLlama
+    throttle (429/403/503) is recorded on `tally` so the caller can tell 'throttled'
+    (retry for real $-at-risk) from 'no price available'."""
     keys = [k for k in keys if k]
     if not keys:
         return {}
@@ -377,6 +407,11 @@ def _defillama_prices(keys: list[str], timestamp: int | None = None) -> dict[str
             else "https://coins.llama.fi/prices/current/"
         )
         r = httpx.get(base + ",".join(keys), timeout=15)
+        reason = rate_limit_reason(r)  # DeFiLlama throttles are status-based (429/403/503)
+        if reason:
+            if tally is not None:
+                tally.note(reason, provider="defillama", retry_after=retry_after_seconds(r))
+            return {}
         coins = r.json().get("coins", {})
         return {k: v["price"] for k, v in coins.items() if isinstance(v, dict) and "price" in v}
     except Exception:
@@ -396,16 +431,20 @@ def token_exposure(chain_id: int, address: str, block: object = "latest") -> dic
     if berr:
         return {"chain_id": chain_id, "address": address.lower(), "error": berr}
     out: dict = {"chain_id": chain_id, "address": address.lower(), "rpc_url": url, "block": blk}
+    tally = RateLimitTally()
     checks = Web3.to_checksum_address(address)
     try:
         native = w3.eth.get_balance(checks, block_identifier=blk)
     except Exception as e:
+        reason = rpc_rate_limit_reason(e)
+        if reason:
+            return {**out, "rate_limited": True, "warnings": [f"rpc: {reason}"], "error": f"rpc rate-limited: {reason}"}
         return {**out, "error": f"rpc: {type(e).__name__}: {e} (historical reads need an archive RPC)"}
     native_amt = native / 1e18
     suffix = checks[2:].lower().rjust(64, "0")
     holdings: list[dict] = []
     for sym, taddr, dec, stable in _TOKENS.get(chain_id, []):
-        b = _call(w3, taddr, "70a08231", suffix, block=blk)  # balanceOf(address)
+        b = _call(w3, taddr, "70a08231", suffix, block=blk, tally=tally)  # balanceOf(address)
         if not b:
             continue
         bal = int.from_bytes(b[-32:], "big")
@@ -419,13 +458,19 @@ def token_exposure(chain_id: int, address: str, block: object = "latest") -> dic
     if blk != "latest":
         try:
             ts = w3.eth.get_block(blk)["timestamp"]
-        except Exception:
+        except Exception as e:
             ts = None
+            reason = rpc_rate_limit_reason(e)
+            if reason:
+                # Throttled: we fall back to CURRENT pricing for a historical balance — warn
+                # rather than silently mis-pricing at the wrong epoch.
+                tally.note(f"historical price timestamp unavailable: {reason}", provider="rpc")
     dl_chain = _DL_CHAIN.get(chain_id)
     cgid = _DL_NATIVE_CGID.get(chain_id)
     native_key = f"coingecko:{cgid}" if cgid else ""
     token_keys = {h["token"]: f"{dl_chain}:{h['token']}" for h in holdings} if dl_chain else {}
-    prices = _defillama_prices([native_key, *token_keys.values()], timestamp=ts)
+    prices = _defillama_prices([native_key, *token_keys.values()], timestamp=ts, tally=tally)
+    price_throttled = "defillama" in tally.providers
 
     native_price = prices.get(native_key)
     native_usd = round(native_amt * native_price, 2) if native_price else None
@@ -438,11 +483,17 @@ def token_exposure(chain_id: int, address: str, block: object = "latest") -> dic
 
     out["native"] = {"symbol": _NATIVE.get(chain_id, "NATIVE"), "amount": native_amt, "usd": native_usd}
     out["token_holdings"] = holdings
-    out["total_usd"] = round(total, 2)
+    # A throttled price fetch must NOT be reported as an authoritative $0 — that would deflate
+    # the $-at-risk severity input. Report total_usd as UNKNOWN (null) when pricing was throttled.
+    out["total_usd"] = None if price_throttled else round(total, 2)
     out["price_source"] = "defillama"
     out["price_block_timestamp"] = ts
     out["note"] = (
-        "total_usd = native + priced tokens (DeFiLlama, best-effort; usd=null means no price). "
-        "Fixed major-token list per chain, not the full token set - total_usd is a floor, not exhaustive TVL."
+        "DeFiLlama pricing was rate-limited: total_usd is UNKNOWN (null), NOT $0 - retry for the real $-at-risk."
+        if price_throttled
+        else (
+            "total_usd = native + priced tokens (DeFiLlama, best-effort; usd=null means no price). "
+            "Fixed major-token list per chain, not the full token set - total_usd is a floor, not exhaustive TVL."
+        )
     )
-    return out
+    return tally.apply(out)
