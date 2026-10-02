@@ -4,6 +4,7 @@ import datetime as dt
 import os
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -276,8 +277,10 @@ def extract_address(value: str) -> str:
     return match.group(0) if match else value
 
 
-# 允許使用 BscScan API key (環境變量)
-BSC_SCAN_API_KEY = os.getenv("BSCSCAN_API_KEY") or os.getenv("BSC_SCAN_API_KEY")
+# Etherscan API V2 uses ONE unified key across all chains (ETHERSCAN_API_KEY). Fall back to
+# the legacy per-chain names so older .env files keep working. (get_bscscan_source hits the
+# V2 endpoint api.etherscan.io/v2/api?chainid=..., so ETHERSCAN_API_KEY is the right key.)
+BSC_SCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY") or os.getenv("BSCSCAN_API_KEY") or os.getenv("BSC_SCAN_API_KEY")
 
 
 def get_sourcify_source(chain_id: int, address: str):
@@ -333,24 +336,34 @@ def get_sourcify_source(chain_id: int, address: str):
     metadata = json_loads(metadata_r.text) if metadata_r.status_code == 200 and metadata_r.text else {}
 
     if not sources and metadata.get("sources"):
-        for path, info in metadata["sources"].items():
-            if "content" in info:
-                sources[path] = info["content"]
-                continue
-            file_url = f"{base_url}/sources/{path}"
-            file_r = HTTP.get(file_url)
-            if file_r.status_code == 200:
-                sources[path] = file_r.text
-                continue
-            # fallback: 若 metadata.urls 有其他位置，可再嘗試
-            for url in info.get("urls", []):
+        # Fetch every file concurrently. A big multi-file contract otherwise pulled them
+        # one-by-one from the Sourcify repo (dozens of sequential round-trips -> minutes).
+        def _fetch_source_file(item: tuple[str, dict]) -> tuple[str, str | None]:
+            path, info = item
+            if isinstance(info, dict) and "content" in info:
+                return path, info["content"]
+            try:
+                file_r = HTTP.get(f"{base_url}/sources/{path}")
+                if file_r.status_code == 200:
+                    return path, file_r.text
+            except Exception:
+                pass
+            # fallback: metadata.urls as-is (kept identical to the pre-parallel code so the
+            # fetched source set — and therefore source_hash — does not change).
+            for url in info.get("urls", []) if isinstance(info, dict) else []:
                 try:
                     alt_r = HTTP.get(url)
                     if alt_r.status_code == 200:
-                        sources[path] = alt_r.text
-                        break
+                        return path, alt_r.text
                 except Exception:
                     continue
+            return path, None
+
+        items = list(metadata["sources"].items())
+        with ThreadPoolExecutor(max_workers=min(10, max(1, len(items)))) as ex:
+            for path, content in ex.map(_fetch_source_file, items):
+                if content is not None:
+                    sources[path] = content
 
     if sources:
         # Stash match_type into metadata so download_meta.json persists it.
@@ -410,7 +423,7 @@ def get_blockscout_source(chain_id: int, address: str):
 def get_bscscan_source(chain_id: int, address: str):
     """使用 Etherscan API V2 / BscScan API 抓取源碼 (需要 API Key)"""
     if not BSC_SCAN_API_KEY:
-        return None, None, "BscScan API key not provided (set BSCSCAN_API_KEY in .env)"
+        return None, None, "Etherscan API key not provided (set ETHERSCAN_API_KEY in .env)"
 
     address = extract_address(address)
 
