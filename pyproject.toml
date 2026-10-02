@@ -73,7 +73,6 @@ py-modules = [
     "decompilers",
     "download_contract",
     "onchain_state",
-    "report_renderer",
     "rpc_contract_discovery",
     "scanners",
     "scryer_config",
@@ -157,7 +156,6 @@ module = [
     "scryer_http",
     "cache",
     "scanners",
-    "report_renderer",
 ]
 disallow_untyped_defs = true
 disallow_incomplete_defs = true
