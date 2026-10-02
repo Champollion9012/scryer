@@ -54,8 +54,6 @@ dev = [
 scryer-download = "download_contract:main"
 scryer-crawl = "contract_crawler:main"
 scryer-discover = "rpc_contract_discovery:main"
-scryer-audit = "audit_contracts:main"
-scryer-bounty = "bounty_pipeline:main"
 scryer-similarity = "similarity_cli:main"
 scryer-web = "web:main"
 
@@ -68,15 +66,13 @@ Issues = "https://github.com/your-org/scryer/issues"
 # ---------------------------------------------------------------------------
 [tool.setuptools]
 py-modules = [
-    "audit_contracts",
-    "bounty_pipeline",
     "cache",
     "contract_crawler",
     "contract_registry",
     "data_sources",
     "decompilers",
     "download_contract",
-    "llm_providers",
+    "onchain_state",
     "report_renderer",
     "rpc_contract_discovery",
     "scanners",
@@ -162,7 +158,6 @@ module = [
     "cache",
     "scanners",
     "report_renderer",
-    "bounty_pipeline",
 ]
 disallow_untyped_defs = true
 disallow_incomplete_defs = true

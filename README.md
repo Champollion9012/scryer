@@ -2,9 +2,9 @@
 
 **Multi-chain EVM contract security research toolkit.**
 
-Pulls verified source from 8 EVM chains, falls back to bytecode decompilation when source is missing, runs LLM-powered audits with map-reduce chunking, indexes everything for similarity search, and ships Foundry templates for PoC reproduction.
+Pulls verified source from 8 EVM chains, falls back to bytecode decompilation when source is missing, reads live on-chain state (owner/pause/storage/$-at-risk), indexes everything for similarity search, and ships Foundry templates for PoC reproduction. Exposed as an MCP server so an AI agent can fetch/verify/relate contracts and do the vulnerability analysis itself.
 
-> Originally a single-purpose BscScan downloader. Grew into a one-stop pipeline for bounty hunters and security researchers.
+> Originally a single-purpose BscScan downloader. Grew into a one-stop data/oracle toolkit for bounty hunters and security researchers. Analysis is left to the agent — scryer provides ground truth, not verdicts.
 
 ---
 
@@ -16,14 +16,14 @@ Pulls verified source from 8 EVM chains, falls back to bytecode decompilation wh
 | **Crawl** | [`contract_crawler.py`](contract_crawler.py) | Bulk verified-contract crawl across 8 chains, async + rate-limited; atomic claim-based resume so multiple workers don't double-fetch. |
 | **Discover** | [`rpc_contract_discovery.py`](rpc_contract_discovery.py) | RPC block scanner. Pulls source if available, decompiles bytecode otherwise. TTY-aware progress (live `\r` on terminals, ~5% steps via logger off-tty). |
 | **Decompile** | [`decompilers.py`](decompilers.py) | Heimdall-rs (via WSL on Windows) + Panoramix fallback. |
-| **Index** | [`contract_registry.py`](contract_registry.py) | SQLite registry keyed by source hash → fast clone discovery across chains. |
-| **Audit** | [`audit_contracts.py`](audit_contracts.py) + [`llm_providers.py`](llm_providers.py) | OpenAI / Claude / Gemini, JSON-mode prompts, map-reduce for huge codebases, parallel `--concurrency`, `--stream` for live token deltas, smart retry classification (4xx bail · 429 honours `Retry-After` · 5xx exp-backoff), and content-hash cache that skips re-audits across runs. |
+| **Index** | [`contract_registry.py`](contract_registry.py) | SQLite registry keyed by source hash → fast clone discovery across chains. Downloads via the MCP auto-register, so the corpus grows from use. |
+| **State** | [`onchain_state.py`](onchain_state.py) | Live on-chain reads: owner/admin/pause/proxy impl, raw storage slots, native + token holdings priced in USD via DeFiLlama (free, no key) — the $-at-risk input to severity. |
 | **Scan** | [`scanners.py`](scanners.py) | Curated regex rules (SWC-aligned) matched against whole files with comment bodies masked, so multi-line call shapes (`swap…(\n amt,\n 0,\n …)`) are caught, commented-out code stays quiet, and each finding carries `line`..`end_line`; `max_findings` bounds work as well as output; pluggable via `RegexRule.from_dict` + `load_rules_from_file` (`match_in: "all"` for comment-targeting rules); optional Slither + Mythril + `forge test`. |
 | **Compare** | [`similarity.py`](similarity.py) + [`similarity_cli.py`](similarity_cli.py) | GraphCodeBERT embeddings (length-weighted chunk averaging) + ChromaDB vector store. |
-| **Pipeline** | [`bounty_pipeline.py`](bounty_pipeline.py) | One-shot download + audit driven by a target JSON. |
+| **MCP** | [`scryer_mcp.py`](scryer_mcp.py) | MCP server exposing fetch / verify / state / relate as tools for an AI agent (e.g. a `hunter` agent). Proxy-aware: returns the implementation's source, not just the shell. The agent does the analysis. |
 | **Browse** | [`web.py`](web.py) + [`templates/`](templates/) | Local Flask dashboard over the registry; Jinja templates extend `base.html`; debug gated by `FLASK_DEBUG` env. |
 | **Reproduce** | [`tests/`](tests/) | Foundry forks + PoC templates (e.g. MARS staking sync drain). |
-| **Test** | [`tests/python/`](tests/python/) | 330+ offline pytest cases over the whole pipeline (audit / cache / scanners / rule packs / similarity / web routes / whale watcher / bounty pipeline / IPFS extraction). |
+| **Test** | [`tests/python/`](tests/python/) | offline pytest cases over the pipeline (cache / scanners / rule packs / similarity / web routes / whale watcher / download / verify / IPFS extraction). |
 
 ## Architecture
 
@@ -55,18 +55,16 @@ flowchart TB
         SrcDir[sources/]
         Registry[(contract_registry.db<br/>+ scanned_blocks · vuln_tags)]
         VectorDB[(.similarity_db<br/>ChromaDB · GraphCodeBERT)]
-        AuditCache[(.audit_cache.db<br/>incremental re-audit)]
     end
 
-    subgraph Analyze["🔬 Analyze"]
-        Audit["audit_contracts.py<br/>OpenAI · Claude · Gemini<br/>concurrency · streaming · cache"]
+    subgraph Analyze["🔬 Data / oracle (agent analyzes)"]
+        State["onchain_state.py<br/>owner · pause · storage · $-at-risk"]
         Sim["similarity.py<br/>length-weighted chunks"]
         Scan["scanners.py<br/>pluggable regex registry · Slither · Mythril"]
-        Render["report_renderer.py<br/>Markdown → styled HTML"]
+        MCP["scryer_mcp.py<br/>MCP tools → agent"]
     end
 
     subgraph Output["📊 Output"]
-        Reports[audit_reports/]
         WebUI["web.py · Flask<br/>Jinja templates · debug gated"]
         Foundry[tests/*.t.sol]
     end
@@ -83,9 +81,6 @@ flowchart TB
     Acquire --> Registry
     Decompiler -->|bytecode-only| SrcDir
     SrcDir --> Analyze
-    Audit <-->|cache hit / set| AuditCache
-    Audit --> Render
-    Render --> Reports
     Sim --> VectorDB
     Registry --> WebUI
     VectorDB --> WebUI
@@ -126,7 +121,7 @@ On Windows the test harness in this repo runs forge via WSL — see [`tests/`](t
 cp .env.example .env
 ```
 
-Minimal: `OPENAI_API_KEY` for audits, plus at least one explorer API key (`BSCSCAN_API_KEY`, `ETHERSCAN_API_KEY`, …) for the chains you target. Full key list lives in [.env.example](.env.example).
+Minimal: one **Etherscan V2** key (`ETHERSCAN_API_KEY`) — a single key covers all chains via the V2 unified endpoint, so no per-chain explorer keys are needed. Add `ALCHEMY_KEY` (or any RPC) for on-chain state reads. **No LLM keys required** — analysis is done by the connecting agent, not by scryer. Full list in [.env.example](.env.example).
 
 ---
 
@@ -162,91 +157,38 @@ python rpc_contract_discovery.py --chains 56,137,42161
 
 Source-less contracts get decompiled (Heimdall first, Panoramix fallback) and saved to `sources/` with a header marker.
 
-### Bounty pipeline (download + audit a target list)
+### Analysis = the agent's job
 
-```bash
-python bounty_pipeline.py --targets targets.json
-python bounty_pipeline.py --targets targets.json --download-only
-python bounty_pipeline.py --targets targets.json --slither --model gpt-4.1
-python bounty_pipeline.py --targets targets.json \
-  --regex-rules rules/unprotected_withdraw.json \
-  --source-verify strict \
-  --slither
-```
+scryer no longer ships an LLM audit pipeline. Fetch verified source (above),
+then let an AI agent (e.g. a `hunter` agent over the MCP server) read it and do
+the vulnerability reasoning. scryer provides ground truth — source, verification,
+on-chain state, clone relationships — not verdicts.
 
-Target schema in [targets.example.json](targets.example.json). The pipeline
-forwards `--regex-rules`, `--source-verify`, `--slither`, `--model`,
-`--rpm`, and `--force-map-reduce` to the underlying
-[`audit_contracts.py`](audit_contracts.py) subprocess.
+### Regex rule packs
 
-### LLM audit
+The default SWC-style regex set lives in [scanners.py](scanners.py); layer your
+own with `load_rules_from_file`. [`rules/unprotected_withdraw.json`](rules/unprotected_withdraw.json)
+ships as an example pack (public-withdraw / batch-distribute bug class).
 
-```bash
-python audit_contracts.py                       # default OpenAI
-python audit_contracts.py --provider claude     # Sonnet 4.6 default
-python audit_contracts.py --provider gemini     # 2.5-flash default
-python audit_contracts.py --max-chunk-chars 50000   # force map-reduce
-python audit_contracts.py --html                # Markdown + HTML output
-```
+Rule schema: `[{rule_id, severity, title, pattern, flags?, match_in?}, ...]`.
+`run_regex_scan(files, rules=...)` in [scanners.py](scanners.py) consumes them
+(the rule packs are also used by the whale-watcher scan summary).
 
-#### Custom regex rule packs
+### Source verification
 
-The default regex set in [scanners.py](scanners.py) covers SWC-style
-patterns. Layer your own rule files on top with `--regex-rules`
-(repeatable). [`rules/unprotected_withdraw.json`](rules/unprotected_withdraw.json)
-ships as an example pack targeting the public-withdraw / batch-distribute
-bug class behind the 2026 yieldcore drain.
-
-```bash
-python audit_contracts.py --regex-rules rules/unprotected_withdraw.json
-python audit_contracts.py --regex-rules rules/a.json --regex-rules rules/b.json
-```
-
-Rule schema: `[{rule_id, severity, title, pattern, flags?}, ...]`. See
-[`rules/unprotected_withdraw.json`](rules/unprotected_withdraw.json) for a
-concrete example. Custom rules are appended to the built-in defaults; pass
-`--disable-regex-scan` to skip the regex pass entirely.
-
-#### Local source verification (`--source-verify`)
-
-Re-compile the downloaded source with the metadata-recorded compiler and
-compare to `eth_getCode` to confirm the explorer's "verified" claim is
-genuine. Removes Sourcify / Etherscan / Blockscout from your trust chain.
-Requires a matching `solc` on `$PATH` (or via [solc-select](https://github.com/crytic/solc-select)).
-
-```bash
-python audit_contracts.py --source-verify off       # skip (default)
-python audit_contracts.py --source-verify warn      # log verdict, proceed regardless
-python audit_contracts.py --source-verify strict    # mismatch aborts that group
-```
-
-Verdicts: `full_match` / `partial_match` (runtime identical except metadata
-trailer) / `mismatch` / `no_solc` / `no_bytecode`. Strict mode records
-aborted groups in `manifest.aborted_groups` so they're visible rather than
-silently dropped. Results are cached in `.verify_cache.db`; pass
-`--no-verify-cache` to always re-verify. Standalone CLI also exists:
+Re-compile the downloaded source with the metadata-recorded compiler and compare
+to `eth_getCode` to confirm the explorer's "verified" claim is genuine (removes
+Sourcify / Etherscan / Blockscout from your trust chain). Requires a matching
+`solc` on `$PATH` (or via [solc-select](https://github.com/crytic/solc-select)).
 
 ```bash
 python verify_source.py --chain-id 1 --address 0xAC85eF...95f2e
 ```
 
-#### Auto-continue on truncated LLM output
-
-Sonnet/Opus often produce thorough reports that exceed `--max-output-tokens`
-mid-JSON, breaking the parse and discarding everything the model wrote. The
-audit pipeline detects truncation (provider-aware: OpenAI `finish_reason`,
-Anthropic `stop_reason`, Gemini `finishReason`) and transparently calls the
-provider's continuation API to extend the response, concatenating until the
-JSON is complete or the cap is hit.
-
-```bash
-python audit_contracts.py --auto-continue-attempts 3   # default
-python audit_contracts.py --auto-continue-attempts 0   # disable
-```
-
-Each continuation re-sends the prompt + prior partial, so cost scales
-roughly linearly with attempts triggered. Stream mode (`--stream`) doesn't
-support auto-continue (no truncation signal mid-stream).
+Verdicts: `full_match` / `partial_match` (runtime identical except metadata
+trailer) / `mismatch` / `indeterminate` (couldn't compile/compare — not a
+mismatch) / `no_solc` / `no_bytecode`. Cached in `.verify_cache.db`. Also exposed
+as the `verify_source` MCP tool.
 
 ### Similarity search
 
@@ -310,9 +252,8 @@ The bundled [`TxSimulation.t.sol`](tests/TxSimulation.t.sol) reproduces a real B
 ├── contract_registry.py        # SQLite contract metadata registry
 ├── data_sources.py             # Blockscout / on-chain / BigQuery integrations
 ├── decompilers.py              # Heimdall / Panoramix bytecode decompilation
-├── bounty_pipeline.py          # download + audit a JSON target list
-├── audit_contracts.py          # AI-powered audit pipeline (map-reduce)
-├── llm_providers.py            # OpenAI / Claude / Gemini abstraction
+├── onchain_state.py            # live on-chain reads (owner/pause/storage/$-at-risk)
+├── scryer_mcp.py               # MCP server (fetch/verify/state/relate) for an AI agent
 ├── similarity.py               # GraphCodeBERT embedding + ChromaDB
 ├── similarity_cli.py           # Similarity search CLI
 ├── scanners.py                 # Regex + Slither vulnerability scanner
@@ -324,12 +265,9 @@ The bundled [`TxSimulation.t.sol`](tests/TxSimulation.t.sol) reproduces a real B
 │   ├── TxSimulation.t.sol      # MARS staking sync drain PoC (passes)
 │   ├── MpcPoc.t.sol            # PoC scaffold
 │   └── exp.t.sol               # Exploit PoC templates
-├── prompts/                    # LLM prompt templates (audit / map / reduce)
 ├── foundry.toml                # Foundry config
 │
 ├── sources/                    # Downloaded contract sources       (gitignored)
-├── audit_reports/              # Generated audit reports           (gitignored)
-├── runs/                       # bounty_pipeline.py run dirs       (gitignored)
 ├── decompiled/                 # Bytecode / disasm / decompiled.sol (gitignored)
 ├── .contract_registry.db       # SQLite registry                   (gitignored)
 └── .similarity_db/             # ChromaDB vector database          (gitignored)
@@ -352,17 +290,19 @@ The bundled [`TxSimulation.t.sol`](tests/TxSimulation.t.sol) reproduces a real B
 
 ---
 
-## LLM Providers
+## MCP server
 
-Switchable via `--provider` flag on [audit_contracts.py](audit_contracts.py); defaults set in [llm_providers.py](llm_providers.py):
+[`scryer_mcp.py`](scryer_mcp.py) exposes scryer as an MCP server (stdio) so an AI
+agent drives it and does the analysis itself. Tools: `health`, `download_contract`
+(proxy-aware, auto-registers to the corpus), `verify_source`, `get_state`,
+`read_storage`, `token_exposure`, `registry_clones`, `registry_tag_vulnerability`,
+`registry_vulnerable`. No LLM keys — the connecting agent is the analyst.
 
-| Provider | Default model | Env key |
-|----------|---------------|---------|
-| OpenAI | `gpt-4.1-mini` | `OPENAI_API_KEY` |
-| Anthropic | `claude-sonnet-4-6` | `ANTHROPIC_API_KEY` |
-| Google | `gemini-2.5-flash` | `GOOGLE_API_KEY` / `GEMINI_API_KEY` |
+```bash
+claude mcp add scryer -s user -- /path/to/.venv/bin/python /path/to/scryer_mcp.py
+```
 
-For codebases > 200K chars the audit pipeline auto-switches to map-reduce: each file is summarized via `prompts/solidity_map_prompt.txt` then merged via `solidity_reduce_prompt.txt`.
+Requires `mcp` pinned `<2` in the server's venv (FastMCP v1 API).
 
 ---
 
