@@ -19,6 +19,72 @@ import verify_source as vs
 # ---------------------------------------------------------------------------
 
 
+def test_coerce_settings_normalizes_string_optimizer() -> None:
+    s = vs._coerce_settings({"optimizer": {"enabled": "1", "runs": "200"}, "evmVersion": "london"})
+    assert s["optimizer"]["enabled"] is True and s["optimizer"]["runs"] == 200
+    assert s["evmVersion"] == "london"
+    s2 = vs._coerce_settings({"optimizer": {"enabled": "0", "runs": "bad"}})
+    assert s2["optimizer"]["enabled"] is False and "runs" not in s2["optimizer"]
+    # Already-correct types pass through unchanged.
+    assert vs._coerce_settings({"optimizer": {"enabled": True, "runs": 1}})["optimizer"] == {"enabled": True, "runs": 1}
+
+
+def _no_target_meta(contract_name: str = "Bar") -> bytes:
+    return json.dumps(
+        {
+            "metadata": {
+                "compiler": {"version": "0.8.20"},
+                "settings": {},  # NO compilationTarget — the flattened/legacy case
+                "sources": {"Flat.sol": {"content": "pragma solidity ^0.8.0; contract X {}"}},
+                "contract": {"contract_name": contract_name},
+            }
+        }
+    ).encode()
+
+
+def test_verify_no_target_compile_all_recovers_match(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """No compilationTarget -> compile ALL contracts and match on-chain bytecode, recovering the
+    deployed contract instead of bailing to indeterminate (the fix for flattened/legacy source)."""
+    foo = vs.CompiledArtifact(bytecode_hex="60800bad", immutable_ranges=[])
+    bar = vs.CompiledArtifact(bytecode_hex="6080deadbeef", immutable_ranges=[])
+    monkeypatch.setattr(vs, "compile_all_runtime_bytecode", lambda *a, **k: {"Flat.sol:Foo": foo, "Flat.sol:Bar": bar})
+    monkeypatch.setattr(vs, "fetch_runtime_bytecode", lambda rpc, addr: "6080deadbeef")  # == Bar
+
+    r = vs._verify_contract_uncached(
+        chain_id=1, address_lower="0x" + "11" * 20, meta_bytes=_no_target_meta("Bar"),
+        sources_dir=tmp_path, rpc_url="http://x", solc_path=Path("solc"),
+    )
+    assert r.verdict == "full_match"
+    assert any("Bar" in n and "recovered" in n for n in r.notes)
+
+
+def test_verify_no_target_recovers_by_bytecode_even_if_hint_absent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    foo = vs.CompiledArtifact(bytecode_hex="60800bad", immutable_ranges=[])
+    bar = vs.CompiledArtifact(bytecode_hex="6080deadbeef", immutable_ranges=[])
+    monkeypatch.setattr(vs, "compile_all_runtime_bytecode", lambda *a, **k: {"Flat.sol:Foo": foo, "Flat.sol:Bar": bar})
+    monkeypatch.setattr(vs, "fetch_runtime_bytecode", lambda rpc, addr: "60800bad")  # == Foo (not the hint "Bar")
+
+    r = vs._verify_contract_uncached(
+        chain_id=1, address_lower="0x" + "11" * 20, meta_bytes=_no_target_meta("Bar"),
+        sources_dir=tmp_path, rpc_url="http://x", solc_path=Path("solc"),
+    )
+    assert r.verdict == "full_match" and any("Foo" in n for n in r.notes)  # matched by bytecode, not the hint
+
+
+def test_verify_no_target_none_match_is_indeterminate_not_mismatch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    foo = vs.CompiledArtifact(bytecode_hex="60800bad", immutable_ranges=[])
+    bar = vs.CompiledArtifact(bytecode_hex="6080deadbeef", immutable_ranges=[])
+    monkeypatch.setattr(vs, "compile_all_runtime_bytecode", lambda *a, **k: {"Flat.sol:Foo": foo, "Flat.sol:Bar": bar})
+    monkeypatch.setattr(vs, "fetch_runtime_bytecode", lambda rpc, addr: "6080ffffffff")  # matches neither
+
+    r = vs._verify_contract_uncached(
+        chain_id=1, address_lower="0x" + "11" * 20, meta_bytes=_no_target_meta(),
+        sources_dir=tmp_path, rpc_url="http://x", solc_path=Path("solc"),
+    )
+    assert r.verdict == "indeterminate"  # NOT mismatch — we were guessing the target
+    assert any("none matched" in n for n in r.notes)
+
+
 def _make_bytecode_with_trailer(runtime_hex: str, meta_blob_bytes: int) -> str:
     """Build hex: <runtime> + <meta_blob> + <2-byte length>."""
     meta_blob = "ab" * meta_blob_bytes  # arbitrary

@@ -530,6 +530,7 @@ def get_bscscan_source(chain_id: int, address: str, tally: RateLimitTally | None
 
         source_code_str = source_code_raw.strip()
         sources = {}
+        std_settings: dict = {}  # solc standard-json settings (optimizer/evmVersion/libraries/remappings)
 
         # 多文件：常見格式是 {{ ...json... }}（外面多包一層大括號）
         if source_code_str.startswith("{{") and source_code_str.endswith("}}") and len(source_code_str) >= 4:
@@ -542,6 +543,8 @@ def get_bscscan_source(chain_id: int, address: str, tally: RateLimitTally | None
                         for path, data in parsed["sources"].items()
                         if isinstance(data, dict) and isinstance(data.get("content"), str)
                     }
+                    if isinstance(parsed.get("settings"), dict):
+                        std_settings = parsed["settings"]  # keep the REAL compiler settings for verify
             except Exception:
                 pass
         elif source_code_str.startswith("{") and source_code_str.endswith("}"):
@@ -553,6 +556,8 @@ def get_bscscan_source(chain_id: int, address: str, tally: RateLimitTally | None
                         for path, data in parsed["sources"].items()
                         if isinstance(data, dict) and isinstance(data.get("content"), str)
                     }
+                    if isinstance(parsed.get("settings"), dict):
+                        std_settings = parsed["settings"]
             except Exception:
                 pass
 
@@ -565,16 +570,37 @@ def get_bscscan_source(chain_id: int, address: str, tally: RateLimitTally | None
         if not any((content or "").strip() for content in sources.values()):
             return None, None, f"contract not verified on {label} (empty SourceCode)"
 
+        contract_name = result.get("ContractName", "")
+        # Build solc settings verify_source can actually recompile with. Prefer the standard-json
+        # settings Etherscan embedded for a multi-file source (authoritative optimizer/evmVersion/
+        # libraries/remappings); else synthesize from the flat getsourcecode fields, COERCING types
+        # (Etherscan returns strings; solc standard-json wants bool/int).
+        if std_settings:
+            settings = dict(std_settings)
+        else:
+            opt_used = str(result.get("OptimizationUsed", "")).strip().lower()
+            try:
+                runs = int(result.get("Runs") or 200)
+            except (TypeError, ValueError):
+                runs = 200
+            settings = {"optimizer": {"enabled": opt_used in ("1", "true", "yes"), "runs": runs}}
+            evm = str(result.get("EVMVersion", "")).strip()
+            if evm and evm.lower() != "default":
+                settings["evmVersion"] = evm
+        # A standard-json input has no compilationTarget; synthesize one for the flattened single
+        # file (we know it). For multi-file we leave it out -> verify_source's compile-all +
+        # match-any recovers the deployed contract by bytecode match.
+        if not settings.get("compilationTarget") and contract_name and len(sources) == 1:
+            settings["compilationTarget"] = {next(iter(sources)): contract_name}
+
         metadata = {
             "compiler": {"version": result.get("CompilerVersion", "")},
-            "settings": {
-                "optimizer": {
-                    "enabled": result.get("OptimizationUsed", ""),
-                    "runs": result.get("Runs", ""),
-                }
-            },
+            "settings": settings,
+            # Logical source paths so verify_source can reload them from disk and resolve imports
+            # (keys only — content is already on disk; avoids bloating download_meta.json).
+            "sources": {path: {} for path in sources},
             "contract": {
-                "contract_name": result.get("ContractName", ""),
+                "contract_name": contract_name,
                 "implementation": result.get("Implementation", ""),
                 "proxy": result.get("Proxy", ""),
             },

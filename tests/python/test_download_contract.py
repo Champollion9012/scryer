@@ -79,6 +79,75 @@ def test_sourcify_unverified_returns_failure_without_match_type() -> None:
     assert "Not verified" in msg
 
 
+def test_bscscan_flattened_metadata_is_verify_ready() -> None:
+    """A flattened Etherscan source must yield metadata verify_source can recompile: a synthesized
+    compilationTarget (from ContractName), optimizer coerced to bool/int, and logical source keys."""
+    src = "// SPDX-License-Identifier: MIT\npragma solidity 0.8.20;\ncontract Token { uint256 x; }"
+    etherscan = {
+        "status": "1",
+        "message": "OK",
+        "result": [
+            {
+                "SourceCode": src,
+                "ContractName": "Token",
+                "CompilerVersion": "v0.8.20+commit.a1b2c3d4",
+                "OptimizationUsed": "1",
+                "Runs": "200",
+                "EVMVersion": "london",
+                "Implementation": "",
+                "Proxy": "0",
+            }
+        ],
+    }
+
+    def _fake_get(url: str, params: dict | None = None, **kwargs):
+        return _FakeResp(text=json.dumps(etherscan))
+
+    with patch.object(dc, "BSC_SCAN_API_KEY", "DUMMY"), patch.object(dc.HTTP, "get", side_effect=_fake_get):
+        sources, metadata, msg = dc.get_bscscan_source(1, "0xabc")
+
+    assert sources == {"combined_source.sol": src}
+    s = metadata["settings"]
+    assert s["compilationTarget"] == {"combined_source.sol": "Token"}  # synthesized from ContractName
+    assert s["optimizer"] == {"enabled": True, "runs": 200}  # coerced from the "1"/"200" strings
+    assert s["evmVersion"] == "london"
+    assert metadata["sources"] == {"combined_source.sol": {}}  # logical path for disk reload
+    assert metadata["compiler"]["version"] == "v0.8.20+commit.a1b2c3d4"
+
+
+def test_bscscan_multifile_keeps_real_settings_and_no_synthetic_target() -> None:
+    std = {
+        "language": "Solidity",
+        "sources": {"A.sol": {"content": "contract A{}"}, "B.sol": {"content": "contract B{}"}},
+        "settings": {"optimizer": {"enabled": True, "runs": 999}, "evmVersion": "paris"},
+    }
+    etherscan = {
+        "status": "1",
+        "result": [
+            {
+                "SourceCode": "{" + json.dumps(std) + "}",  # Etherscan wraps standard-json in {{ }}
+                "ContractName": "A",
+                "CompilerVersion": "v0.8.20",
+                "OptimizationUsed": "1",
+                "Runs": "999",
+                "EVMVersion": "paris",
+            }
+        ],
+    }
+
+    def _fake_get(url: str, params: dict | None = None, **kwargs):
+        return _FakeResp(text=json.dumps(etherscan))
+
+    with patch.object(dc, "BSC_SCAN_API_KEY", "DUMMY"), patch.object(dc.HTTP, "get", side_effect=_fake_get):
+        sources, metadata, msg = dc.get_bscscan_source(1, "0xabc")
+
+    assert set(sources) == {"A.sol", "B.sol"}
+    s = metadata["settings"]
+    assert s["optimizer"] == {"enabled": True, "runs": 999} and s["evmVersion"] == "paris"  # REAL settings kept
+    assert "compilationTarget" not in s  # multi-file -> left for verify's compile-all + match-any
+    assert set(metadata["sources"]) == {"A.sol", "B.sol"}
+
+
 # ---------------------------------------------------------------------------
 # Decompile fallback: when no verified source exists, try heimdall/panoramix
 # ---------------------------------------------------------------------------

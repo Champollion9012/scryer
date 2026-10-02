@@ -354,37 +354,45 @@ def zero_immutable_ranges(bytecode_hex: str, ranges: list[tuple[int, int]]) -> s
     return "".join(chars)
 
 
-def compile_runtime_bytecode(
-    sources: dict[str, str],
-    settings: dict,
-    *,
-    target_file: str,
-    target_contract: str,
-    solc_path: Path,
-    timeout_s: int = 120,
-) -> CompiledArtifact:
-    """Compile via ``solc --standard-json`` and return runtime + immutable refs.
+def _coerce_settings(settings: dict) -> dict:
+    """Make a metadata ``settings`` dict solc-safe.
 
-    ``settings`` should mirror what was in the metadata (optimizer, evmVersion,
-    libraries, remappings); ``outputSelection`` is overridden to ensure
-    ``deployedBytecode`` (and its ``immutableReferences``) is emitted so
-    callers can mask immutable byte ranges before comparing to deployed code.
+    Etherscan/legacy exports often store the optimizer as strings ("1"/"0"/"200"); solc
+    standard-json wants bool/int. Returns a shallow copy (original untouched)."""
+    s = dict(settings or {})
+    opt = s.get("optimizer")
+    if isinstance(opt, dict):
+        opt = dict(opt)
+        if isinstance(opt.get("enabled"), str):
+            opt["enabled"] = opt["enabled"].strip().lower() in ("1", "true", "yes")
+        if isinstance(opt.get("runs"), str):
+            try:
+                opt["runs"] = int(opt["runs"])
+            except ValueError:
+                opt.pop("runs", None)
+        s["optimizer"] = opt
+    return s
+
+
+def _solc_compile(sources: dict[str, str], settings: dict, *, solc_path: Path, timeout_s: int = 120) -> dict:
+    """Run ``solc --standard-json`` for deployedBytecode; return the ``contracts`` map
+    ({file: {Contract: {...}}}). Raises RuntimeError on a solc/compile error.
+
+    ``settings`` mirrors the metadata (optimizer, evmVersion, libraries, remappings);
+    ``compilationTarget``/``outputSelection`` are stripped (the former is a Sourcify
+    breadcrumb, not a compiler setting) and outputSelection is set so deployedBytecode +
+    immutableReferences are emitted for every contract.
     """
-    # Strip metadata-only keys solc's standard-json rejects (compilationTarget
-    # is a Sourcify breadcrumb, not a compiler setting). Override outputSelection
-    # to make sure deployedBytecode + immutableReferences are emitted.
     _SETTINGS_BLOCKLIST = {"compilationTarget", "outputSelection"}
-    full_settings = {k: v for k, v in settings.items() if k not in _SETTINGS_BLOCKLIST}
+    full_settings = {k: v for k, v in _coerce_settings(settings).items() if k not in _SETTINGS_BLOCKLIST}
     full_settings["outputSelection"] = {
         "*": {"*": ["evm.deployedBytecode.object", "evm.deployedBytecode.immutableReferences"]}
     }
-
     standard_input = {
         "language": "Solidity",
         "sources": {p: {"content": c} for p, c in sources.items()},
         "settings": full_settings,
     }
-
     proc = subprocess.run(
         [str(solc_path), "--standard-json"],
         input=json.dumps(standard_input),
@@ -398,22 +406,56 @@ def compile_runtime_bytecode(
         out = json.loads(proc.stdout)
     except json.JSONDecodeError as e:
         raise RuntimeError(f"solc output not JSON: {e}; stdout={proc.stdout[:200]}") from e
-
     errors = [e for e in out.get("errors", []) if e.get("severity") == "error"]
     if errors:
         msg = "; ".join(e.get("formattedMessage", str(e))[:200] for e in errors)
         raise RuntimeError(f"solc errors: {msg}")
+    return out.get("contracts", {}) or {}
 
-    contracts = out.get("contracts", {}) or {}
-    file_out = contracts.get(target_file) or {}
-    contract_out = file_out.get(target_contract) or {}
+
+def _artifact_from(contract_out: dict) -> CompiledArtifact | None:
     deployed_obj = (contract_out.get("evm") or {}).get("deployedBytecode") or {}
     deployed = deployed_obj.get("object", "") or ""
     if not deployed:
+        return None
+    return CompiledArtifact(
+        bytecode_hex=deployed.lower(), immutable_ranges=_flatten_immutable_refs(deployed_obj.get("immutableReferences"))
+    )
+
+
+def compile_runtime_bytecode(
+    sources: dict[str, str],
+    settings: dict,
+    *,
+    target_file: str,
+    target_contract: str,
+    solc_path: Path,
+    timeout_s: int = 120,
+) -> CompiledArtifact:
+    """Compile one known target -> its runtime bytecode + immutable refs."""
+    contracts = _solc_compile(sources, settings, solc_path=solc_path, timeout_s=timeout_s)
+    art = _artifact_from((contracts.get(target_file) or {}).get(target_contract) or {})
+    if art is None:
         available = [f"{f}:{c}" for f, cs in contracts.items() for c in (cs or {})]
         raise RuntimeError(f"no deployedBytecode for {target_file}:{target_contract}; available={available}")
-    immutables = _flatten_immutable_refs(deployed_obj.get("immutableReferences"))
-    return CompiledArtifact(bytecode_hex=deployed.lower(), immutable_ranges=immutables)
+    return art
+
+
+def compile_all_runtime_bytecode(
+    sources: dict[str, str], settings: dict, *, solc_path: Path, timeout_s: int = 120
+) -> dict[str, CompiledArtifact]:
+    """Compile and return EVERY contract's runtime bytecode, keyed ``"file:Contract"``.
+
+    Used when no compilationTarget is known (flattened / legacy / Etherscan single-file export):
+    the caller compares each against on-chain bytecode to recover the deployed contract."""
+    contracts = _solc_compile(sources, settings, solc_path=solc_path, timeout_s=timeout_s)
+    out: dict[str, CompiledArtifact] = {}
+    for f, cs in contracts.items():
+        for cname, cout in (cs or {}).items():
+            art = _artifact_from(cout or {})
+            if art is not None:
+                out[f"{f}:{cname}"] = art
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -561,134 +603,12 @@ def verify_contract(
     return result
 
 
-def _verify_contract_uncached(
-    *,
-    chain_id: int,
-    address_lower: str,
-    meta_bytes: bytes,
-    sources_dir: Path,
-    rpc_url: str | None,
-    solc_path: Path | None,
-) -> VerifyResult:
-    """Inner: parse meta, compile, fetch, compare. No cache awareness."""
-    meta = json.loads(meta_bytes.decode("utf-8"))
-    embedded_meta = meta.get("metadata") or {}
-    compiler_version = (embedded_meta.get("compiler") or {}).get("version") or embedded_meta.get("compilerVersion")
-    settings = embedded_meta.get("settings") or {}
-    target_map = settings.get("compilationTarget") or {}
-    if not target_map:
-        return VerifyResult(
-            verdict="indeterminate",
-            chain_id=chain_id,
-            address=address_lower,
-            compiler_version=compiler_version,
-            notes=[
-                "metadata.settings.compilationTarget missing (legacy single-file/flattened export) "
-                "— cannot pick a contract to compile, so verification was skipped. This is NOT a mismatch.",
-            ],
-        )
-    target_file, target_contract = next(iter(target_map.items()))
-
-    # Sources: prefer inline content from metadata; fall back to disk.
-    sources: dict[str, str] = {}
-    for path, info in (embedded_meta.get("sources") or {}).items():
-        if isinstance(info, dict) and isinstance(info.get("content"), str):
-            sources[path] = info["content"]
-    if not sources:
-        logical = list((embedded_meta.get("sources") or {}).keys()) or [target_file]
-        sources = _load_sources_from_disk(
-            chain_id=chain_id, address=address_lower, sources_dir=sources_dir, logical_paths=logical
-        )
-    if not sources:
-        return VerifyResult(
-            verdict="indeterminate",
-            chain_id=chain_id,
-            address=address_lower,
-            compiler_version=compiler_version,
-            notes=["no source files found (neither inline nor on disk) — verification skipped, not a mismatch"],
-        )
-
-    if solc_path is None:
-        solc_path = find_solc(compiler_version)
-    if solc_path is None:
-        short = _normalize_version(compiler_version)
-        return VerifyResult(
-            verdict="no_solc",
-            chain_id=chain_id,
-            address=address_lower,
-            compiler_version=compiler_version,
-            notes=[
-                "solc not found (checked $SOLC_PATH, ~/.svm, $PATH)",
-                f"install: solc-select install {short}" if short else "install: solc-select install <version>",
-            ],
-        )
-
-    # Compile
-    try:
-        artifact = compile_runtime_bytecode(
-            sources,
-            settings,
-            target_file=target_file,
-            target_contract=target_contract,
-            solc_path=solc_path,
-        )
-        compiled = artifact.bytecode_hex
-        immutable_ranges = artifact.immutable_ranges
-    except Exception as e:
-        return VerifyResult(
-            verdict="indeterminate",
-            chain_id=chain_id,
-            address=address_lower,
-            compiler_version=compiler_version,
-            notes=[f"compile failed: {e} — verification could not complete, not a mismatch"],
-        )
-
-    # Fetch on-chain
-    if rpc_url is None:
-        rpc_url = _default_rpc_for(chain_id)
-    if not rpc_url:
-        return VerifyResult(
-            verdict="no_bytecode",
-            chain_id=chain_id,
-            address=address_lower,
-            compiler_version=compiler_version,
-            notes=[f"no RPC URL for chain {chain_id}"],
-        )
-    try:
-        on_chain = fetch_runtime_bytecode(rpc_url, address_lower)
-    except RateLimited as e:
-        # A throttle is NOT a verdict on the code. Never report no_bytecode
-        # ('EOA/selfdestructed') for it — return indeterminate so the agent retries.
-        # indeterminate is not in _CACHEABLE_VERDICTS, so a throttle is never cached.
-        return VerifyResult(
-            verdict="indeterminate",
-            chain_id=chain_id,
-            address=address_lower,
-            compiler_version=compiler_version,
-            notes=[f"on-chain bytecode fetch rate-limited: {e.reason} — retry; NOT a verdict on the code"],
-            rate_limited=True,
-            retry_after=e.retry_after,
-        )
-    except Exception as e:
-        return VerifyResult(
-            verdict="no_bytecode",
-            chain_id=chain_id,
-            address=address_lower,
-            compiler_version=compiler_version,
-            notes=[f"eth_getCode failed: {e}"],
-        )
-    if not on_chain:
-        return VerifyResult(
-            verdict="no_bytecode",
-            chain_id=chain_id,
-            address=address_lower,
-            compiler_version=compiler_version,
-            notes=["empty bytecode (EOA or selfdestructed?)"],
-        )
-
-    # Mask immutables before comparing — they're filled in at construction
-    # time from constructor args, so the recompiled deployedBytecode has
-    # placeholder zeros there while on-chain has the real values.
+def _compare(on_chain: str, artifact: CompiledArtifact) -> tuple[VerifyVerdict, list[str], dict]:
+    """Compare on-chain runtime bytecode to a compiled artifact (mask immutables, strip the
+    metadata trailer). Returns (verdict, notes, result_fields) where result_fields slot
+    straight into VerifyResult."""
+    compiled = artifact.bytecode_hex
+    immutable_ranges = artifact.immutable_ranges
     notes: list[str] = []
     if immutable_ranges:
         on_chain_cmp = zero_immutable_ranges(on_chain, immutable_ranges)
@@ -720,17 +640,141 @@ def _verify_contract_uncached(
                 f"runtime sizes differ: on-chain={len(on_chain_no_meta) // 2} compiled={len(compiled_no_meta) // 2}"
             )
 
-    return VerifyResult(
-        verdict=verdict,
-        chain_id=chain_id,
-        address=address_lower,
-        compiler_version=compiler_version,
-        on_chain_size=len(on_chain) // 2,
-        compiled_size=len(compiled) // 2,
-        on_chain_no_meta_prefix=on_chain_no_meta[:64],
-        compiled_no_meta_prefix=compiled_no_meta[:64],
-        notes=notes,
-        immutables_zeroed=len(immutable_ranges),
+    fields = {
+        "on_chain_size": len(on_chain) // 2,
+        "compiled_size": len(compiled) // 2,
+        "on_chain_no_meta_prefix": on_chain_no_meta[:64],
+        "compiled_no_meta_prefix": compiled_no_meta[:64],
+        "immutables_zeroed": len(immutable_ranges),
+    }
+    return verdict, notes, fields
+
+
+def _verify_contract_uncached(
+    *,
+    chain_id: int,
+    address_lower: str,
+    meta_bytes: bytes,
+    sources_dir: Path,
+    rpc_url: str | None,
+    solc_path: Path | None,
+) -> VerifyResult:
+    """Inner: parse meta, compile, fetch, compare. No cache awareness.
+
+    When metadata carries a ``compilationTarget`` we compile just that contract. When it does
+    not (flattened / legacy / Etherscan single-file export), we compile EVERY contract and
+    match each against on-chain bytecode — recovering the deployed contract instead of bailing
+    to ``indeterminate``.
+    """
+    meta = json.loads(meta_bytes.decode("utf-8"))
+    embedded_meta = meta.get("metadata") or {}
+    compiler_version = (embedded_meta.get("compiler") or {}).get("version") or embedded_meta.get("compilerVersion")
+    settings = embedded_meta.get("settings") or {}
+    target_map = settings.get("compilationTarget") or {}
+    contract_hint = (embedded_meta.get("contract") or {}).get("contract_name") or ""
+
+    def _result(verdict: VerifyVerdict, notes: list[str], fields: dict | None = None, **extra) -> VerifyResult:
+        return VerifyResult(
+            verdict=verdict,
+            chain_id=chain_id,
+            address=address_lower,
+            compiler_version=compiler_version,
+            notes=notes,
+            **(fields or {}),
+            **extra,
+        )
+
+    # Sources: prefer inline content from metadata; fall back to disk by logical path.
+    sources: dict[str, str] = {}
+    for path, info in (embedded_meta.get("sources") or {}).items():
+        if isinstance(info, dict) and isinstance(info.get("content"), str):
+            sources[path] = info["content"]
+    if not sources:
+        logical = list((embedded_meta.get("sources") or {}).keys())
+        if not logical and target_map:
+            logical = [next(iter(target_map))]
+        sources = _load_sources_from_disk(
+            chain_id=chain_id, address=address_lower, sources_dir=sources_dir, logical_paths=logical
+        )
+    if not sources:
+        return _result(
+            "indeterminate", ["no source files found (neither inline nor on disk) — verification skipped, not a mismatch"]
+        )
+
+    if solc_path is None:
+        solc_path = find_solc(compiler_version)
+    if solc_path is None:
+        short = _normalize_version(compiler_version)
+        return _result(
+            "no_solc",
+            [
+                "solc not found (checked $SOLC_PATH, ~/.svm, $PATH)",
+                f"install: solc-select install {short}" if short else "install: solc-select install <version>",
+            ],
+        )
+
+    # Fetch on-chain bytecode (shared by the targeted and compile-all paths).
+    if rpc_url is None:
+        rpc_url = _default_rpc_for(chain_id)
+    if not rpc_url:
+        return _result("no_bytecode", [f"no RPC URL for chain {chain_id}"])
+    try:
+        on_chain = fetch_runtime_bytecode(rpc_url, address_lower)
+    except RateLimited as e:
+        # A throttle is NOT a verdict on the code — indeterminate (not cached), so the agent retries.
+        return _result(
+            "indeterminate",
+            [f"on-chain bytecode fetch rate-limited: {e.reason} — retry; NOT a verdict on the code"],
+            rate_limited=True,
+            retry_after=e.retry_after,
+        )
+    except Exception as e:
+        return _result("no_bytecode", [f"eth_getCode failed: {e}"])
+    if not on_chain:
+        return _result("no_bytecode", ["empty bytecode (EOA or selfdestructed?)"])
+
+    # --- Targeted compile: compilationTarget is known (Sourcify / Etherscan flattened) ---
+    if target_map:
+        target_file, target_contract = next(iter(target_map.items()))
+        try:
+            artifact = compile_runtime_bytecode(
+                sources, settings, target_file=target_file, target_contract=target_contract, solc_path=solc_path
+            )
+        except Exception as e:
+            return _result("indeterminate", [f"compile failed: {e} — verification could not complete, not a mismatch"])
+        verdict, notes, fields = _compare(on_chain, artifact)
+        return _result(verdict, notes, fields)
+
+    # --- No compilationTarget: compile ALL contracts and match ANY against on-chain ---
+    try:
+        candidates = compile_all_runtime_bytecode(sources, settings, solc_path=solc_path)
+    except Exception as e:
+        return _result("indeterminate", [f"compile failed: {e} — verification could not complete, not a mismatch"])
+    if not candidates:
+        return _result("indeterminate", ["no contracts produced deployable bytecode — verification skipped, not a mismatch"])
+
+    # Try the metadata-named contract first; prefer a full match, remember the best partial.
+    ordered = sorted(candidates.items(), key=lambda kv: 0 if kv[0].rsplit(":", 1)[-1] == contract_hint else 1)
+    best_partial: tuple[list[str], dict] | None = None
+    for key, artifact in ordered:
+        verdict, notes, fields = _compare(on_chain, artifact)
+        if verdict == "full_match":
+            notes.insert(0, f"recovered deployed contract {key} by bytecode match (metadata had no compilationTarget)")
+            return _result("full_match", notes, fields)
+        if verdict == "partial_match" and best_partial is None:
+            notes.insert(0, f"recovered deployed contract {key} by runtime match (metadata had no compilationTarget)")
+            best_partial = (notes, fields)
+    if best_partial is not None:
+        notes, fields = best_partial
+        return _result("partial_match", notes, fields)
+
+    tried = ", ".join(list(candidates)[:8]) + (" …" if len(candidates) > 8 else "")
+    return _result(
+        "indeterminate",
+        [
+            f"compiled {len(candidates)} contract(s) [{tried}] but none matched on-chain bytecode — likely a "
+            "different solc version / optimizer setting, or the deployed source differs. NOT a confirmed mismatch."
+        ],
     )
 
 
