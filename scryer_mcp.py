@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Scryer MCP server — a lean DATA / RETRIEVAL layer for AI-driven EVM security analysis.
+"""Scryer MCP server - a lean DATA / RETRIEVAL layer for AI-driven EVM security analysis.
 
 Philosophy: this server does NOT analyze contracts. It does three things the
 connecting agent cannot do for itself: (1) fetch verified source across multiple
@@ -40,6 +40,7 @@ except Exception:
 from mcp.server.fastmcp import FastMCP  # noqa: E402
 
 import download_contract as dc  # noqa: E402
+import onchain_state as oc  # noqa: E402
 import verify_source as vs  # noqa: E402
 from contract_registry import ContractRegistry  # noqa: E402
 
@@ -175,17 +176,17 @@ def download_contract(address: str, chain_id: int = 56, follow_proxy: bool = Tru
     Resolves proxies when follow_proxy=True (default): EIP-1967, EIP-1167 minimal,
     beacon, and legacy zeppelinos slots. Writes .sol files to sources/ and returns
     their on-disk paths + a short preview of each + the source_hash. **Read the full
-    source from the returned paths and analyze it yourself** — this server does not
+    source from the returned paths and analyze it yourself** - this server does not
     scan or audit. Feed the source_hash to registry_clones to find the same code
     deployed elsewhere.
 
-    For a proxy, the top-level `files` are only the proxy shell — the `proxy` field
+    For a proxy, the top-level `files` are only the proxy shell - the `proxy` field
     reports the implementation address and its `implementation_files` (that's the
     real logic to analyze). If a proxy's implementation wasn't auto-fetched, `proxy`
     tells you the address to download.
 
     Returns {found: false} if no verified source exists on any provider (only
-    runtime bytecode is on-chain — you cannot analyze what you can't read).
+    runtime bytecode is on-chain - you cannot analyze what you can't read).
     """
     try:
         ok = dc.fetch_contract_source(
@@ -194,7 +195,7 @@ def download_contract(address: str, chain_id: int = 56, follow_proxy: bool = Tru
         out = _collect_download(chain_id, address)
         out["found"] = bool(ok and out["file_count"] > 0)
         if not out["found"]:
-            out["note"] = "No verified source from any provider — only runtime bytecode exists on-chain."
+            out["note"] = "No verified source from any provider - only runtime bytecode exists on-chain."
         if follow_proxy:
             out["proxy"] = _proxy_block(chain_id, out.get("meta_path"), follow_proxy)
         return out
@@ -211,9 +212,11 @@ def verify_source(chain_id: int, address: str) -> dict:
 
     Run this before trusting the source you're about to analyze. Requires the
     source already downloaded (download_contract) and a matching `solc` on PATH.
-    Verdicts: full_match / partial_match / mismatch / no_solc / no_bytecode.
-    **A `mismatch` means the deployed code is NOT what the source says — treat
-    that as a Critical finding on its own and stop.**
+    Verdicts: full_match / partial_match / mismatch / indeterminate / no_solc /
+    no_bytecode. **A `mismatch` means the deployed code is NOT what the source says
+    - treat that as a Critical finding on its own and stop.** `indeterminate` means
+    verification could not be completed (e.g. legacy flattened source with no
+    compile target) - it is NOT a mismatch, do not treat it as one.
     """
     try:
         r = vs.verify_contract(chain_id, address, cache=vs.VerifyCache())
@@ -233,11 +236,57 @@ def verify_source(chain_id: int, address: str) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# Live on-chain state (ground truth the agent can't derive — grounds exploitability + severity)
+# --------------------------------------------------------------------------- #
+@mcp.tool()
+def get_state(chain_id: int, address: str) -> dict:
+    """Read a contract's LIVE state: owner/admin/pause, proxy implementation, ERC20 meta.
+
+    Source tells you what COULD happen; this tells you what's true NOW. Use it to
+    decide if a bug is actually reachable: is it paused? who is owner/admin (can a
+    privileged path be triggered)? Best-effort eth_call against common getters —
+    only the ones that answer are returned.
+    """
+    try:
+        return oc.get_state(chain_id, address)
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+def read_storage(chain_id: int, address: str, slot: str) -> dict:
+    """Read a raw storage slot (eth_getStorageAt), decoded as uint and address.
+
+    For values no getter exposes: custom/legacy proxy slots, packed flags, a role
+    mapping entry, an uninitialized-vs-set check. `slot` is an int or 0x-hex string.
+    """
+    try:
+        return oc.read_storage(chain_id, address, slot)
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+def token_exposure(chain_id: int, address: str) -> dict:
+    """How much value the contract holds right now — the $-at-risk input to severity.
+
+    Reads native-coin balance + balanceOf for major tokens; sums stablecoins as an
+    approximate USD figure. Turns "theoretical bug" into "N dollars at risk", which
+    is what actually sets a finding's severity. Empty holdings don't prove safety,
+    but real balances quantify impact.
+    """
+    try:
+        return oc.token_exposure(chain_id, address)
+    except Exception as e:
+        return _err(e)
+
+
+# --------------------------------------------------------------------------- #
 # Relate + persist (clone discovery / vuln knowledge base over the local registry)
 # --------------------------------------------------------------------------- #
 @mcp.tool()
 def registry_clones(chain_id: int = 0, address: str = "", source_hash: str = "") -> dict:
-    """Find every address sharing this contract's exact source — by (chain_id, address) OR by source_hash.
+    """Find every address sharing this contract's exact source - by (chain_id, address) OR by source_hash.
 
     A bug confirmed in one contract is confirmed in all its clones, so this sizes
     the blast radius. Pass source_hash (from download_contract) for a direct hash
