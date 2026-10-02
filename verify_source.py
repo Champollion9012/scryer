@@ -492,11 +492,14 @@ def verify_contract(
         meta_path = flat if flat.exists() else tree
 
     if not meta_path.exists():
+        # No meta -> nothing was compiled or compared, so this is NOT a mismatch
+        # (which must mean deployed code != source). Return indeterminate, like the
+        # other no-comparison paths, so callers (and the hunter) don't raise a false Critical.
         return VerifyResult(
-            verdict="mismatch",
+            verdict="indeterminate",
             chain_id=chain_id,
             address=address_lower,
-            notes=[f"download_meta.json not found (looked for {meta_path})"],
+            notes=[f"download_meta.json not found (looked for {meta_path}) - verification skipped, not a mismatch"],
         )
 
     meta_bytes = meta_path.read_bytes()

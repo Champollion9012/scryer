@@ -173,6 +173,19 @@ _RPC_ENV_NAMES: dict[int, list[str]] = {
     8453: ["BASE_URL", "BASE_RPC_URL"],
     42161: ["ARB_URL", "ARBITRUM_RPC_URL", "ARB_RPC_URL"],
     43114: ["AVALANCHE_URL", "AVAX_URL", "AVALANCHE_RPC_URL"],
+    # extended EVM chains
+    59144: ["LINEA_URL", "LINEA_RPC_URL"],
+    534352: ["SCROLL_URL", "SCROLL_RPC_URL"],
+    81457: ["BLAST_URL", "BLAST_RPC_URL"],
+    5000: ["MANTLE_URL", "MANTLE_RPC_URL"],
+    100: ["GNOSIS_URL", "XDAI_URL", "GNOSIS_RPC_URL"],
+    324: ["ZKSYNC_URL", "ZKSYNC_RPC_URL"],
+    1101: ["POLYGON_ZKEVM_URL", "ZKEVM_URL", "POLYGON_ZKEVM_RPC_URL"],
+    204: ["OPBNB_URL", "OPBNB_RPC_URL"],
+    42220: ["CELO_URL", "CELO_RPC_URL"],
+    25: ["CRONOS_URL", "CRONOS_RPC_URL"],
+    1284: ["MOONBEAM_URL", "MOONBEAM_RPC_URL"],
+    1088: ["METIS_URL", "METIS_RPC_URL"],
 }
 
 _PUBLIC_RPC: dict[int, str] = {
@@ -184,6 +197,18 @@ _PUBLIC_RPC: dict[int, str] = {
     8453: "https://mainnet.base.org",
     42161: "https://arb1.arbitrum.io/rpc",
     43114: "https://api.avax.network/ext/bc/C/rpc",
+    59144: "https://rpc.linea.build",
+    534352: "https://rpc.scroll.io",
+    81457: "https://rpc.blast.io",
+    5000: "https://rpc.mantle.xyz",
+    100: "https://rpc.gnosischain.com",
+    324: "https://mainnet.era.zksync.io",
+    1101: "https://zkevm-rpc.com",
+    204: "https://opbnb-mainnet-rpc.bnbchain.org",
+    42220: "https://forno.celo.org",
+    25: "https://evm.cronos.org",
+    1284: "https://rpc.api.moonbeam.network",
+    1088: "https://andromeda.metis.io/?owner=1088",
 }
 
 _RPC_SPLIT = re.compile(r"[,\s]+")
@@ -209,7 +234,14 @@ def get_rpc_urls(chain_id: int) -> list[str]:
     """
     out: list[str] = []
     seen: set[str] = set()
-    for name in [*_RPC_ENV_NAMES.get(chain_id, []), "RPC_URL"]:
+    # RPC_URL is the legacy chain-agnostic default; historically it was the BSC/primary
+    # node (see DEFAULT_RPC_URL in download_contract). It carries no chain binding, so
+    # only honor it for BSC — otherwise a single chain's node leaks into EVERY other
+    # chain's RPC list and causes wrong-chain queries.
+    names = list(_RPC_ENV_NAMES.get(chain_id, []))
+    if chain_id == 56:
+        names.append("RPC_URL")
+    for name in names:
         for u in _split_urls(get(name)):
             if u not in seen:
                 seen.add(u)

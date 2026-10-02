@@ -15,6 +15,7 @@ from web3 import Web3
 
 import scryer_config
 import scryer_http
+from contract_registry import ContractRegistry
 from decompilers import decompile_with_heimdall, decompile_with_panoramix
 from scryer_logging import get_logger
 
@@ -669,6 +670,9 @@ def save_sources(
             "address": address,
             "generated_at": dt.datetime.now(dt.UTC).isoformat(),
             "files_written": written,
+            # source_hash over the ORIGINAL logical paths (matches the crawler's
+            # registry rows); the on-disk flat filenames would hash differently.
+            "source_hash": ContractRegistry.compute_source_hash(sources),
         }
         if extra_metadata:
             meta.update(extra_metadata)
@@ -688,6 +692,9 @@ def save_sources(
             "address": address,
             "generated_at": dt.datetime.now(dt.UTC).isoformat(),
             "files_written": written,
+            # source_hash over the ORIGINAL logical paths (matches the crawler's
+            # registry rows); the on-disk flat filenames would hash differently.
+            "source_hash": ContractRegistry.compute_source_hash(sources),
         }
         if extra_metadata:
             meta.update(extra_metadata)

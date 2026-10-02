@@ -453,9 +453,10 @@ def test_verify_loads_source_from_disk_when_metadata_lacks_inline_content(tmp_pa
     assert "pragma solidity" in payload["sources"]["scripts/1.sol"]["content"]
 
 
-def test_verify_missing_meta_returns_mismatch_with_diagnostic(tmp_path: Path) -> None:
+def test_verify_missing_meta_returns_indeterminate_with_diagnostic(tmp_path: Path) -> None:
+    # No meta -> no compile, no compare -> indeterminate (NOT a false "mismatch").
     result = vs.verify_contract(1, "0x" + "44" * 20, sources_dir=tmp_path, rpc_url="http://stub")
-    assert result.verdict == "mismatch"
+    assert result.verdict == "indeterminate"
     assert any("download_meta.json not found" in n for n in result.notes)
 
 

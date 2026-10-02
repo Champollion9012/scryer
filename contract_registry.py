@@ -112,12 +112,18 @@ class ContractRegistry:
         sources: dict[str, str],
         contract_name: str | None = None,
         compiler_version: str | None = None,
+        source_hash: str | None = None,
     ) -> str:
         """
         Register a contract and return its source hash.
         If address already exists, updates the record.
+
+        Pass ``source_hash`` to register a precomputed hash (e.g. derived from the
+        ORIGINAL logical source paths) instead of recomputing from ``sources`` —
+        needed when ``sources`` is keyed by mangled flat filenames whose sort order,
+        and therefore the content-concatenation hash, differs from the logical keys.
         """
-        source_hash = self.compute_source_hash(sources)
+        source_hash = source_hash or self.compute_source_hash(sources)
         address_lower = address.lower()
         now = _utc_now_iso()
 
