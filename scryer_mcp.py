@@ -18,6 +18,7 @@ so this reuses scryer's existing data stores.
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -108,15 +109,80 @@ def _collect_download(chain_id: int, address: str) -> dict:
     }
 
 
+_PROXY_SCHEMES = (
+    "eip1167_minimal_proxy",
+    "eip1967_implementation_slot",
+    "zeppelinos_implementation_slot",
+    "eip1967_beacon_slot",
+    "implementation_method",
+)
+
+
+def _proxy_block(chain_id: int, meta_path: str | None, requested: bool) -> dict:
+    """Summarize proxy resolution AND surface the implementation's source files.
+
+    For a proxy, the top-level `files` are only the proxy shell; the real logic is
+    saved under the implementation address. This makes that explicit so the agent
+    analyzes the right code (or knows to fetch it).
+    """
+    block: dict = {"requested": bool(requested), "is_proxy": False}
+    if not meta_path:
+        return block
+    try:
+        meta = json.loads(Path(meta_path).read_text(encoding="utf-8"))
+    except Exception:
+        return block
+    pr = (meta.get("proxy_resolution") or {}).get("proxy") or {}
+    if pr.get("error"):
+        block["error"] = pr["error"]
+    scheme = next((k for k in _PROXY_SCHEMES if pr.get(k)), None)
+    impl = pr.get("implementation")
+    if not scheme and not impl:
+        return block  # not a proxy, or detected:false
+    block["is_proxy"] = True
+    if scheme:
+        block["scheme"] = scheme
+    if pr.get("beacon"):
+        block["beacon"] = pr["beacon"]
+    if impl:
+        impl = impl.lower()
+        block["implementation"] = impl
+        impl_files = sorted(SOURCES_DIR.glob(f"{chain_id}_{impl}_*.sol"))
+        srcs: dict[str, str] = {}
+        for f in impl_files:
+            try:
+                srcs[f.name] = f.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                srcs[f.name] = ""
+        block["implementation_files"] = [
+            {"path": str(f), "name": f.name, "bytes": f.stat().st_size} for f in impl_files
+        ]
+        block["implementation_source_fetched"] = bool(impl_files)
+        block["implementation_source_hash"] = ContractRegistry.compute_source_hash(srcs) if srcs else None
+        block["note"] = (
+            "PROXY: analyze implementation_files (the real logic); top-level `files` are just the proxy shell."
+            if impl_files
+            else f"PROXY: implementation detected but source not fetched; call "
+            f"download_contract(address='{impl}', chain_id={chain_id})."
+        )
+    return block
+
+
 @mcp.tool()
 def download_contract(address: str, chain_id: int = 56, follow_proxy: bool = True) -> dict:
     """Fetch verified source for a contract (Sourcify -> Blockscout -> explorer -> IPFS metadata).
 
-    Resolves EIP-1967/EIP-1167 proxies when follow_proxy=True (default). Writes
-    .sol files to sources/ and returns their on-disk paths + a short preview of
-    each + the source_hash. **Read the full source from the returned paths and
-    analyze it yourself** — this server does not scan or audit. Feed the
-    source_hash to registry_clones to find the same code deployed elsewhere.
+    Resolves proxies when follow_proxy=True (default): EIP-1967, EIP-1167 minimal,
+    beacon, and legacy zeppelinos slots. Writes .sol files to sources/ and returns
+    their on-disk paths + a short preview of each + the source_hash. **Read the full
+    source from the returned paths and analyze it yourself** — this server does not
+    scan or audit. Feed the source_hash to registry_clones to find the same code
+    deployed elsewhere.
+
+    For a proxy, the top-level `files` are only the proxy shell — the `proxy` field
+    reports the implementation address and its `implementation_files` (that's the
+    real logic to analyze). If a proxy's implementation wasn't auto-fetched, `proxy`
+    tells you the address to download.
 
     Returns {found: false} if no verified source exists on any provider (only
     runtime bytecode is on-chain — you cannot analyze what you can't read).
@@ -129,6 +195,8 @@ def download_contract(address: str, chain_id: int = 56, follow_proxy: bool = Tru
         out["found"] = bool(ok and out["file_count"] > 0)
         if not out["found"]:
             out["note"] = "No verified source from any provider — only runtime bytecode exists on-chain."
+        if follow_proxy:
+            out["proxy"] = _proxy_block(chain_id, out.get("meta_path"), follow_proxy)
         return out
     except Exception as e:
         return _err(e)

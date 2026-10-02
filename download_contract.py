@@ -56,6 +56,10 @@ def eip1967_slot(tag: str) -> int:
 
 EIP1967_IMPLEMENTATION_SLOT = eip1967_slot("eip1967.proxy.implementation")
 EIP1967_BEACON_SLOT = eip1967_slot("eip1967.proxy.beacon")
+# Legacy OpenZeppelin / zeppelinos proxies (e.g. USDC's FiatTokenProxy) store the
+# implementation at keccak256("org.zeppelinos.proxy.implementation") — note: NO
+# minus-1, unlike the EIP-1967 scheme above.
+ZOS_IMPLEMENTATION_SLOT = int.from_bytes(Web3.keccak(text="org.zeppelinos.proxy.implementation"), "big")
 
 
 def _parse_storage_address(value: bytes) -> str | None:
@@ -127,6 +131,13 @@ def resolve_proxy_targets(chain_id: int, address: str, rpc_url: str) -> tuple[li
         result["proxy"]["eip1967_implementation_slot"] = True
         result["proxy"]["implementation"] = normalize_address(eip1967_impl)
         return [address, normalize_address(eip1967_impl)], result
+
+    # Legacy zeppelinos implementation slot (pre-EIP-1967; e.g. USDC FiatTokenProxy).
+    zos_impl = try_get_storage_address(w3, address, ZOS_IMPLEMENTATION_SLOT)
+    if zos_impl:
+        result["proxy"]["zeppelinos_implementation_slot"] = True
+        result["proxy"]["implementation"] = normalize_address(zos_impl)
+        return [address, normalize_address(zos_impl)], result
 
     beacon = try_get_storage_address(w3, address, EIP1967_BEACON_SLOT)
     if beacon:
