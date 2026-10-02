@@ -9,6 +9,7 @@ from flask import Flask, jsonify, render_template, request
 
 import scryer_config
 from contract_registry import ContractRegistry
+from scryer_http import RateLimited
 from scryer_logging import get_logger
 
 _log = get_logger(__name__)
@@ -442,6 +443,9 @@ def similarity_search():
                     sources = asyncio.run(fetch_code())
                     if sources:
                         code = next(iter(sources.values()))
+                except RateLimited as e:
+                    # Distinct from a genuine "not on Sourcify" miss — tell the user to retry.
+                    error = f"Sourcify rate-limited — retry later ({e.reason})"
                 except Exception as e:
                     error = f"Could not fetch code for {address}: {e}"
 

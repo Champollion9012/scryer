@@ -52,6 +52,7 @@ import httpx
 
 import scryer_config
 import scryer_http
+from scryer_http import RateLimitTally, rate_limit_reason, retry_after_seconds, rpc_rate_limit_reason
 from scryer_logging import get_logger
 
 _log = get_logger(__name__)
@@ -210,6 +211,17 @@ class RpcError(RuntimeError):
     pass
 
 
+class RateLimitedRpcError(RpcError):
+    """An RpcError that was specifically a throttle. Subclassing RpcError keeps existing
+    ``except RpcError`` handlers working, while callers that care can catch this distinctly
+    to back off (hold the cursor, don't drop the hit) instead of treating it as a hard failure."""
+
+    def __init__(self, message: str, *, retry_after: int | None = None, reason: str | None = None):
+        super().__init__(message)
+        self.retry_after = retry_after
+        self.reason = reason or message
+
+
 class RpcClient:
     """Tiny synchronous JSON-RPC wrapper around httpx.Client."""
 
@@ -234,9 +246,15 @@ class RpcClient:
         payload = {"jsonrpc": "2.0", "id": self._req_id, "method": method, "params": params}
         resp = self._client.post(self.url, json=payload)
         if resp.status_code != 200:
+            reason = rate_limit_reason(resp)
+            if reason:
+                raise RateLimitedRpcError(f"{method} -> {reason}", retry_after=retry_after_seconds(resp), reason=reason)
             raise RpcError(f"{method} -> HTTP {resp.status_code}: {resp.text[:200]}")
         body = resp.json()
         if "error" in body:
+            rl = rpc_rate_limit_reason(body["error"])  # JSON-RPC throttle body (e.g. -32005/capacity)
+            if rl:
+                raise RateLimitedRpcError(f"{method} -> rate limit: {rl}", reason=rl)
             raise RpcError(f"{method} -> RPC error: {body['error']}")
         return body.get("result")
 
@@ -426,6 +444,8 @@ class TickStats:
     new_hits: int = 0
     cursor_advanced_to: int | None = None
     error: str | None = None
+    rate_limited: bool = False
+    retry_after: int | None = None
 
 
 def _is_contract_code(code: str) -> bool:
@@ -455,6 +475,7 @@ def _scan_recipient(
         _log.warning("scan-on-hit unavailable: %s", e)
         return None
 
+    tally = RateLimitTally()
     try:
         ok = download_contract.fetch_contract_source(
             chain_id=chain_id,
@@ -462,10 +483,16 @@ def _scan_recipient(
             output_dir=str(sources_dir),
             layout="flat",
             quiet=True,
+            tally=tally,
         )
     except Exception as e:  # pragma: no cover — network failures expected
         _log.warning("scan-on-hit download failed for %s: %s", address, e)
         return None
+    if tally.hit:
+        # The source download was throttled — persist a distinct marker instead of a NULL/clean
+        # summary, so the hit is recognizable as "needs re-scan" rather than "scanned, clean".
+        _log.warning("scan-on-hit rate-limited for %s: %s", address, "; ".join(tally.reasons))
+        return {"total": 0, "rule_id_counts": {}, "rate_limited": True, "warnings": list(tally.reasons)}
     if not ok:
         return None
 
@@ -512,6 +539,11 @@ def scan_chain(
 
     try:
         head = rpc.block_number()
+    except RateLimitedRpcError as e:
+        stats.rate_limited = True
+        stats.retry_after = e.retry_after
+        stats.error = f"block_number rate-limited: {e.reason}"
+        return stats
     except Exception as e:
         stats.error = f"block_number failed: {e}"
         return stats
@@ -540,6 +572,11 @@ def scan_chain(
                 addresses=addresses,
                 topics=[TRANSFER_TOPIC],
             )
+        except RateLimitedRpcError as e:
+            stats.rate_limited = True
+            stats.retry_after = e.retry_after
+            stats.error = f"getLogs {next_block}->{chunk_to} rate-limited: {e.reason}"
+            break
         except Exception as e:
             stats.error = f"getLogs {next_block}->{chunk_to} failed: {e}"
             break
@@ -547,6 +584,7 @@ def scan_chain(
         stats.chunks_scanned += 1
         stats.logs_seen += len(raw_logs)
 
+        throttled = False
         for raw in raw_logs:
             log = parse_transfer_log(chain_id, raw)
             if not log:
@@ -557,6 +595,14 @@ def scan_chain(
             # Filter to contract recipients only (the user's stated criterion).
             try:
                 code = rpc.get_code(log.to_address)
+            except RateLimitedRpcError as e:
+                # Don't silently drop the hit as if the recipient were an EOA, and don't let the
+                # cursor advance past this chunk — surface it and retry the whole chunk next tick.
+                stats.rate_limited = True
+                stats.retry_after = e.retry_after
+                stats.error = f"get_code rate-limited: {e.reason}"
+                throttled = True
+                break
             except Exception as e:
                 _log.debug("[chain %d] eth_getCode failed for %s: %s", chain_id, log.to_address, e)
                 continue
@@ -604,6 +650,9 @@ def scan_chain(
                                 ", ".join(summary["rule_id_counts"]),
                             )
 
+        if throttled:
+            break  # leave the cursor at the previous chunk -> this chunk is retried next tick
+
         store.set_cursor(chain_id, chunk_to)
         stats.cursor_advanced_to = chunk_to
         next_block = chunk_to + 1
@@ -628,7 +677,12 @@ def run_once(config: Config) -> dict[int, TickStats]:
         with RpcClient(rpc_url) as rpc:
             stats = scan_chain(rpc, store, chain_id=chain_id, tokens=chain_tokens, config=config)
         results[chain_id] = stats
-        if stats.error:
+        if stats.rate_limited:
+            _log.warning(
+                "[chain %d] RATE-LIMITED: %s (retry_after=%s) — cursor held, range retried next tick",
+                chain_id, stats.error, stats.retry_after,
+            )
+        elif stats.error:
             _log.warning("[chain %d] error: %s", chain_id, stats.error)
         elif stats.new_hits:
             _log.info(
