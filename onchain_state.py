@@ -13,6 +13,7 @@ All functions are best-effort and never raise — they return an ``error`` key.
 
 from __future__ import annotations
 
+import httpx
 from web3 import Web3
 
 import scryer_config
@@ -36,6 +37,11 @@ _UINT = {"decimals", "totalSupply"}
 _STR = {"name", "symbol"}
 
 _NATIVE = {1: "ETH", 10: "ETH", 56: "BNB", 137: "MATIC", 250: "FTM", 8453: "ETH", 42161: "ETH", 43114: "AVAX"}
+
+# DeFiLlama (free, no API key) price API: per-chain prefix for tokens, and the
+# coingecko id used to price each chain's native coin.
+_DL_CHAIN = {1: "ethereum", 10: "optimism", 56: "bsc", 137: "polygon", 250: "fantom", 8453: "base", 42161: "arbitrum", 43114: "avax"}
+_DL_NATIVE_CGID = {1: "ethereum", 10: "ethereum", 42161: "ethereum", 8453: "ethereum", 56: "binancecoin", 137: "matic-network", 250: "fantom", 43114: "avalanche-2"}
 
 # Major tokens per chain: (symbol, address, decimals, is_stable). Stablecoin
 # balances approximate USD at risk; non-stables are reported unpriced.
@@ -156,13 +162,27 @@ def read_storage(chain_id: int, address: str, slot: int | str) -> dict:
     }
 
 
-def token_exposure(chain_id: int, address: str) -> dict:
-    """How much value this contract currently holds — the $-at-risk input to severity.
+def _defillama_prices(keys: list[str]) -> dict[str, float]:
+    """Batch USD prices from DeFiLlama (free, no key). Keys like 'ethereum:0x..' or
+    'coingecko:ethereum'. Returns {key: price}; empty on any failure (best-effort)."""
+    keys = [k for k in keys if k]
+    if not keys:
+        return {}
+    try:
+        r = httpx.get("https://coins.llama.fi/prices/current/" + ",".join(keys), timeout=15)
+        coins = r.json().get("coins", {})
+        return {k: v["price"] for k, v in coins.items() if isinstance(v, dict) and "price" in v}
+    except Exception:
+        return {}
 
-    Reads native-coin balance + balanceOf for major tokens. Stablecoin balances
-    are summed as an approximate USD figure; native and non-stables are reported
-    unpriced (add a price feed for exact TVL). Empty holdings ≠ harmless, but real
-    balances turn a theoretical bug into a quantified one.
+
+def token_exposure(chain_id: int, address: str) -> dict:
+    """How much value the contract holds right now, in USD — the $-at-risk input to severity.
+
+    Reads native-coin balance + balanceOf for major tokens, then prices everything via
+    DeFiLlama (free, no key). total_usd is the quantified impact; each holding carries
+    its own usd. Prices are best-effort — usd=null just means DeFiLlama had no price.
+    Checks a fixed major-token list per chain, so total_usd is a FLOOR, not exhaustive TVL.
     """
     w3, url = _w3(chain_id)
     out: dict = {"chain_id": chain_id, "address": address.lower(), "rpc_url": url}
@@ -171,10 +191,9 @@ def token_exposure(chain_id: int, address: str) -> dict:
         native = w3.eth.get_balance(checks)
     except Exception as e:
         return {**out, "error": f"rpc: {type(e).__name__}: {e}"}
-    out["native"] = {"symbol": _NATIVE.get(chain_id, "NATIVE"), "wei": native, "amount": native / 1e18}
+    native_amt = native / 1e18
     suffix = checks[2:].lower().rjust(64, "0")
     holdings: list[dict] = []
-    stable_usd = 0.0
     for sym, taddr, dec, stable in _TOKENS.get(chain_id, []):
         b = _call(w3, taddr, "70a08231", suffix)  # balanceOf(address)
         if not b:
@@ -182,14 +201,30 @@ def token_exposure(chain_id: int, address: str) -> dict:
         bal = int.from_bytes(b[-32:], "big")
         if bal == 0:
             continue
-        amt = bal / (10**dec)
-        holdings.append({"symbol": sym, "amount": amt, "token": taddr.lower(), "stable": stable})
-        if stable:
-            stable_usd += amt
+        holdings.append({"symbol": sym, "amount": bal / (10**dec), "token": taddr.lower(), "stable": stable})
+
+    # Price native + every held token in one DeFiLlama batch.
+    dl_chain = _DL_CHAIN.get(chain_id)
+    cgid = _DL_NATIVE_CGID.get(chain_id)
+    native_key = f"coingecko:{cgid}" if cgid else ""
+    token_keys = {h["token"]: f"{dl_chain}:{h['token']}" for h in holdings} if dl_chain else {}
+    prices = _defillama_prices([native_key, *token_keys.values()])
+
+    native_price = prices.get(native_key)
+    native_usd = round(native_amt * native_price, 2) if native_price else None
+    total = native_usd or 0.0
+    for h in holdings:
+        p = prices.get(token_keys.get(h["token"], ""))
+        h["usd"] = round(h["amount"] * p, 2) if p else None
+        if h["usd"]:
+            total += h["usd"]
+
+    out["native"] = {"symbol": _NATIVE.get(chain_id, "NATIVE"), "amount": native_amt, "usd": native_usd}
     out["token_holdings"] = holdings
-    out["stablecoin_usd_approx"] = round(stable_usd, 2)
+    out["total_usd"] = round(total, 2)
+    out["price_source"] = "defillama"
     out["note"] = (
-        "stablecoin_usd_approx ~ USD held in major stables; native coin and non-stable tokens are "
-        "unpriced here. Checked a fixed major-token list per chain, not the full token set."
+        "total_usd = native + priced tokens (DeFiLlama, best-effort; usd=null means no price). "
+        "Fixed major-token list per chain, not the full token set - total_usd is a floor, not exhaustive TVL."
     )
     return out
