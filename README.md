@@ -18,12 +18,12 @@ Pulls verified source from 8 EVM chains, falls back to bytecode decompilation wh
 | **Decompile** | [`decompilers.py`](decompilers.py) | Heimdall-rs (via WSL on Windows) + Panoramix fallback. |
 | **Index** | [`contract_registry.py`](contract_registry.py) | SQLite registry keyed by source hash → fast clone discovery across chains. |
 | **Audit** | [`audit_contracts.py`](audit_contracts.py) + [`llm_providers.py`](llm_providers.py) | OpenAI / Claude / Gemini, JSON-mode prompts, map-reduce for huge codebases, parallel `--concurrency`, `--stream` for live token deltas, smart retry classification (4xx bail · 429 honours `Retry-After` · 5xx exp-backoff), and content-hash cache that skips re-audits across runs. |
-| **Scan** | [`scanners.py`](scanners.py) | Curated regex rules (SWC-aligned), pluggable via `RegexRule.from_dict` + `load_rules_from_file`; optional Slither + Mythril + `forge test`. |
+| **Scan** | [`scanners.py`](scanners.py) | Curated regex rules (SWC-aligned) matched against whole files with comment bodies masked, so multi-line call shapes (`swap…(\n amt,\n 0,\n …)`) are caught, commented-out code stays quiet, and each finding carries `line`..`end_line`; `max_findings` bounds work as well as output; pluggable via `RegexRule.from_dict` + `load_rules_from_file` (`match_in: "all"` for comment-targeting rules); optional Slither + Mythril + `forge test`. |
 | **Compare** | [`similarity.py`](similarity.py) + [`similarity_cli.py`](similarity_cli.py) | GraphCodeBERT embeddings (length-weighted chunk averaging) + ChromaDB vector store. |
 | **Pipeline** | [`bounty_pipeline.py`](bounty_pipeline.py) | One-shot download + audit driven by a target JSON. |
 | **Browse** | [`web.py`](web.py) + [`templates/`](templates/) | Local Flask dashboard over the registry; Jinja templates extend `base.html`; debug gated by `FLASK_DEBUG` env. |
 | **Reproduce** | [`tests/`](tests/) | Foundry forks + PoC templates (e.g. MARS staking sync drain). |
-| **Test** | [`tests/python/`](tests/python/) | 159 offline pytest cases over the whole pipeline (audit / cache / scanners / similarity / web routes / bounty pipeline / IPFS extraction). |
+| **Test** | [`tests/python/`](tests/python/) | 316 offline pytest cases over the whole pipeline (audit / cache / scanners / rule packs / similarity / web routes / whale watcher / bounty pipeline / IPFS extraction). |
 
 ## Architecture
 

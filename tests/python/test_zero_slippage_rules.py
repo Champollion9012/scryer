@@ -1,4 +1,4 @@
-"""Tests for the rules/zero_slippage_amm.json rule pack.
+r"""Tests for the rules/zero_slippage_amm.json rule pack.
 
 These rules target the ``amountOutMin = 0`` / ``amountTokenMin = 0`` /
 ``addLiquidity*(_,_,0,0,...)`` sandwich-vulnerable shape that the serial
@@ -13,12 +13,13 @@ The anchor exploit is Saint Michael the Archangel (Ethereum,
 passes ``0`` as ``amountOutMin`` to Uniswap V2; every auto-tax swap is a
 free sandwich.
 
-Note on coverage: ``run_regex_scan`` is line-by-line — multi-line Solidity
-call shapes (Archangel's actual style) are intentionally NOT caught by
-these regexes; the LLM stage in audit_contracts.py is responsible for that
-(verified in runs/archangel_audit: F-03 was caught by Sonnet 4.6). The
-regex pack catches the equally-common single-line shape used by smaller
-contracts and serves as a fast pre-filter.
+Note on coverage: ``run_regex_scan`` matches each rule against the whole
+file (rules_version 3), so ``\s*`` / ``[^,)]+`` inside a rule can cross a
+newline and the multi-line call shape that all four April-2026 victims use
+is caught by the regex layer directly. Before rules_version 3 the scanner
+was line-by-line and this shape was a documented blind spot that only the
+LLM stage covered (runs/archangel_audit F-03); the tests below pin the
+multi-line catch so a future regression is loud.
 """
 
 from __future__ import annotations
@@ -79,24 +80,123 @@ def test_archangel_swap_fee_on_transfer_single_line(tmp_path: Path, amm_rules: l
     assert "UNISWAP_DEADLINE_BLOCK_TIMESTAMP" in ids
 
 
-def test_archangel_swap_multiline_is_regex_blindspot(tmp_path: Path, amm_rules: list) -> None:
-    """Multi-line form (Archangel's actual on-chain code) is NOT caught by the
-    line-by-line regex scanner. This test pins that limitation so anyone who
-    later upgrades scanners.py to multi-line mode will see this test break and
-    can re-evaluate the rule pack. The audit pipeline relies on the LLM stage
-    here — see runs/archangel_audit F-03 for the real catch.
+def test_archangel_swap_multiline_is_caught(tmp_path: Path, amm_rules: list) -> None:
+    """Multi-line form (Archangel's actual on-chain code) MUST be caught now
+    that the scanner matches whole files. The finding has to point at the
+    line where the call starts and extend to the ``0,`` argument line so a
+    reviewer can jump straight to it.
     """
     body = (
-        "uniswapV2Router.swapExactTokensForETHSupportingFeeOnTransferTokens(\n"
-        "    tokenAmount,\n"
-        "    0,\n"
-        "    path,\n"
+        "contract T {\n"
+        "  function swapTokensForEth(uint256 tokenAmount) private {\n"
+        "    uniswapV2Router.swapExactTokensForETHSupportingFeeOnTransferTokens(\n"
+        "        tokenAmount,\n"
+        "        0,\n"
+        "        path,\n"
+        "        address(this),\n"
+        "        block.timestamp\n"
+        "    );\n"
+        "  }\n"
+        "}\n"
+    )
+    p = tmp_path / "Vuln.sol"
+    p.write_text(body, encoding="utf-8")
+    findings = run_regex_scan([p], rules=amm_rules)["findings"]
+    hits = [f for f in findings if f["rule_id"] == "UNISWAP_SWAP_AMOUNT_OUT_MIN_ZERO"]
+    assert len(hits) == 1, findings
+    assert hits[0]["line"] == 3
+    assert hits[0]["end_line"] == 5
+    assert "0," in hits[0]["excerpt"]
+    # Deadline rule must also see through the line breaks and, like the swap
+    # rule, anchor on the call (line 3) rather than on the `function` line.
+    deadline = [f for f in findings if f["rule_id"] == "UNISWAP_DEADLINE_BLOCK_TIMESTAMP"]
+    assert [(f["line"], f["end_line"]) for f in deadline] == [(3, 9)]
+
+
+def test_upegstr_eth_for_tokens_multiline_is_caught(tmp_path: Path, amm_rules: list) -> None:
+    """UPEGSTR (Solady/V4 strategy, 0xd730b101...210c) — amountOutMin is the
+    first positional arg and sits on its own line after ``{value: amountIn}(``.
+    """
+    body = (
+        "V2_ROUTER.swapExactETHForTokensSupportingFeeOnTransferTokens{value: amountIn}(\n"
+        "    0, path, DEAD, block.timestamp\n"
+        ");\n"
+    )
+    ids = _scan(tmp_path, body, amm_rules)
+    assert "UNISWAP_SWAP_ETH_AMOUNT_OUT_MIN_ZERO" in ids
+
+
+def test_add_liquidity_multiline_zero_min_is_caught(tmp_path: Path, amm_rules: list) -> None:
+    """openTrading() written one-arg-per-line — both 0 mins on separate lines."""
+    body = (
+        "uniswapV2Router.addLiquidityETH{value: address(this).balance}(\n"
         "    address(this),\n"
+        "    balanceOf(address(this)),\n"
+        "    0,\n"
+        "    0,\n"
+        "    owner(),\n"
         "    block.timestamp\n"
         ");\n"
     )
     ids = _scan(tmp_path, body, amm_rules)
-    assert "UNISWAP_SWAP_AMOUNT_OUT_MIN_ZERO" not in ids
+    assert "UNISWAP_ADD_LIQUIDITY_ZERO_MIN" in ids
+
+
+def test_swapping_modifier_is_not_treated_as_call_options(tmp_path: Path, amm_rules: list) -> None:
+    """SafeMoon-style `function swapBack() internal swapping {`: the `{` after
+    the modifier must not be parsed as a `{value: ...}` call-options block
+    that swallows the body. Findings have to sit on the router call."""
+    body = (
+        "contract T {\n"
+        "  function swapBack() internal swapping {\n"
+        "    uint256 amountETH = address(this).balance;\n"
+        "    router.addLiquidityETH{value: amountETH}(\n"
+        "        address(this), tokens, 0, 0, owner(), block.timestamp\n"
+        "    );\n"
+        "  }\n"
+        "}\n"
+    )
+    p = tmp_path / "Vuln.sol"
+    p.write_text(body, encoding="utf-8")
+    findings = run_regex_scan([p], rules=amm_rules)["findings"]
+    deadline = [f for f in findings if f["rule_id"] == "UNISWAP_DEADLINE_BLOCK_TIMESTAMP"]
+    assert [(f["line"], f["end_line"]) for f in deadline] == [(4, 6)]
+    addliq = [f for f in findings if f["rule_id"] == "UNISWAP_ADD_LIQUIDITY_ZERO_MIN"]
+    assert [(f["line"], f["end_line"]) for f in addliq] == [(4, 5)]
+
+
+def test_call_as_first_statement_after_definition_anchors_on_call(tmp_path: Path, amm_rules: list) -> None:
+    """`function addLiquidity(...) private {` immediately followed by the
+    router call: the finding must start at the call (line 3), not at the
+    definition line, and the call must not be swallowed."""
+    body = (
+        "contract T {\n"
+        "  function addLiquidity(uint256 tokenAmount, uint256 ethAmount) private {\n"
+        "    uniswapV2Router.addLiquidityETH{value: ethAmount}("
+        "address(this), tokenAmount, 0, 0, owner(), block.timestamp);\n"
+        "  }\n"
+        "}\n"
+    )
+    p = tmp_path / "Vuln.sol"
+    p.write_text(body, encoding="utf-8")
+    findings = run_regex_scan([p], rules=amm_rules)["findings"]
+    for rule_id in ("UNISWAP_ADD_LIQUIDITY_ZERO_MIN", "UNISWAP_DEADLINE_BLOCK_TIMESTAMP"):
+        hits = [f for f in findings if f["rule_id"] == rule_id]
+        assert [(f["line"], f["end_line"]) for f in hits] == [(3, 3)], (rule_id, findings)
+
+
+def test_commented_out_swap_does_not_shadow_live_swap(tmp_path: Path, amm_rules: list) -> None:
+    """A commented-out router call above the live one must neither fire nor
+    anchor a span that consumes the live call (comment masking)."""
+    body = (
+        "// router.swapExactTokensForETHSupportingFeeOnTransferTokens(\n"
+        "router.swapExactTokensForETHSupportingFeeOnTransferTokens(amt, 0, path, to, block.timestamp);\n"
+    )
+    p = tmp_path / "Vuln.sol"
+    p.write_text(body, encoding="utf-8")
+    findings = run_regex_scan([p], rules=amm_rules)["findings"]
+    hits = [f for f in findings if f["rule_id"] == "UNISWAP_SWAP_AMOUNT_OUT_MIN_ZERO"]
+    assert [(f["line"], f["end_line"]) for f in hits] == [(2, 2)]
 
 
 def test_swap_exact_tokens_for_tokens_single_line(tmp_path: Path, amm_rules: list) -> None:
@@ -131,9 +231,7 @@ def test_add_liquidity_eth_zero_min(tmp_path: Path, amm_rules: list) -> None:
 
 
 def test_add_liquidity_pair_zero_min(tmp_path: Path, amm_rules: list) -> None:
-    body = (
-        "router.addLiquidity(tokenA, tokenB, amtA, amtB, 0, 0, to, block.timestamp);\n"
-    )
+    body = "router.addLiquidity(tokenA, tokenB, amtA, amtB, 0, 0, to, block.timestamp);\n"
     ids = _scan(tmp_path, body, amm_rules)
     assert "UNISWAP_ADD_LIQUIDITY_ZERO_MIN" in ids
 
@@ -156,9 +254,7 @@ def test_protected_swap_explicit_min_value(tmp_path: Path, amm_rules: list) -> N
 
 
 def test_protected_add_liquidity_nonzero_mins(tmp_path: Path, amm_rules: list) -> None:
-    body = (
-        "router.addLiquidityETH{value: ethAmt}(token, tokenAmt, tokenMin, ethMin, to, deadline);\n"
-    )
+    body = "router.addLiquidityETH{value: ethAmt}(token, tokenAmt, tokenMin, ethMin, to, deadline);\n"
     ids = _scan(tmp_path, body, amm_rules)
     assert "UNISWAP_ADD_LIQUIDITY_ZERO_MIN" not in ids
 

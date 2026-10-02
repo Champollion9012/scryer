@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import bisect
+import itertools
 import json
 import re
 import shutil
 import subprocess
 import tempfile
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 
@@ -16,24 +19,34 @@ class RegexRule:
     severity: str
     title: str
     pattern: re.Pattern[str]
+    # "code" (default): match against the source with comment bodies blanked
+    # out, so commented-out code cannot fire the rule or anchor a span that
+    # swallows a real statement. "all": match the raw text — for rules that
+    # deliberately target comments (e.g. TODO_FIXME).
+    match_in: str = "code"
 
     @classmethod
     def from_dict(cls, payload: dict) -> RegexRule:
         """Build a rule from JSON-friendly dict, e.g. loaded from disk.
 
         Expected keys: ``rule_id``, ``severity``, ``title``, ``pattern``.
-        Optional ``flags`` (e.g. ``"IGNORECASE"``) maps to :mod:`re` constants.
+        Optional ``flags`` (e.g. ``"IGNORECASE"``) maps to :mod:`re` constants;
+        optional ``match_in`` is ``"code"`` (default) or ``"all"``.
         """
         flags = 0
         for name in (payload.get("flags") or "").split("|"):
             name = name.strip().upper()
             if name:
                 flags |= getattr(re, name)
+        match_in = str(payload.get("match_in") or "code")
+        if match_in not in ("code", "all"):
+            raise ValueError(f"rule {payload.get('rule_id')!r}: match_in must be 'code' or 'all', got {match_in!r}")
         return cls(
             rule_id=str(payload["rule_id"]),
             severity=str(payload["severity"]),
             title=str(payload["title"]),
             pattern=re.compile(str(payload["pattern"]), flags),
+            match_in=match_in,
         )
 
 
@@ -63,7 +76,9 @@ DEFAULT_REGEX_RULES: list[RegexRule] = [
         "REENTRANCY_PATTERN",
         "High",
         "Potential reentrancy (external call before state change)",
-        re.compile(r"\.call\s*\{[^}]*\}\s*\([^)]*\)"),
+        # `{...}` never contains braces and an argument list is bounded, so
+        # neither window can run away across a whole file.
+        re.compile(r"\.call\s*\{[^{}]*\}\s*\([^)]{0,500}\)"),
     ),
     RegexRule(
         "DELEGATECALL", "High", "Use of delegatecall (storage collision risk)", re.compile(r"\.delegatecall\s*\(")
@@ -91,7 +106,7 @@ DEFAULT_REGEX_RULES: list[RegexRule] = [
         re.compile(r"delegatecall.*storage|storage.*delegatecall", re.IGNORECASE),
     ),
     # === Medium ===
-    RegexRule("CALL_VALUE", "Medium", "Low-level call with value", re.compile(r"\.call\s*\{[^}]*\bvalue\s*:")),
+    RegexRule("CALL_VALUE", "Medium", "Low-level call with value", re.compile(r"\.call\s*\{[^{}]*\bvalue\s*:")),
     RegexRule(
         "TIMESTAMP_DEPENDENCE",
         "Medium",
@@ -102,10 +117,14 @@ DEFAULT_REGEX_RULES: list[RegexRule] = [
         "UNCHECKED_RETURN",
         "Medium",
         "Unchecked return value from low-level call",
-        re.compile(r"\.call\s*\{[^}]*\}\s*\([^)]*\)\s*;"),
+        re.compile(r"\.call\s*\{[^{}]*\}\s*\([^)]{0,500}\)\s*;"),
     ),
     RegexRule(
-        "DOS_UNBOUNDED_LOOP", "Medium", "Potentially unbounded loop", re.compile(r"for\s*\([^;]*;\s*[^;]*\.length\s*;")
+        "DOS_UNBOUNDED_LOOP",
+        "Medium",
+        "Potentially unbounded loop",
+        # A real `for` header never contains braces before its second `;`.
+        re.compile(r"\bfor\s*\([^;{}]{0,500};\s*[^;{}]{0,500}\.length\s*;"),
     ),
     RegexRule(
         "FRONT_RUNNING",
@@ -124,13 +143,196 @@ DEFAULT_REGEX_RULES: list[RegexRule] = [
         re.compile(r"\b(flashLoan|onFlashLoan|executeOperation)\b"),
     ),
     RegexRule(
-        "TODO_FIXME", "Info", "TODO/FIXME comment in code", re.compile(r"//\s*(TODO|FIXME|XXX|HACK)", re.IGNORECASE)
+        "TODO_FIXME",
+        "Info",
+        "TODO/FIXME comment in code",
+        re.compile(r"//[ \t]*(TODO|FIXME|XXX|HACK)", re.IGNORECASE),
+        match_in="all",
     ),
 ]
 
+# Bump when scanner semantics change in a way that alters findings for the
+# same rule set (v3: whole-file matching + comment masking; v2: per-line).
+RULES_VERSION = 3
 
-def _iter_lines(text: str) -> Iterator[tuple[int, str]]:
-    yield from enumerate(text.splitlines(), start=1)
+
+@lru_cache(maxsize=512)
+def _as_multiline(pattern: re.Pattern[str]) -> re.Pattern[str]:
+    """Return ``pattern`` recompiled with :data:`re.MULTILINE` so ``^``/``$``
+    keep their per-line meaning now that rules run over whole files."""
+    if pattern.flags & re.MULTILINE:
+        return pattern
+    return re.compile(pattern.pattern, pattern.flags | re.MULTILINE)
+
+
+_COMMENT_OR_STRING_RE = re.compile(r"//|/\*|\"|'")
+_NON_NEWLINE_RE = re.compile(r"[^\n]")
+
+
+def _mask_comments(text: str) -> str:
+    """Blank out ``//`` and ``/* */`` comment bodies, preserving length.
+
+    Every comment character becomes a space (newlines are kept), so offsets
+    on the masked text map 1:1 onto the original — ``line``, ``column`` and
+    ``excerpt`` are still taken from the real source. String literals are
+    copied verbatim so a ``//`` inside ``"https://..."`` is not mistaken for a
+    comment start.
+
+    Rules run against the masked text by default (``RegexRule.match_in ==
+    "code"``). This keeps commented-out code from firing rules and, more
+    importantly under whole-file matching, keeps a token inside a comment
+    from anchoring a span that swallows the real call on a later line.
+    """
+    if "//" not in text and "/*" not in text:
+        return text
+    n = len(text)
+    parts: list[str] = []
+    i = 0
+    while i < n:
+        m = _COMMENT_OR_STRING_RE.search(text, i)
+        if m is None:
+            parts.append(text[i:])
+            break
+        j = m.start()
+        parts.append(text[i:j])
+        tok = m.group()
+        if tok == "//":
+            end = text.find("\n", j)
+            end = n if end == -1 else end
+            parts.append(" " * (end - j))
+        elif tok == "/*":
+            close = text.find("*/", j + 2)
+            end = n if close == -1 else close + 2
+            parts.append(_NON_NEWLINE_RE.sub(" ", text[j:end]))
+        else:  # string literal — copy through the closing quote (or end of line)
+            k = j + 1
+            while k < n:
+                c = text[k]
+                if c == "\\":
+                    k += 2
+                    continue
+                if c == tok or c == "\n":
+                    break
+                k += 1
+            end = min(k + 1, n)
+            parts.append(text[j:end])
+        i = end
+    return "".join(parts)
+
+
+def _line_index(text: str) -> tuple[list[str], list[int]]:
+    """Split ``text`` into lines and return ``(lines, line_start_offsets)``.
+
+    Offsets are 0-based character positions of each line's first character,
+    which lets a whole-file regex match be mapped back to ``(line, column)``
+    with a single :func:`bisect.bisect_right`.
+    """
+    lines = text.split("\n")
+    starts = [0]
+    for line in lines[:-1]:
+        starts.append(starts[-1] + len(line) + 1)
+    return lines, starts
+
+
+def _excerpt(lines: list[str], start_idx: int, end_idx: int, *, limit: int = 300) -> str:
+    """Excerpt for a match spanning ``lines[start_idx:end_idx + 1]``.
+
+    Single-line matches return the stripped source line (unchanged from the
+    per-line scanner); multi-line matches are whitespace-collapsed into one
+    line. Work is bounded by ``limit`` so a huge span costs O(limit).
+    """
+    if end_idx == start_idx:
+        return lines[start_idx].strip()[:limit]
+    out: list[str] = []
+    total = 0
+    for ln in lines[start_idx : end_idx + 1]:
+        s = ln.strip()
+        if not s:
+            continue
+        out.append(s)
+        total += len(s) + 1
+        if total >= limit:
+            break
+    return " ".join(out)[:limit]
+
+
+def _scan_text(text: str, rules: Sequence[RegexRule], rel: Path, *, max_findings: int) -> list[dict]:
+    r"""Run every rule over the whole file text (not line-by-line).
+
+    Whole-file matching is what lets ``\s*`` / ``[^,)]+`` in a rule cross a
+    newline, so multi-line call shapes such as::
+
+        router.swapExactTokensForETHSupportingFeeOnTransferTokens(
+            amount,
+            0,
+            path, address(this), block.timestamp
+        );
+
+    are caught by the same ``,\s*0\s*,`` rule that already matched the
+    single-line collapse. Patterns that rely on ``.*`` still stay within one
+    line because :data:`re.DOTALL` is never added.
+
+    Comment bodies are masked first (see :func:`_mask_comments`) for every
+    rule except those with ``match_in == "all"``.
+
+    Findings are ordered by ``(line, column, rule order)`` so the output is
+    stable and line-major like the historical per-line scanner, and at most
+    ``max_findings`` are returned.
+    """
+    if max_findings <= 0:
+        return []
+    lines, starts = _line_index(text)
+    text_len = len(text)
+    # ``text.split("\n")`` leaves a trailing "" after a final newline; a
+    # zero-width match (``^``, ``$``) at EOF would otherwise land on that
+    # phantom line, one past ``lines_scanned``.
+    phantom_tail = not text or text.endswith("\n")
+    masked: str | None = None
+    excerpts: dict[tuple[int, int], str] = {}
+    found: list[tuple[int, int, int, dict]] = []
+    for rule_idx, rule in enumerate(rules):
+        if rule.match_in == "all":
+            haystack = text
+        else:
+            if masked is None:
+                masked = _mask_comments(text)
+            haystack = masked
+        # finditer yields in offset order, so a rule's matches beyond the
+        # first ``max_findings`` can never survive the final (line, column)
+        # sort + cap. Capping here keeps work O(max_findings) per rule instead
+        # of O(all matches) on match-dense (e.g. minified) files.
+        matches = itertools.islice(_as_multiline(rule.pattern).finditer(haystack), max_findings)
+        for match in matches:
+            start_off = match.start()
+            if start_off >= text_len and phantom_tail:
+                continue
+            end_off = max(match.end() - 1, start_off)
+            line_idx = bisect.bisect_right(starts, start_off) - 1
+            end_line_idx = bisect.bisect_right(starts, end_off) - 1
+            key = (line_idx, end_line_idx)
+            excerpt = excerpts.get(key)
+            if excerpt is None:
+                excerpt = excerpts[key] = _excerpt(lines, line_idx, end_line_idx)
+            column = start_off - starts[line_idx] + 1
+            found.append(
+                (
+                    line_idx,
+                    column,
+                    rule_idx,
+                    {
+                        "rule_id": rule.rule_id,
+                        "severity": rule.severity,
+                        "title": rule.title,
+                        "file": rel.as_posix(),
+                        "line": line_idx + 1,
+                        "end_line": end_line_idx + 1,
+                        "column": column,
+                        "excerpt": excerpt,
+                    },
+                )
+            )
+    found.sort(key=lambda item: item[:3])
+    return [item[3] for item in found[:max_findings]]
 
 
 def run_regex_scan(
@@ -146,6 +348,12 @@ def run_regex_scan(
     pass their own ``rules`` (e.g. extended with project-specific patterns
     loaded via :func:`load_rules_from_file`) without monkey-patching the
     module-level list.
+
+    Each rule is applied to the whole file text with comment bodies masked
+    (unless the rule sets ``match_in="all"``), so a rule may match across
+    line breaks; every finding carries ``line`` (where the match starts) and
+    ``end_line`` (where it ends — equal to ``line`` for single-line matches).
+    ``max_findings`` bounds both the output and the work done per file.
     """
     active_rules: Sequence[RegexRule] = rules if rules is not None else DEFAULT_REGEX_RULES
     findings: list[dict] = []
@@ -153,6 +361,9 @@ def run_regex_scan(
     lines_scanned = 0
 
     for path in files:
+        remaining = max_findings - len(findings)
+        if remaining <= 0:
+            break
         if not path.exists() or not path.is_file():
             continue
         try:
@@ -161,33 +372,12 @@ def run_regex_scan(
             continue
 
         files_scanned += 1
+        lines_scanned += len(text.splitlines())
         rel = path
         if root and root in path.parents:
             rel = path.relative_to(root)
 
-        for line_no, line in _iter_lines(text):
-            lines_scanned += 1
-            for rule in active_rules:
-                for match in rule.pattern.finditer(line):
-                    findings.append(
-                        {
-                            "rule_id": rule.rule_id,
-                            "severity": rule.severity,
-                            "title": rule.title,
-                            "file": rel.as_posix(),
-                            "line": line_no,
-                            "column": match.start() + 1,
-                            "excerpt": line.strip()[:300],
-                        }
-                    )
-                    if len(findings) >= max_findings:
-                        break
-                if len(findings) >= max_findings:
-                    break
-            if len(findings) >= max_findings:
-                break
-        if len(findings) >= max_findings:
-            break
+        findings.extend(_scan_text(text, active_rules, rel, max_findings=remaining))
 
     by_severity: dict[str, int] = {}
     for f in findings:
@@ -195,7 +385,7 @@ def run_regex_scan(
 
     return {
         "tool": "regex_scan",
-        "rules_version": 2,
+        "rules_version": RULES_VERSION,
         "files_scanned": files_scanned,
         "lines_scanned": lines_scanned,
         "findings_total": len(findings),
@@ -203,6 +393,8 @@ def run_regex_scan(
         "findings": findings,
         "notes": [
             "Heuristic scan only; high false-positive/false-negative risk.",
+            "Rules match across line breaks (whole-file regex); `line`..`end_line` bound each hit.",
+            "Comment bodies are masked before matching (except rules with match_in='all'), so commented-out code does not fire.",
             "Do not treat as a substitute for compilation-based analysis.",
         ],
     }

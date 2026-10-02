@@ -130,9 +130,7 @@ def test_admin_only_withdraw_still_flagged_for_review(tmp_path: Path, custom_rul
     triage. The reduce step is responsible for filtering down.
     """
     body = (
-        "function adminWithdraw(address to, uint256 amount) external onlyOwner {\n"
-        "    token.transfer(to, amount);\n"
-        "}\n"
+        "function adminWithdraw(address to, uint256 amount) external onlyOwner {\n    token.transfer(to, amount);\n}\n"
     )
     assert "PUBLIC_WITHDRAW_FN_PARAM_RECEIVER" in _scan(tmp_path, body, custom_rules)
 

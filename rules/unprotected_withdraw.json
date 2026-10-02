@@ -3,7 +3,7 @@
     "rule_id": "CALL_GAS_FORWARD_FULL",
     "severity": "High",
     "title": "Low-level call forwards all remaining gas (reentrancy door)",
-    "pattern": "\\.call\\s*\\{[^}]*gas\\s*:\\s*(gasleft\\s*\\(\\s*\\)|msg\\.gas)"
+    "pattern": "\\.call\\s*\\{[^{}]*gas\\s*:\\s*(gasleft\\s*\\(\\s*\\)|msg\\.gas)"
   },
   {
     "rule_id": "PUBLIC_WITHDRAW_FN_PARAM_RECEIVER",
@@ -27,7 +27,7 @@
     "rule_id": "CALL_VALUE_TO_PARAM",
     "severity": "High",
     "title": "Low-level call with value to caller-controlled address",
-    "pattern": "(_?to|_?recipient|_?receiver|_?beneficiary|_?payee|_?destination|_?target)\\s*\\.\\s*call\\s*\\{[^}]*value\\s*:"
+    "pattern": "(_?to|_?recipient|_?receiver|_?beneficiary|_?payee|_?destination|_?target)\\s*\\.\\s*call\\s*\\{[^{}]*value\\s*:"
   },
   {
     "rule_id": "PAYABLE_TO_PARAM_RECEIVER",
@@ -39,6 +39,12 @@
     "rule_id": "MISSING_OWNER_RECEIVER_BINDING",
     "severity": "Info",
     "title": "Function has both an `owner` and a separate `receiver`/`to` parameter (verify they are bound)",
-    "pattern": "function\\s+[A-Za-z0-9_]+\\s*\\([^)]*\\baddress\\s+(_?owner|_?from|_?account|_?holder)\\b[^)]*\\baddress\\s+(_?to|_?receiver|_?recipient|_?beneficiary)\\b"
+    "pattern": "function\\s+[A-Za-z0-9_]+\\s*\\((?=[^){};]{0,400}\\baddress\\s+(_?owner|_?from|_?account|_?holder)\\b)(?=[^){};]{0,400}\\baddress\\s+(_?to|_?receiver|_?recipient|_?beneficiary)\\b)(?:[^){};]{0,400}+\\))?"
+  },
+  {
+    "rule_id": "ERC4626_WITHDRAW_REDEEM_OVERRIDE_SIG",
+    "severity": "High",
+    "title": "ERC4626 withdraw/redeem(uint256,address,address) override — verify _spendAllowance(owner, msg.sender, shares) is called when msg.sender != owner (else any caller can drain `owner`'s shares to `receiver`)",
+    "pattern": "function\\s+(withdraw|redeem)\\s*\\(\\s*uint256\\s+\\w+\\s*,\\s*address\\s+\\w+\\s*,\\s*address\\s+\\w+\\s*\\)"
   }
 ]
