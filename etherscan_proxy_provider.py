@@ -30,6 +30,8 @@ import threading
 import time
 from typing import Any
 
+from web3 import Web3
+from web3.middleware import ExtraDataToPOAMiddleware
 from web3.providers.base import JSONBaseProvider
 from web3.types import RPCEndpoint, RPCResponse
 
@@ -187,6 +189,37 @@ def _call_params(p: list) -> dict:
         "data": tx.get("data") or tx.get("input") or "0x",
         "tag": _hexify(p[1]) if len(p) > 1 else "latest",
     }
+
+
+def make_web3(chain_id: int, rpc_url: str = "") -> tuple[Web3, str]:
+    """Build a read-only Web3 for ``chain_id``, with the niche-chain proxy fallback.
+
+    Resolution: an explicit ``rpc_url`` -> the configured native RPC -> the Etherscan V2
+    proxy provider (needs ETHERSCAN_API_KEY) for chains with no native node. POA middleware
+    is injected so get_block works on POA chains. Returns ``(w3, label)``. Raises if there is
+    no native RPC and no API key.
+
+    This is the single source of truth shared by onchain_state._w3 and download_contract's
+    RPC paths, so a niche chain never silently falls back to the wrong (default BSC) node.
+    """
+    url = rpc_url or scryer_config.get_rpc_url(chain_id)
+    if url:
+        provider: Any = Web3.HTTPProvider(url)
+        label = url
+    else:
+        key = scryer_config.get("ETHERSCAN_API_KEY")
+        if not key:
+            raise RuntimeError(
+                f"no RPC configured for chain {chain_id} and no ETHERSCAN_API_KEY for the Etherscan-proxy fallback"
+            )
+        provider = EtherscanProxyProvider(chain_id, key)
+        label = f"etherscan-v2-proxy:{chain_id}"
+    w3 = Web3(provider)
+    try:
+        w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+    except Exception:
+        pass
+    return w3, label
 
 
 # method -> (params -> Etherscan proxy query fields)

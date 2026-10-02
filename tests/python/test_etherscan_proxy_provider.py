@@ -153,6 +153,26 @@ def test_throttle_retry_can_succeed() -> None:
     assert calls["n"] == 2 and resp["result"] == "0xabcd" and "error" not in resp
 
 
+def test_make_web3_selects_native_then_proxy_then_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Configured chain (chain 1 always has a public RPC) -> native HTTPProvider, no key needed.
+    w3, label = epp.make_web3(1)
+    assert label.startswith("http") and type(w3.provider).__name__ == "HTTPProvider"
+
+    # Niche chain + key -> Etherscan proxy provider (NOT a wrong-chain native node).
+    monkeypatch.setenv("ETHERSCAN_API_KEY", "DUMMY")
+    w3b, labelb = epp.make_web3(80002)
+    assert labelb == "etherscan-v2-proxy:80002" and type(w3b.provider).__name__ == "EtherscanProxyProvider"
+
+    # An explicit rpc_url always wins (even for a niche chain).
+    w3c, labelc = epp.make_web3(80002, "https://custom.example/rpc")
+    assert labelc == "https://custom.example/rpc" and type(w3c.provider).__name__ == "HTTPProvider"
+
+    # Niche chain + no key -> clear error (never a silent wrong-chain fallback).
+    monkeypatch.delenv("ETHERSCAN_API_KEY", raising=False)
+    with pytest.raises(RuntimeError):
+        epp.make_web3(80002)
+
+
 def test_proxy_jsonrpc_error_passes_through_as_error() -> None:
     # A genuine EVM error (not a throttle) must surface as an error, not be misread.
     def fake_get(url, params=None):

@@ -19,7 +19,6 @@ import httpx
 from eth_abi import decode as abi_decode
 from eth_abi import encode as abi_encode
 from web3 import Web3
-from web3.middleware import ExtraDataToPOAMiddleware
 
 import scryer_config
 from scryer_http import RateLimitTally, rate_limit_reason, retry_after_seconds, rpc_rate_limit_reason
@@ -90,31 +89,12 @@ _TOKENS: dict[int, list[tuple[str, str, int, bool]]] = {
 
 
 def _w3(chain_id: int) -> tuple[Web3, str]:
-    url = scryer_config.get_rpc_url(chain_id)
-    if url:
-        provider = Web3.HTTPProvider(url)
-        label = url
-    else:
-        # No native RPC configured for this (niche) chain -> fall back to Etherscan V2's proxy
-        # module as an RPC backend: ONE key covers 70+ chains, so get_state/call_view/
-        # read_storage/token_exposure work even on chains scryer has no public node for.
-        key = scryer_config.get("ETHERSCAN_API_KEY")
-        if not key:
-            raise RuntimeError(
-                f"no RPC configured for chain {chain_id} and no ETHERSCAN_API_KEY for the Etherscan-proxy fallback"
-            )
-        from etherscan_proxy_provider import EtherscanProxyProvider
+    # Native RPC if configured, else the Etherscan V2 proxy fallback for niche chains.
+    # make_web3 is the single source of truth (shared with download_contract) and injects
+    # the POA middleware that POA chains (BSC/Polygon/L2s) need for get_block.
+    from etherscan_proxy_provider import make_web3
 
-        provider = EtherscanProxyProvider(chain_id, key)
-        label = f"etherscan-v2-proxy:{chain_id}"
-    w3 = Web3(provider)
-    # Many supported chains are POA (BSC, Polygon, several L2s): their long extraData field
-    # trips web3's default block validation, which breaks get_block (needed for timestamps).
-    try:
-        w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
-    except Exception:
-        pass
-    return w3, label
+    return make_web3(chain_id)
 
 
 def _parse_block(block) -> tuple[object, str | None]:

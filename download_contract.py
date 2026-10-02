@@ -17,6 +17,7 @@ from web3 import Web3
 import scryer_config
 import scryer_http
 from scryer_http import RateLimitTally, rate_limit_reason, retry_after_seconds, rpc_rate_limit_reason
+from etherscan_proxy_provider import make_web3
 from contract_registry import ContractRegistry
 from decompilers import decompile_with_heimdall, decompile_with_panoramix
 from scryer_logging import get_logger
@@ -184,10 +185,11 @@ def resolve_proxy_targets(
     - EIP-1167 minimal proxy runtime code
     """
     address = normalize_address(address)
-    w3 = Web3(Web3.HTTPProvider(rpc_url))
     result: dict = {"chain_id": chain_id, "address": address, "rpc_url": rpc_url, "proxy": {}}
 
     try:
+        w3, label = make_web3(chain_id, rpc_url)  # native RPC, else Etherscan proxy (niche chains)
+        result["rpc_url"] = label
         code = w3.eth.get_code(Web3.to_checksum_address(address))
     except Exception as e:
         reason = rpc_rate_limit_reason(e)
@@ -586,8 +588,8 @@ def extract_from_bytecode_metadata(
     chain_id: int, address: str, rpc_url: str = DEFAULT_RPC_URL, tally: RateLimitTally | None = None
 ):
     """最後手段: 從鏈上 bytecode 解析 metadata → IPFS/Swarm"""
-    w3 = Web3(Web3.HTTPProvider(rpc_url))
     try:
+        w3, _ = make_web3(chain_id, rpc_url)  # native RPC, else Etherscan proxy (niche chains)
         bytecode = w3.eth.get_code(Web3.to_checksum_address(address)).hex()
     except Exception as e:
         # Note a throttle (so a rate-limited RPC isn't read as "EOA/no code") then re-raise;
@@ -806,7 +808,10 @@ def fetch_contract_source(
     # when the caller left the default — one RPC convention shared with
     # rpc_contract_discovery, and the correct chain's node instead of a single global.
     if rpc_url == DEFAULT_RPC_URL:
-        rpc_url = scryer_config.get_rpc_url(chain_id) or rpc_url
+        # Resolve the correct per-chain RPC. For a niche chain with no native node this is "",
+        # which make_web3 turns into the Etherscan V2 proxy fallback — do NOT keep the BSC
+        # default here, or a niche chain's proxy slots/bytecode would be read off the wrong node.
+        rpc_url = scryer_config.get_rpc_url(chain_id)
 
     proxy_info = None
     targets = [root_address]
@@ -917,7 +922,7 @@ def fetch_contract_source(
             # Save bytecode-only with marker, optionally with a decompiled
             # pseudo-source if Heimdall/Panoramix is available locally.
             try:
-                w3 = Web3(Web3.HTTPProvider(rpc_url))
+                w3, _ = make_web3(chain_id, rpc_url)  # native RPC, else Etherscan proxy (niche chains)
                 bytecode = w3.eth.get_code(Web3.to_checksum_address(target)).hex()
                 recovered_from_archive_block: int | None = None
                 if (not bytecode or bytecode == "0x") and archive_rpc_url:
