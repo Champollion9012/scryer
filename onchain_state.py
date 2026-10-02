@@ -10,6 +10,7 @@ reality instead of guessing.
 RPC endpoints come from scryer_config.get_rpc_url (the unified per-chain resolver).
 All functions are best-effort and never raise — they return an ``error`` key.
 """
+
 from __future__ import annotations
 
 from web3 import Web3
@@ -18,15 +19,15 @@ import scryer_config
 
 # No-argument view selectors worth probing on an unknown contract.
 _VIEWS: dict[str, str] = {
-    "owner": "8da5cb5b",        # owner()
-    "getOwner": "893d20e8",     # getOwner()  (common on BEP20)
-    "admin": "f851a440",        # admin()
-    "pendingOwner": "e30c3978", # pendingOwner()
-    "paused": "5c975abb",       # paused()
+    "owner": "8da5cb5b",  # owner()
+    "getOwner": "893d20e8",  # getOwner()  (common on BEP20)
+    "admin": "f851a440",  # admin()
+    "pendingOwner": "e30c3978",  # pendingOwner()
+    "paused": "5c975abb",  # paused()
     "implementation": "5c60da1b",  # implementation()
-    "name": "06fdde03",         # name()
-    "symbol": "95d89b41",       # symbol()
-    "decimals": "313ce567",     # decimals()
+    "name": "06fdde03",  # name()
+    "symbol": "95d89b41",  # symbol()
+    "decimals": "313ce567",  # decimals()
     "totalSupply": "18160ddd",  # totalSupply()
 }
 _ADDR = {"owner", "getOwner", "admin", "pendingOwner", "implementation"}
@@ -69,7 +70,7 @@ def _w3(chain_id: int) -> tuple[Web3, str]:
 
 def _call(w3: Web3, address: str, selector: str, suffix: str = "") -> bytes | None:
     try:
-        raw = w3.eth.call({"to": Web3.to_checksum_address(address), "data": "0x" + selector + suffix})
+        raw = w3.eth.call({"to": Web3.to_checksum_address(address), "data": bytes.fromhex(selector + suffix)})
         return bytes(raw)
     except Exception:
         return None
@@ -114,6 +115,7 @@ def get_state(chain_id: int, address: str) -> dict:
         b = _call(w3, address, sel)
         if not b:
             continue
+        v: str | bool | int | None
         if name in _ADDR:
             v = _as_addr(b)
         elif name in _BOOL:

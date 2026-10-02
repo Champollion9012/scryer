@@ -16,6 +16,7 @@ Run:  python scryer_mcp.py            # stdio transport (for Claude Code / MCP c
 Relative paths (sources/, .contract_registry.db) resolve against the repo root,
 so this reuses scryer's existing data stores.
 """
+
 from __future__ import annotations
 
 import json
@@ -73,8 +74,13 @@ def health() -> dict:
         "role": "data/retrieval layer - analysis is performed by the connecting agent",
         "explorer_keys": {
             k: bool(os.getenv(k))
-            for k in ("ETHERSCAN_API_KEY", "BSCSCAN_API_KEY", "POLYGONSCAN_API_KEY",
-                      "ARBISCAN_API_KEY", "BASESCAN_API_KEY")
+            for k in (
+                "ETHERSCAN_API_KEY",
+                "BSCSCAN_API_KEY",
+                "POLYGONSCAN_API_KEY",
+                "ARBISCAN_API_KEY",
+                "BASESCAN_API_KEY",
+            )
         },
         "solc": bool(which("solc")),
         "registry": reg,
@@ -325,8 +331,10 @@ def registry_clones(chain_id: int = 0, address: str = "", source_hash: str = "")
             return {"source_hash": source_hash, "addresses": reg.get_addresses_by_hash(source_hash)}
         if not address:
             return {"error": "provide either source_hash, or chain_id + address"}
-        return {"query": {"chain_id": chain_id, "address": address.lower()},
-                "related": reg.find_related_contracts(chain_id, address)}
+        return {
+            "query": {"chain_id": chain_id, "address": address.lower()},
+            "related": reg.find_related_contracts(chain_id, address),
+        }
     except Exception as e:
         return _err(e)
 
@@ -339,8 +347,9 @@ def registry_tag_vulnerability(source_hash: str, tag: str, severity: str = "", d
     with registry_vulnerable to turn the local registry into a bug knowledge base.
     """
     try:
-        ContractRegistry().tag_vulnerability(source_hash, tag, severity=severity or None,
-                                             description=description or None)
+        ContractRegistry().tag_vulnerability(
+            source_hash, tag, severity=severity or "Unknown", description=description or ""
+        )
         return {"ok": True, "source_hash": source_hash, "tag": tag}
     except Exception as e:
         return _err(e)
