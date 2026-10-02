@@ -99,6 +99,9 @@ class Config:
     lookback_blocks: int = 200
     confirmations: int = 3
     max_chunks_per_tick: int = 20  # cap work per tick so daemon stays responsive
+    scan_on_hit: bool = False
+    scan_rule_files: list[Path] = field(default_factory=list)
+    scan_sources_dir: Path = Path("sources")
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -282,6 +285,13 @@ class WhaleStore:
 
     def _init(self) -> None:
         with self._conn() as conn:
+            # Migrate existing DBs that pre-date the scan_summary column.
+            try:
+                cols = {row[1] for row in conn.execute("PRAGMA table_info(whale_hits)").fetchall()}
+                if cols and "scan_summary" not in cols:
+                    conn.execute("ALTER TABLE whale_hits ADD COLUMN scan_summary TEXT")
+            except sqlite3.OperationalError:
+                pass  # table doesn't exist yet — fresh init below will include the column.
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS whale_hits (
@@ -298,6 +308,7 @@ class WhaleStore:
                     amount_raw TEXT NOT NULL,
                     amount_normalized REAL,
                     receiver_is_contract INTEGER,
+                    scan_summary TEXT,
                     seen_at TEXT DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(chain_id, tx_hash, log_index)
                 );
@@ -342,6 +353,7 @@ class WhaleStore:
         symbol: str,
         decimals: int,
         receiver_is_contract: bool,
+        scan_summary: str | None = None,
     ) -> bool:
         """Insert a hit; returns True if newly inserted, False if duplicate."""
         with self._conn() as conn:
@@ -352,8 +364,8 @@ class WhaleStore:
                         chain_id, block_number, tx_hash, log_index,
                         token_address, token_symbol, token_decimals,
                         from_address, to_address, amount_raw, amount_normalized,
-                        receiver_is_contract
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                        receiver_is_contract, scan_summary
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
                         log.chain_id,
@@ -368,12 +380,25 @@ class WhaleStore:
                         str(log.amount_raw),
                         log.normalized(decimals),
                         int(bool(receiver_is_contract)),
+                        scan_summary,
                     ),
                 )
                 conn.commit()
                 return True
             except sqlite3.IntegrityError:
                 return False
+
+    def update_scan_summary(self, *, chain_id: int, tx_hash: str, log_index: int, summary: str) -> None:
+        """Attach a regex-scan summary to an existing hit row."""
+        with self._conn() as conn:
+            conn.execute(
+                """
+                UPDATE whale_hits SET scan_summary = ?
+                 WHERE chain_id = ? AND tx_hash = ? AND log_index = ?
+                """,
+                (summary, chain_id, tx_hash, log_index),
+            )
+            conn.commit()
 
     def recent_hits(self, *, limit: int = 100, chain_id: int | None = None) -> list[dict]:
         with self._conn() as conn:
@@ -408,6 +433,60 @@ def _is_contract_code(code: str) -> bool:
     if not code or not code.startswith("0x"):
         return False
     return len(code) > 2  # anything beyond "0x" indicates code
+
+
+def _scan_recipient(
+    *,
+    chain_id: int,
+    address: str,
+    rule_files: list[Path],
+    sources_dir: Path,
+) -> dict | None:
+    """Download the recipient's source and run regex rules over it.
+
+    Returns a summary dict (``{"rule_id_counts": …, "total": …}``) or
+    ``None`` if the download fails. Imports are lazy so the whale watcher
+    stays cheap when ``--scan-on-hit`` is off.
+    """
+    try:
+        import download_contract
+        import scanners
+    except Exception as e:  # pragma: no cover — defensive
+        _log.warning("scan-on-hit unavailable: %s", e)
+        return None
+
+    try:
+        ok = download_contract.fetch_contract_source(
+            chain_id=chain_id,
+            address=address,
+            output_dir=str(sources_dir),
+            layout="flat",
+            quiet=True,
+        )
+    except Exception as e:  # pragma: no cover — network failures expected
+        _log.warning("scan-on-hit download failed for %s: %s", address, e)
+        return None
+    if not ok:
+        return None
+
+    rules = list(scanners.DEFAULT_REGEX_RULES)
+    for path in rule_files:
+        try:
+            rules.extend(scanners.load_rules_from_file(path))
+        except Exception as e:
+            _log.warning("rule file %s skipped: %s", path, e)
+
+    addr_lc = address.lower().removeprefix("0x")
+    files = sorted(sources_dir.glob(f"{chain_id}_0x{addr_lc}_*.sol"))
+    if not files:
+        return None
+
+    findings = scanners.run_regex_scan(files, root=sources_dir, rules=rules)
+    counts: dict[str, int] = {}
+    for f in findings.get("findings", []):
+        rid = f.get("rule_id", "?")
+        counts[rid] = counts.get(rid, 0) + 1
+    return {"total": sum(counts.values()), "rule_id_counts": counts, "files": [p.name for p in files]}
 
 
 def _amount_passes_threshold(amount_raw: int, decimals: int, threshold_usd: float) -> bool:
@@ -502,6 +581,28 @@ def scan_chain(
                     log.block_number,
                     log.tx_hash[:18],
                 )
+                if config.scan_on_hit:
+                    summary = _scan_recipient(
+                        chain_id=chain_id,
+                        address=log.to_address,
+                        rule_files=config.scan_rule_files,
+                        sources_dir=config.scan_sources_dir,
+                    )
+                    if summary:
+                        store.update_scan_summary(
+                            chain_id=chain_id,
+                            tx_hash=log.tx_hash,
+                            log_index=log.log_index,
+                            summary=json.dumps(summary, ensure_ascii=False),
+                        )
+                        if summary["total"]:
+                            _log.info(
+                                "[chain %d] scan: %s flagged %d findings (rules: %s)",
+                                chain_id,
+                                log.to_address,
+                                summary["total"],
+                                ", ".join(summary["rule_id_counts"]),
+                            )
 
         store.set_cursor(chain_id, chunk_to)
         stats.cursor_advanced_to = chunk_to
@@ -608,6 +709,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
         metavar="N",
         help="After scan, print the N most-recent hits as JSONL.",
     )
+    parser.add_argument(
+        "--scan-on-hit",
+        action="store_true",
+        help="Download each new contract recipient's source and run regex scanners; persist a JSON summary in whale_hits.scan_summary.",
+    )
+    parser.add_argument(
+        "--scan-rule-file",
+        type=Path,
+        action="append",
+        default=[],
+        help="Additional regex rule pack to merge with scanners.DEFAULT_REGEX_RULES (repeatable; e.g. rules/unprotected_withdraw.json).",
+    )
+    parser.add_argument(
+        "--scan-sources-dir",
+        type=Path,
+        default=Path("sources"),
+        help="Where to drop downloaded sources during --scan-on-hit (default: sources).",
+    )
     return parser
 
 
@@ -626,6 +745,9 @@ def build_config(args: argparse.Namespace) -> Config:
         lookback_blocks=args.lookback_blocks,
         confirmations=args.confirmations,
         max_chunks_per_tick=args.max_chunks_per_tick,
+        scan_on_hit=bool(args.scan_on_hit),
+        scan_rule_files=list(args.scan_rule_file or []),
+        scan_sources_dir=args.scan_sources_dir,
     )
 
 

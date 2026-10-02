@@ -318,15 +318,36 @@ def _load_whale_hits(
         finally:
             reg_conn.close()
 
+    import json as _json
+
     enriched: list[dict] = []
     for r in rows:
         explorer_base = CHAIN_EXPLORERS.get(r["chain_id"], "https://etherscan.io")
+        scan_total: int | None = None
+        scan_rules: list[tuple[str, int]] = []
+        raw_summary = r.get("scan_summary") if isinstance(r, dict) else None
+        if raw_summary:
+            try:
+                parsed = _json.loads(raw_summary)
+                if isinstance(parsed, dict):
+                    scan_total = int(parsed.get("total") or 0)
+                    counts = parsed.get("rule_id_counts") or {}
+                    if isinstance(counts, dict):
+                        scan_rules = sorted(
+                            ((str(k), int(v)) for k, v in counts.items()),
+                            key=lambda kv: (-kv[1], kv[0]),
+                        )
+            except (ValueError, TypeError):
+                scan_total = None
+                scan_rules = []
         enriched.append(
             {
                 **r,
                 "chain_name": CHAIN_NAMES.get(r["chain_id"], str(r["chain_id"])),
                 "tx_explorer_url": f"{explorer_base}/tx/{r['tx_hash']}",
                 "in_registry": (r["chain_id"], r["to_address"].lower()) in indexed_keys,
+                "scan_total": scan_total,
+                "scan_rules": scan_rules,
             }
         )
 

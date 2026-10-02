@@ -51,6 +51,7 @@
             <th>Amount (USD)</th>
             <th>From</th>
             <th>To (Contract)</th>
+            <th>Scan</th>
         </tr>
     </thead>
     <tbody>
@@ -81,6 +82,23 @@
                 <span class="vuln-badge vuln-low">indexed</span>
                 {% else %}
                 <span class="vuln-badge vuln-medium">unseen</span>
+                {% endif %}
+            </td>
+            <td>
+                {% if h.scan_total is none %}
+                    <span class="hash">-</span>
+                {% elif h.scan_total == 0 %}
+                    <span class="vuln-badge vuln-low">clean</span>
+                {% else %}
+                    <span class="vuln-badge vuln-high" title="{% for rid, n in h.scan_rules %}{{ rid }}={{ n }}{% if not loop.last %}, {% endif %}{% endfor %}">
+                        {{ h.scan_total }} hit{{ '' if h.scan_total == 1 else 's' }}
+                    </span>
+                    <div class="hash" style="margin-top: 0.2rem; font-size: 0.78em; opacity: 0.78;">
+                        {% for rid, n in h.scan_rules[:3] %}
+                            {{ rid }}{% if n > 1 %}×{{ n }}{% endif %}{% if not loop.last %}, {% endif %}
+                        {% endfor %}
+                        {% if h.scan_rules|length > 3 %} … +{{ h.scan_rules|length - 3 }}{% endif %}
+                    </div>
                 {% endif %}
             </td>
         </tr>

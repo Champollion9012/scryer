@@ -177,6 +177,71 @@ def test_whales_route_renders_seeded_hits(client, tmp_path, monkeypatch) -> None
     assert "0x2222222222" in body
 
 
+def test_whales_route_renders_scan_summary_badge(client, tmp_path, monkeypatch) -> None:
+    """A hit with scan_summary JSON shows the hit count badge + top rule_ids."""
+    import scryer_whale_watcher as ww
+
+    db = tmp_path / "w.db"
+    store = ww.WhaleStore(db)
+    log = ww.TransferLog(
+        chain_id=1,
+        block_number=4242,
+        tx_hash="0x" + "cd" * 32,
+        log_index=1,
+        token_address="0xdac17f958d2ee523a2206206994597c13d831ec7",
+        from_address="0x" + "33" * 20,
+        to_address="0x" + "44" * 20,
+        amount_raw=70_000 * 10**6,
+    )
+    store.insert_hit(log, symbol="USDT", decimals=6, receiver_is_contract=True)
+    store.update_scan_summary(
+        chain_id=1,
+        tx_hash="0x" + "cd" * 32,
+        log_index=1,
+        summary='{"total": 5, "rule_id_counts": {"PUBLIC_WITHDRAW_FN_PARAM_RECEIVER": 3, "RAW_SELECTOR_BYTES_LITERAL": 2}}',
+    )
+
+    monkeypatch.setattr(
+        "scryer_config.get",
+        lambda key, default=None: str(db) if key == "WHALE_WATCHER_DB" else default,
+    )
+    body = client.get("/whales").get_data(as_text=True)
+    assert "5 hits" in body
+    assert "PUBLIC_WITHDRAW_FN_PARAM_RECEIVER" in body
+    assert "RAW_SELECTOR_BYTES_LITERAL" in body
+
+
+def test_whales_route_renders_clean_badge_for_zero_scan(client, tmp_path, monkeypatch) -> None:
+    """scan_summary with total=0 renders the 'clean' badge, not the 'hits' badge."""
+    import scryer_whale_watcher as ww
+
+    db = tmp_path / "w.db"
+    store = ww.WhaleStore(db)
+    log = ww.TransferLog(
+        chain_id=1,
+        block_number=5,
+        tx_hash="0x" + "ee" * 32,
+        log_index=0,
+        token_address="0xdac17f958d2ee523a2206206994597c13d831ec7",
+        from_address="0x" + "55" * 20,
+        to_address="0x" + "66" * 20,
+        amount_raw=10_000 * 10**6,
+    )
+    store.insert_hit(log, symbol="USDT", decimals=6, receiver_is_contract=True)
+    store.update_scan_summary(
+        chain_id=1,
+        tx_hash="0x" + "ee" * 32,
+        log_index=0,
+        summary='{"total": 0, "rule_id_counts": {}}',
+    )
+    monkeypatch.setattr(
+        "scryer_config.get",
+        lambda key, default=None: str(db) if key == "WHALE_WATCHER_DB" else default,
+    )
+    body = client.get("/whales").get_data(as_text=True)
+    assert "clean" in body
+
+
 def test_whales_route_ignores_garbage_chain_param(client, tmp_path, monkeypatch) -> None:
     """?chain=foo must not 500 — graceful fall back to "all chains"."""
     monkeypatch.setattr(

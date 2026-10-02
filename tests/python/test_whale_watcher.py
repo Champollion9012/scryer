@@ -79,14 +79,21 @@ def test_parse_transfer_log_extracts_addresses_and_amount() -> None:
 
 def test_parse_skips_non_transfer_topic() -> None:
     raw = _make_raw_log(
-        block=1, log_index=0, token="0x" + "00" * 19 + "01", sender="0x" + "11" * 20, receiver="0x" + "22" * 20, amount=1
+        block=1,
+        log_index=0,
+        token="0x" + "00" * 19 + "01",
+        sender="0x" + "11" * 20,
+        receiver="0x" + "22" * 20,
+        amount=1,
     )
     raw["topics"][0] = "0x" + "00" * 32  # not Transfer
     assert ww.parse_transfer_log(1, raw) is None
 
 
 def test_parse_skips_short_topic_list() -> None:
-    raw = _make_raw_log(block=1, log_index=0, token="0x" + "00" * 20, sender="0x" + "11" * 20, receiver="0x" + "22" * 20, amount=1)
+    raw = _make_raw_log(
+        block=1, log_index=0, token="0x" + "00" * 20, sender="0x" + "11" * 20, receiver="0x" + "22" * 20, amount=1
+    )
     raw["topics"] = [ww.TRANSFER_TOPIC]
     assert ww.parse_transfer_log(1, raw) is None
 
@@ -189,9 +196,7 @@ def test_store_recent_hits_filtered_by_chain(tmp_path: Path) -> None:
         "log_index": 0,
     }
     for i, chain_id in enumerate([1, 1, 56, 56, 56]):
-        log = ww.TransferLog(
-            chain_id=chain_id, block_number=i, tx_hash=f"0x{i:064x}", amount_raw=10**18, **base
-        )
+        log = ww.TransferLog(chain_id=chain_id, block_number=i, tx_hash=f"0x{i:064x}", amount_raw=10**18, **base)
         store.insert_hit(log, symbol="X", decimals=18, receiver_is_contract=True)
     assert len(store.recent_hits(limit=10, chain_id=1)) == 2
     assert len(store.recent_hits(limit=10, chain_id=56)) == 3
@@ -208,8 +213,18 @@ def test_load_tokens_from_file(tmp_path: Path) -> None:
     p.write_text(
         json.dumps(
             [
-                {"chain_id": 137, "address": "0xC2132D05D31c914a87C6611C10748AEb04B58e8F", "symbol": "USDT", "decimals": 6},
-                {"chain_id": 42161, "address": "0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8", "symbol": "USDC", "decimals": 6},
+                {
+                    "chain_id": 137,
+                    "address": "0xC2132D05D31c914a87C6611C10748AEb04B58e8F",
+                    "symbol": "USDT",
+                    "decimals": 6,
+                },
+                {
+                    "chain_id": 42161,
+                    "address": "0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8",
+                    "symbol": "USDC",
+                    "decimals": 6,
+                },
             ]
         ),
         encoding="utf-8",
@@ -424,3 +439,78 @@ def test_build_arg_parser_accepts_expected_flags() -> None:
     assert args.threshold_usd == 10_000.0
     assert args.mode == "once"
     assert args.print_recent == 5
+
+
+def test_build_arg_parser_accepts_scan_on_hit_flags() -> None:
+    parser = ww.build_arg_parser()
+    args = parser.parse_args(
+        [
+            "--scan-on-hit",
+            "--scan-rule-file",
+            "rules/unprotected_withdraw.json",
+            "--scan-rule-file",
+            "rules/ai_authored_drainer.json",
+            "--scan-sources-dir",
+            "tmp_sources",
+        ]
+    )
+    assert args.scan_on_hit is True
+    assert [p.as_posix() for p in args.scan_rule_file] == [
+        "rules/unprotected_withdraw.json",
+        "rules/ai_authored_drainer.json",
+    ]
+    assert args.scan_sources_dir.as_posix() == "tmp_sources"
+
+
+def test_store_update_scan_summary_persists(tmp_path: Path) -> None:
+    store = ww.WhaleStore(tmp_path / "w.db")
+    log = ww.TransferLog(
+        chain_id=1,
+        block_number=42,
+        tx_hash="0xfeed",
+        log_index=3,
+        token_address="0xdac17f958d2ee523a2206206994597c13d831ec7",
+        from_address="0x" + "1" * 40,
+        to_address="0x" + "2" * 40,
+        amount_raw=10**6,
+    )
+    store.insert_hit(log, symbol="USDT", decimals=6, receiver_is_contract=True)
+    store.update_scan_summary(chain_id=1, tx_hash="0xfeed", log_index=3, summary='{"total":3}')
+    rows = store.recent_hits(limit=10)
+    assert rows[0]["scan_summary"] == '{"total":3}'
+
+
+def test_store_migrates_existing_db_without_scan_summary_column(tmp_path: Path) -> None:
+    """Older .whale_watcher.db files predate the scan_summary column;
+    the WhaleStore init must ALTER TABLE rather than fail."""
+    import sqlite3
+
+    db = tmp_path / "legacy.db"
+    with sqlite3.connect(db) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE whale_hits (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chain_id INTEGER NOT NULL,
+                block_number INTEGER NOT NULL,
+                tx_hash TEXT NOT NULL,
+                log_index INTEGER NOT NULL,
+                token_address TEXT NOT NULL,
+                token_symbol TEXT,
+                token_decimals INTEGER,
+                from_address TEXT NOT NULL,
+                to_address TEXT NOT NULL,
+                amount_raw TEXT NOT NULL,
+                amount_normalized REAL,
+                receiver_is_contract INTEGER,
+                seen_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(chain_id, tx_hash, log_index)
+            );
+            """
+        )
+        conn.commit()
+    # Should not raise
+    ww.WhaleStore(db)
+    with sqlite3.connect(db) as conn:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(whale_hits)").fetchall()}
+    assert "scan_summary" in cols
