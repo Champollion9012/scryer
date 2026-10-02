@@ -437,7 +437,7 @@ class ContractCrawler:
             if i > 0 and i % 100 == 0:
                 _log.info("  Progress: %d/%d (%d saved)", i, len(addresses), saved_count)
 
-            if isinstance(result, Exception):
+            if isinstance(result, BaseException):
                 async with self._lock:
                     self.stats["errors"] += 1
                 continue

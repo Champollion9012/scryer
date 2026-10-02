@@ -317,7 +317,7 @@ BIGQUERY_DATASETS = {
 }
 
 
-async def fetch_contracts_from_bigquery(
+def fetch_contracts_from_bigquery(
     chain_id: int,
     days_back: int = 30,
     max_results: int = 10000,

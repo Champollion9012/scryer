@@ -10,6 +10,7 @@ import asyncio
 import contextlib
 import os
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -109,7 +110,7 @@ class BlockScanner:
         self.rate_limiter = rate_limiter or AsyncRateLimiter(requests_per_second=50.0)
         self._rpc_index = 0
         self.use_proxy = False
-        self.proxy_client = None
+        self.proxy_client: httpx.AsyncClient | None = None
         self._proxy_lock = asyncio.Lock()
 
     def get_rpc_url(self) -> str:
@@ -293,7 +294,7 @@ class BlockScanner:
         from_block: int,
         to_block: int,
         client: httpx.AsyncClient,
-        progress_callback: callable | None = None,
+        progress_callback: Callable[[int, int, int], None] | None = None,
         concurrency: int = 10,
         queue: asyncio.Queue | None = None,
         stop_event: asyncio.Event | None = None,
@@ -467,7 +468,7 @@ class ContractDiscovery:
             _log.info("  - Blocks %s to %s (%s blocks)", f"{start:,}", f"{end:,}", f"{end - start + 1:,}")
 
         # Queue for streaming contracts
-        queue = asyncio.Queue()
+        queue: asyncio.Queue[Any] = asyncio.Queue()
         stop_event = asyncio.Event()
 
         # Progress callback. On a TTY, render in-place with `\r` for live

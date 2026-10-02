@@ -3,11 +3,14 @@ import atexit
 import datetime as dt
 import os
 import re
+import sys
 from pathlib import Path
+from typing import Any
 
 import cbor2  # pip install cbor2 (for metadata parsing)
 import httpx
 import orjson
+from hexbytes import HexBytes
 from web3 import Web3
 
 import scryer_config
@@ -41,6 +44,61 @@ IPFS_GATEWAYS = [
 
 # Default RPC URL (can be overridden by env/CLI)
 DEFAULT_RPC_URL = os.getenv("RPC_URL") or os.getenv("BSC_RPC_URL") or "https://bsc-dataseed.binance.org"
+
+# Optional archive RPC for recovering bytecode of contracts that self-destructed
+# in the same tx as the exploit. Live RPCs return b"" / "0x" for these addresses;
+# an archive node serves the historic state. Configure via CLI or env.
+DEFAULT_ARCHIVE_RPC_URL = os.getenv("ARCHIVE_RPC_URL") or ""
+
+
+def _fetch_archive_bytecode(
+    *,
+    archive_rpc_url: str,
+    address: str,
+    block_number: int | None,
+    primary_rpc_url: str,
+    tx_hash: str | None,
+) -> tuple[str, int] | None:
+    """Try to fetch historic bytecode for ``address`` against an archive node.
+
+    Returns ``(bytecode_hex, resolved_block)`` on success (``bytecode_hex``
+    starts with ``0x`` and is non-empty), or ``None`` if recovery fails.
+
+    Exactly one of ``block_number`` or ``tx_hash`` should be set. When a tx
+    hash is supplied, the resolved block is ``txBlock - 1`` (read from the
+    primary RPC, since the archive node is typically not used for routine
+    reads).
+    """
+    if not archive_rpc_url:
+        return None
+    if block_number is None and not tx_hash:
+        return None
+    try:
+        target_block: int
+        if tx_hash:
+            primary = Web3(Web3.HTTPProvider(primary_rpc_url))
+            tx = primary.eth.get_transaction(HexBytes(tx_hash))
+            tx_block = tx.get("blockNumber") if isinstance(tx, dict) else getattr(tx, "blockNumber", None)
+            if tx_block is None:
+                _log.warning("Archive recovery: tx %s has no blockNumber yet", tx_hash)
+                return None
+            target_block = tx_block - 1
+        else:
+            assert block_number is not None
+            target_block = block_number
+
+        archive = Web3(Web3.HTTPProvider(archive_rpc_url))
+        raw = archive.eth.get_code(Web3.to_checksum_address(address), block_identifier=target_block)
+        bytecode_hex = raw.hex() if isinstance(raw, (bytes, bytearray)) else str(raw)
+        if not bytecode_hex.startswith("0x"):
+            bytecode_hex = "0x" + bytecode_hex
+        if bytecode_hex == "0x" or len(bytecode_hex) < 4:
+            _log.warning("Archive recovery: empty bytecode at block %s for %s", target_block, address)
+            return None
+        return bytecode_hex, target_block
+    except Exception as e:
+        _log.warning("Archive recovery failed (%s): %s", type(e).__name__, e)
+        return None
 
 
 def normalize_address(address: str) -> str:
@@ -83,7 +141,7 @@ def try_get_storage_address(w3: Web3, address: str, slot: int) -> str | None:
 
 def try_call_implementation(w3: Web3, address: str) -> str | None:
     # bytes4(keccak256("implementation()")) == 0x5c60da1b
-    data = "0x5c60da1b"
+    data = bytes.fromhex("5c60da1b")
     try:
         raw = w3.eth.call({"to": Web3.to_checksum_address(address), "data": data})
     except Exception:
@@ -552,7 +610,7 @@ def extract_from_bytecode_metadata(chain_id: int, address: str, rpc_url: str = D
                     if path in sources:
                         break
 
-        metadata_out = {"cbor": cbor_meta, "metadata": metadata_json}
+        metadata_out: dict[str, Any] = {"cbor": cbor_meta, "metadata": metadata_json}
         if metadata_url:
             metadata_out["metadata_url"] = metadata_url
 
@@ -677,9 +735,19 @@ def fetch_contract_source(
 
     def _dump_source(path: str, code: str) -> None:
         # quiet=False mode dumps fetched sources to stdout — this is the
-        # data the user asked for, so it stays on print().
-        print(f"\n{'=' * 60}\n{path}\n{'=' * 60}")
-        print(code[:1000] + "..." if len(code) > 1000 else code)
+        # data the user asked for, so it stays on print(). Re-encode through
+        # stdout's codec with errors='replace' so a cp1252-only Windows
+        # console can't raise UnicodeEncodeError mid-print and abort the
+        # whole fetch (which used to leave sources/ empty despite a
+        # "success" log line).
+        encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+        body = code[:1000] + "..." if len(code) > 1000 else code
+
+        def _safe(text: str) -> str:
+            return text.encode(encoding, errors="replace").decode(encoding, errors="replace")
+
+        print(_safe(f"\n{'=' * 60}\n{path}\n{'=' * 60}"))
+        print(_safe(body))
 
     def fetch_one(target: str):
         # 步驟 1: Sourcify
@@ -752,6 +820,28 @@ def fetch_contract_source(
             try:
                 w3 = Web3(Web3.HTTPProvider(rpc_url))
                 bytecode = w3.eth.get_code(Web3.to_checksum_address(target)).hex()
+                recovered_from_archive_block: int | None = None
+                if (not bytecode or bytecode == "0x") and archive_rpc_url:
+                    _log.info(
+                        "Live bytecode empty (likely self-destructed). "
+                        "Attempting archive RPC recovery (tx=%s, block=%s)…",
+                        archive_tx_hash,
+                        archive_block,
+                    )
+                    archive_result = _fetch_archive_bytecode(
+                        archive_rpc_url=archive_rpc_url,
+                        address=target,
+                        block_number=archive_block,
+                        primary_rpc_url=rpc_url,
+                        tx_hash=archive_tx_hash,
+                    )
+                    if archive_result:
+                        bytecode, recovered_from_archive_block = archive_result
+                        _log.info(
+                            "✅ Archive RPC recovered bytecode at block %s (%d hex chars)",
+                            recovered_from_archive_block,
+                            len(bytecode),
+                        )
                 if bytecode and bytecode != "0x":
                     decompiled_text: str | None = None
                     decompiler_name: str | None = None
@@ -787,6 +877,7 @@ def fetch_contract_source(
                                 "decompiler": decompiler_name,
                                 "reason": msg,
                                 "proxy_resolution": proxy_info,
+                                "archive_recovered_block": recovered_from_archive_block,
                             },
                         )
                         _log.info("✅ Saved decompiled source — DOWNSTREAM CONSUMERS MUST TRUST OPCODES, NOT NAMING")
@@ -825,12 +916,21 @@ def fetch_contract_source(
                             "bytecode_only": True,
                             "reason": msg,
                             "proxy_resolution": proxy_info,
+                            "archive_recovered_block": recovered_from_archive_block,
                         },
                     )
                     _log.info("✅ 已保存 bytecode (標記為 BYTECODE_ONLY)")
                     any_success = True
                 else:
-                    _log.error("❌ 無法取得 bytecode (可能是 EOA 或已自毀的合約)")
+                    if archive_rpc_url:
+                        _log.error(
+                            "❌ 無法取得 bytecode (live + archive RPC both empty — verify --archive-tx/--archive-block)"
+                        )
+                    else:
+                        _log.error(
+                            "❌ 無法取得 bytecode (可能是 EOA 或已自毀的合約; 設定 ARCHIVE_RPC_URL "
+                            "並提供 --archive-tx <hash> 可嘗試 recover)"
+                        )
             except Exception as e:
                 _log.error("❌ 保存 bytecode 失敗: %s", e)
             continue
@@ -869,6 +969,22 @@ if __name__ == "__main__":
         "--layout", choices=["flat", "tree"], default="flat", help="Save layout: flat filenames or tree per contract."
     )
     parser.add_argument("--quiet", action="store_true", help="Reduce output (do not print sources/metadata previews).")
+    parser.add_argument(
+        "--archive-rpc-url",
+        default=DEFAULT_ARCHIVE_RPC_URL,
+        help="Archive node URL for recovering bytecode of self-destructed contracts (env: ARCHIVE_RPC_URL).",
+    )
+    parser.add_argument(
+        "--archive-tx",
+        default=None,
+        help="Tx hash whose blockNumber-1 will be queried on the archive node (typical exploit-tx use).",
+    )
+    parser.add_argument(
+        "--archive-block",
+        type=int,
+        default=None,
+        help="Explicit block number for archive bytecode recovery (overridden by --archive-tx if both set).",
+    )
     args = parser.parse_args()
 
     chain_id = args.chain_id
@@ -883,4 +999,7 @@ if __name__ == "__main__":
         output_dir=args.output_dir,
         layout=args.layout,
         quiet=args.quiet,
+        archive_rpc_url=args.archive_rpc_url,
+        archive_tx_hash=args.archive_tx,
+        archive_block=args.archive_block,
     )

@@ -116,11 +116,7 @@ def _solc_output(deployed_object: str, *, immutable_refs: dict | None = None) ->
     return json.dumps(
         {
             "errors": [],
-            "contracts": {
-                "scripts/1.sol": {
-                    "test": {"evm": {"deployedBytecode": deployed}}
-                }
-            },
+            "contracts": {"scripts/1.sol": {"test": {"evm": {"deployedBytecode": deployed}}}},
         }
     )
 
@@ -213,8 +209,7 @@ def test_zero_immutable_ranges_strips_0x_prefix() -> None:
 def test_compile_raises_on_solc_error() -> None:
     err_out = json.dumps({"errors": [{"severity": "error", "formattedMessage": "ParserError: bad"}]})
     fake_proc = SimpleNamespace(returncode=0, stdout=err_out, stderr="")
-    with patch.object(vs.subprocess, "run", return_value=fake_proc), \
-         pytest.raises(RuntimeError, match="solc errors"):
+    with patch.object(vs.subprocess, "run", return_value=fake_proc), pytest.raises(RuntimeError, match="solc errors"):
         vs.compile_runtime_bytecode(
             sources={"scripts/1.sol": "junk"},
             settings={},
@@ -226,8 +221,10 @@ def test_compile_raises_on_solc_error() -> None:
 
 def test_compile_raises_on_non_zero_exit() -> None:
     fake_proc = SimpleNamespace(returncode=1, stdout="", stderr="oom")
-    with patch.object(vs.subprocess, "run", return_value=fake_proc), \
-         pytest.raises(RuntimeError, match="solc returned 1"):
+    with (
+        patch.object(vs.subprocess, "run", return_value=fake_proc),
+        pytest.raises(RuntimeError, match="solc returned 1"),
+    ):
         vs.compile_runtime_bytecode(
             sources={}, settings={}, target_file="x.sol", target_contract="X", solc_path=Path("/fake/solc")
         )
@@ -263,7 +260,9 @@ def _seed_meta_and_source(
                 "metadata": {"bytecodeHash": "ipfs"},
             },
             "sources": {
-                "scripts/1.sol": {"content": source_content} if inline_source else {"keccak256": "0x00", "license": "MIT"}
+                "scripts/1.sol": {"content": source_content}
+                if inline_source
+                else {"keccak256": "0x00", "license": "MIT"}
             },
         },
     }
@@ -304,9 +303,11 @@ def test_verify_full_match(tmp_path: Path) -> None:
     deployed = "60806040DEAD" + "ff" * 8 + "0008"  # runtime + 8-byte trailer + length 8
 
     fake_proc = SimpleNamespace(returncode=0, stdout=_solc_output(deployed), stderr="")
-    with patch.object(vs.subprocess, "run", return_value=fake_proc), \
-         patch.object(vs.scryer_http, "sync_client", return_value=_fake_rpc_post(deployed)), \
-         patch.object(vs, "find_solc", return_value=Path("/fake/solc")):
+    with (
+        patch.object(vs.subprocess, "run", return_value=fake_proc),
+        patch.object(vs.scryer_http, "sync_client", return_value=_fake_rpc_post(deployed)),
+        patch.object(vs, "find_solc", return_value=Path("/fake/solc")),
+    ):
         result = vs.verify_contract(1, addr, sources_dir=sources_dir, rpc_url="http://stub")
 
     assert result.verdict == "full_match"
@@ -325,16 +326,18 @@ def test_verify_full_match_with_immutables_zeroed(tmp_path: Path) -> None:
 
     # 32 bytes of "code" + 8-byte trailer + 2-byte length suffix.
     # Imagine the 32-byte slot at byte offset 16 is an immutable address.
-    runtime_code_compiled = "ff" * 16 + "00" * 32 + "ee" * 4 + "0008"   # immutable = zeros
-    runtime_code_on_chain = "ff" * 16 + "ab" * 32 + "ee" * 4 + "0008"   # immutable = real address
+    runtime_code_compiled = "ff" * 16 + "00" * 32 + "ee" * 4 + "0008"  # immutable = zeros
+    runtime_code_on_chain = "ff" * 16 + "ab" * 32 + "ee" * 4 + "0008"  # immutable = real address
     immutable_refs = {"42": [{"start": 16, "length": 32}]}
 
     fake_proc = SimpleNamespace(
         returncode=0, stdout=_solc_output(runtime_code_compiled, immutable_refs=immutable_refs), stderr=""
     )
-    with patch.object(vs.subprocess, "run", return_value=fake_proc), \
-         patch.object(vs.scryer_http, "sync_client", return_value=_fake_rpc_post(runtime_code_on_chain)), \
-         patch.object(vs, "find_solc", return_value=Path("/fake/solc")):
+    with (
+        patch.object(vs.subprocess, "run", return_value=fake_proc),
+        patch.object(vs.scryer_http, "sync_client", return_value=_fake_rpc_post(runtime_code_on_chain)),
+        patch.object(vs, "find_solc", return_value=Path("/fake/solc")),
+    ):
         result = vs.verify_contract(1, addr, sources_dir=sources_dir, rpc_url="http://stub")
 
     assert result.verdict == "full_match", f"got {result.verdict}: {result.notes}"
@@ -343,8 +346,7 @@ def test_verify_full_match_with_immutables_zeroed(tmp_path: Path) -> None:
 
 
 def test_verify_mismatch_remains_when_runtime_actually_differs_around_immutables(tmp_path: Path) -> None:
-    """If the bytes OUTSIDE immutable ranges differ, masking shouldn't paper over it.
-    """
+    """If the bytes OUTSIDE immutable ranges differ, masking shouldn't paper over it."""
     addr = "0x" + "fb" * 20
     sources_dir = _seed_meta_and_source(tmp_path, chain_id=1, address=addr)
     # immutable at [16, 48); but we tweak a byte at offset 4 too — that should
@@ -353,12 +355,12 @@ def test_verify_mismatch_remains_when_runtime_actually_differs_around_immutables
     on_chain = "ff" * 4 + "BB" + "ff" * 11 + "ab" * 32 + "ee" * 4 + "0008"
     immutable_refs = {"7": [{"start": 16, "length": 32}]}
 
-    fake_proc = SimpleNamespace(
-        returncode=0, stdout=_solc_output(compiled, immutable_refs=immutable_refs), stderr=""
-    )
-    with patch.object(vs.subprocess, "run", return_value=fake_proc), \
-         patch.object(vs.scryer_http, "sync_client", return_value=_fake_rpc_post(on_chain)), \
-         patch.object(vs, "find_solc", return_value=Path("/fake/solc")):
+    fake_proc = SimpleNamespace(returncode=0, stdout=_solc_output(compiled, immutable_refs=immutable_refs), stderr="")
+    with (
+        patch.object(vs.subprocess, "run", return_value=fake_proc),
+        patch.object(vs.scryer_http, "sync_client", return_value=_fake_rpc_post(on_chain)),
+        patch.object(vs, "find_solc", return_value=Path("/fake/solc")),
+    ):
         result = vs.verify_contract(1, addr, sources_dir=sources_dir, rpc_url="http://stub")
 
     assert result.verdict == "mismatch"
@@ -375,9 +377,11 @@ def test_verify_partial_match_when_only_trailer_differs(tmp_path: Path) -> None:
     deployed_on_chain = runtime_core + "11" * 8 + "0008"  # different trailer
 
     fake_proc = SimpleNamespace(returncode=0, stdout=_solc_output(deployed_compiled), stderr="")
-    with patch.object(vs.subprocess, "run", return_value=fake_proc), \
-         patch.object(vs.scryer_http, "sync_client", return_value=_fake_rpc_post(deployed_on_chain)), \
-         patch.object(vs, "find_solc", return_value=Path("/fake/solc")):
+    with (
+        patch.object(vs.subprocess, "run", return_value=fake_proc),
+        patch.object(vs.scryer_http, "sync_client", return_value=_fake_rpc_post(deployed_on_chain)),
+        patch.object(vs, "find_solc", return_value=Path("/fake/solc")),
+    ):
         result = vs.verify_contract(1, addr, sources_dir=sources_dir, rpc_url="http://stub")
 
     assert result.verdict == "partial_match"
@@ -391,9 +395,11 @@ def test_verify_mismatch_when_runtime_differs(tmp_path: Path) -> None:
     deployed_on_chain = "BBBB" + "ff" * 8 + "0008"  # runtime differs
 
     fake_proc = SimpleNamespace(returncode=0, stdout=_solc_output(deployed_compiled), stderr="")
-    with patch.object(vs.subprocess, "run", return_value=fake_proc), \
-         patch.object(vs.scryer_http, "sync_client", return_value=_fake_rpc_post(deployed_on_chain)), \
-         patch.object(vs, "find_solc", return_value=Path("/fake/solc")):
+    with (
+        patch.object(vs.subprocess, "run", return_value=fake_proc),
+        patch.object(vs.scryer_http, "sync_client", return_value=_fake_rpc_post(deployed_on_chain)),
+        patch.object(vs, "find_solc", return_value=Path("/fake/solc")),
+    ):
         result = vs.verify_contract(1, addr, sources_dir=sources_dir, rpc_url="http://stub")
 
     assert result.verdict == "mismatch"
@@ -417,9 +423,11 @@ def test_verify_no_bytecode_when_eoa(tmp_path: Path) -> None:
     sources_dir = _seed_meta_and_source(tmp_path, chain_id=1, address=addr)
 
     fake_proc = SimpleNamespace(returncode=0, stdout=_solc_output("dead"), stderr="")
-    with patch.object(vs.subprocess, "run", return_value=fake_proc), \
-         patch.object(vs.scryer_http, "sync_client", return_value=_fake_rpc_post("")), \
-         patch.object(vs, "find_solc", return_value=Path("/fake/solc")):
+    with (
+        patch.object(vs.subprocess, "run", return_value=fake_proc),
+        patch.object(vs.scryer_http, "sync_client", return_value=_fake_rpc_post("")),
+        patch.object(vs, "find_solc", return_value=Path("/fake/solc")),
+    ):
         result = vs.verify_contract(1, addr, sources_dir=sources_dir, rpc_url="http://stub")
 
     assert result.verdict == "no_bytecode"
@@ -431,9 +439,11 @@ def test_verify_loads_source_from_disk_when_metadata_lacks_inline_content(tmp_pa
     sources_dir = _seed_meta_and_source(tmp_path, chain_id=1, address=addr, inline_source=False)
     runtime = "abcdef0123456789" + "0001" + "0001"  # non-empty trailer
     fake_proc = SimpleNamespace(returncode=0, stdout=_solc_output(runtime), stderr="")
-    with patch.object(vs.subprocess, "run", return_value=fake_proc) as mock_run, \
-         patch.object(vs.scryer_http, "sync_client", return_value=_fake_rpc_post(runtime)), \
-         patch.object(vs, "find_solc", return_value=Path("/fake/solc")):
+    with (
+        patch.object(vs.subprocess, "run", return_value=fake_proc) as mock_run,
+        patch.object(vs.scryer_http, "sync_client", return_value=_fake_rpc_post(runtime)),
+        patch.object(vs, "find_solc", return_value=Path("/fake/solc")),
+    ):
         result = vs.verify_contract(1, addr, sources_dir=sources_dir, rpc_url="http://stub")
 
     assert result.verdict == "full_match"
@@ -525,9 +535,11 @@ def test_verify_contract_uses_cache_on_hit(tmp_path: Path) -> None:
     )
 
     # If solc or RPC were called, these mocks would fail loudly
-    with patch.object(vs.subprocess, "run", side_effect=AssertionError("solc must not run on cache hit")), \
-         patch.object(vs.scryer_http, "sync_client", side_effect=AssertionError("RPC must not run on cache hit")), \
-         patch.object(vs, "find_solc", return_value=fake_solc):
+    with (
+        patch.object(vs.subprocess, "run", side_effect=AssertionError("solc must not run on cache hit")),
+        patch.object(vs.scryer_http, "sync_client", side_effect=AssertionError("RPC must not run on cache hit")),
+        patch.object(vs, "find_solc", return_value=fake_solc),
+    ):
         result = vs.verify_contract(1, addr, sources_dir=sources_dir, cache=cache)
 
     assert result.verdict == "full_match"
@@ -542,9 +554,11 @@ def test_verify_contract_writes_cacheable_verdicts(tmp_path: Path) -> None:
     deployed = "60806040DEAD" + "ff" * 8 + "0008"
 
     fake_proc = SimpleNamespace(returncode=0, stdout=_solc_output(deployed), stderr="")
-    with patch.object(vs.subprocess, "run", return_value=fake_proc), \
-         patch.object(vs.scryer_http, "sync_client", return_value=_fake_rpc_post(deployed)), \
-         patch.object(vs, "find_solc", return_value=Path("/fake/solc")):
+    with (
+        patch.object(vs.subprocess, "run", return_value=fake_proc),
+        patch.object(vs.scryer_http, "sync_client", return_value=_fake_rpc_post(deployed)),
+        patch.object(vs, "find_solc", return_value=Path("/fake/solc")),
+    ):
         first = vs.verify_contract(1, addr, sources_dir=sources_dir, rpc_url="http://stub", cache=cache)
 
     assert first.verdict == "full_match"
@@ -552,9 +566,11 @@ def test_verify_contract_writes_cacheable_verdicts(tmp_path: Path) -> None:
 
     # Second call must hit cache — solc/RPC mocks raise if invoked.
     # find_solc must keep returning the same path so the cache key matches.
-    with patch.object(vs.subprocess, "run", side_effect=AssertionError("should not recompile")), \
-         patch.object(vs.scryer_http, "sync_client", side_effect=AssertionError("should not RPC")), \
-         patch.object(vs, "find_solc", return_value=Path("/fake/solc")):
+    with (
+        patch.object(vs.subprocess, "run", side_effect=AssertionError("should not recompile")),
+        patch.object(vs.scryer_http, "sync_client", side_effect=AssertionError("should not RPC")),
+        patch.object(vs, "find_solc", return_value=Path("/fake/solc")),
+    ):
         second = vs.verify_contract(1, addr, sources_dir=sources_dir, rpc_url="http://stub", cache=cache)
     assert second.verdict == "full_match"
     assert second.cache_hit is True
@@ -584,14 +600,22 @@ def test_cli_main_returns_no_solc_when_solc_missing(tmp_path: Path, monkeypatch,
     """main() should run end-to-end and return exit code 2 when solc is unavailable."""
     addr = "0x" + "55" * 20
     sources_dir = _seed_meta_and_source(tmp_path, chain_id=1, address=addr)
-    monkeypatch.setattr(vs.sys, "argv", [
-        "verify_source.py",
-        "--chain-id", "1",
-        "--address", addr,
-        "--sources-dir", str(sources_dir),
-        "--rpc-url", "http://stub",
-        "--json",
-    ])
+    monkeypatch.setattr(
+        vs.sys,
+        "argv",
+        [
+            "verify_source.py",
+            "--chain-id",
+            "1",
+            "--address",
+            addr,
+            "--sources-dir",
+            str(sources_dir),
+            "--rpc-url",
+            "http://stub",
+            "--json",
+        ],
+    )
     with patch.object(vs, "find_solc", return_value=None):
         rc = vs.main()
     assert rc == vs._EXIT_CODES["no_solc"]

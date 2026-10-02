@@ -94,6 +94,50 @@ def test_decompile_fallback_imports_correctly() -> None:
     assert hasattr(dc, "decompile_with_panoramix")
 
 
+def test_fetch_archive_bytecode_no_url_returns_none() -> None:
+    """Without an archive RPC URL the helper short-circuits to None — should
+    never attempt a network call. Important for offline test runs."""
+    result = dc._fetch_archive_bytecode(
+        archive_rpc_url="",
+        address="0x" + "ab" * 20,
+        block_number=10,
+        primary_rpc_url="http://unused",
+        tx_hash=None,
+    )
+    assert result is None
+
+
+def test_fetch_archive_bytecode_no_target_block_or_tx_returns_none() -> None:
+    """If neither block_number nor tx_hash is supplied, the helper must bail
+    out before touching any RPC."""
+    result = dc._fetch_archive_bytecode(
+        archive_rpc_url="http://archive.example",
+        address="0x" + "ab" * 20,
+        block_number=None,
+        primary_rpc_url="http://primary.example",
+        tx_hash=None,
+    )
+    assert result is None
+
+
+def test_fetch_archive_bytecode_cli_flags_present() -> None:
+    """The CLI must expose --archive-rpc-url / --archive-tx / --archive-block
+    so users can recover self-destructed exploit-tx contracts."""
+    import inspect
+
+    src = inspect.getsource(dc)
+    assert "--archive-rpc-url" in src
+    assert "--archive-tx" in src
+    assert "--archive-block" in src
+    # And the fetch_contract_source signature must accept them.
+    sig = inspect.signature(dc.fetch_contract_source)
+    assert {"archive_rpc_url", "archive_tx_hash", "archive_block"}.issubset(sig.parameters.keys())
+    # Defaults must be safe (no archive recovery unless explicitly opted in).
+    assert sig.parameters["archive_rpc_url"].default == ""
+    assert sig.parameters["archive_tx_hash"].default is None
+    assert sig.parameters["archive_block"].default is None
+
+
 def test_decompile_fallback_meta_marker_consumed_by_audit(tmp_path: Path) -> None:
     """When download_contract writes a decompiled source, the meta MUST set
     ``decompiled: True`` and ``decompiler: <name>`` so audit_contracts can

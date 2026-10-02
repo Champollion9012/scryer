@@ -159,7 +159,7 @@ class VerifyCache:
             return None
         notes = json.loads(row[8]) if row[8] else []
         return VerifyResult(
-            verdict=row[2],  # type: ignore[arg-type]
+            verdict=row[2],
             chain_id=int(row[0]),
             address=str(row[1]),
             compiler_version=row[3],
@@ -656,9 +656,7 @@ def _verify_contract_uncached(
         on_chain_cmp = zero_immutable_ranges(on_chain, immutable_ranges)
         compiled_cmp = zero_immutable_ranges(compiled, immutable_ranges)
         bytes_zeroed = sum(length for _, length in immutable_ranges)
-        notes.append(
-            f"masked {len(immutable_ranges)} immutable ref(s) ({bytes_zeroed} bytes) before compare"
-        )
+        notes.append(f"masked {len(immutable_ranges)} immutable ref(s) ({bytes_zeroed} bytes) before compare")
     else:
         on_chain_cmp = on_chain
         compiled_cmp = compiled
