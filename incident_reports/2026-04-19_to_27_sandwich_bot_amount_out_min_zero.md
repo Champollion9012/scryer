@@ -138,7 +138,7 @@ python audit_contracts.py \
 | Commit | What | Validates against |
 |---|---|---|
 | `25460ab` | `rules/zero_slippage_amm.json` rule pack + 14 tests, including a pinned-limitation test for the multi-line regex blind spot | 3/4 victims on `addLiquidity`, 0/4 on the primary swap rule (regex layer) |
-| 2026-09-17 (this branch) | `scanners.run_regex_scan` switched to whole-file matching (`rules_version: 3`, findings gain `end_line`); `UNISWAP_ADD_LIQUIDITY_ZERO_MIN` uses `[^;]*?` instead of `.*?` so it also spans lines; blind-spot test rewritten as a positive catch | **4/4 victims (regex layer)**, 0 lost findings on 201 local sources, ~1.9× faster scan |
+| 2026-09-17 (this branch) | `scanners.run_regex_scan` switched to whole-file matching with comment bodies masked (`RULES_VERSION = 3`, findings gain `end_line`, `max_findings` bounds work per rule); every negated-class window in the AMM pack bounded (`[^;{}]{0,500}`, call-options group `\{[^{};]*\}`) so hostile sources cannot go quadratic; `UNISWAP_ADD_LIQUIDITY_ZERO_MIN` uses that bounded window instead of `.*?` so it spans lines; blind-spot test rewritten as a positive catch | **4/4 victims (regex layer)**; on 3218 local sources 226 findings dropped (225 inside `//` / `/* */` bodies — comment masking; the 1 other is a `FRONT_RUNNING` hit whose `amount` token sat in a trailing comment) and 525 gained (multi-line calls/signatures); max span 18 lines; 1.7–3× faster scan across runs |
 | Earlier in branch — `12ecb3b` `feat(audit): force trusted-role threat enumeration + numeric bounds audit in prompt` | The `MANDATORY-2 Numeric Input Bounds` directive that the LLM uses to catch the multi-line case | 4/4 victims (LLM layer) |
 
 ---

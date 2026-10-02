@@ -3,24 +3,24 @@
     "rule_id": "UNISWAP_SWAP_AMOUNT_OUT_MIN_ZERO",
     "severity": "High",
     "title": "Uniswap-style swap with amountOutMin=0 — sandwich-vulnerable (no slippage protection)",
-    "pattern": "swap(Exact)?(Tokens|ETH)?For(Tokens|ETH)[A-Za-z]*\\s*(?:\\{[^{};]*\\}\\s*)?\\(\\s*[^,)]{1,500},\\s*0\\s*,"
+    "pattern": "(?<![A-Za-z])swap(Exact)?(Tokens|ETH)?For(Tokens|ETH)[A-Za-z]*\\s*(?:\\{[^{};]*\\}\\s*)?\\(\\s*[^,)]{1,500},\\s*0\\s*,"
   },
   {
     "rule_id": "UNISWAP_SWAP_ETH_AMOUNT_OUT_MIN_ZERO",
     "severity": "High",
     "title": "swap*ETHForTokens with amountOutMin=0 (first positional arg when amountIn is msg.value)",
-    "pattern": "swap(Exact)?ETHForTokens[A-Za-z]*\\s*(?:\\{[^{};]*\\}\\s*)?\\(\\s*0\\s*,"
+    "pattern": "(?<![A-Za-z])swap(Exact)?ETHForTokens[A-Za-z]*\\s*(?:\\{[^{};]*\\}\\s*)?\\(\\s*0\\s*,"
   },
   {
     "rule_id": "UNISWAP_ADD_LIQUIDITY_ZERO_MIN",
     "severity": "High",
     "title": "addLiquidity*(...) called with both amountAMin=0 and amountBMin=0 — initial LP is sandwich-vulnerable",
-    "pattern": "addLiquidity(ETH)?\\s*(?:\\{[^{};]*\\}\\s*)?\\([^;{}]{0,500}?,\\s*0\\s*,\\s*0\\s*,"
+    "pattern": "(?<![A-Za-z])addLiquidity(ETH)?\\s*(?:\\{[^{};]*\\}\\s*)?\\([^;{}]{0,500}?,\\s*0\\s*,\\s*0\\s*,"
   },
   {
     "rule_id": "UNISWAP_DEADLINE_BLOCK_TIMESTAMP",
     "severity": "Low",
     "title": "block.timestamp passed directly as Uniswap deadline — no real expiration window (mempool may sit indefinitely)",
-    "pattern": "(swap|addLiquidity|removeLiquidity)[A-Za-z]*\\s*(?:\\{[^{};]*\\}\\s*)?\\([^;{}]{0,500},\\s*block\\.timestamp\\s*\\)"
+    "pattern": "(?<![A-Za-z])(swap|addLiquidity|removeLiquidity)[A-Za-z]*\\s*(?:\\{[^{};]*\\}\\s*)?\\([^;{}]{0,500},\\s*block\\.timestamp\\s*\\)"
   }
 ]

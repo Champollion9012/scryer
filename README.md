@@ -23,7 +23,7 @@ Pulls verified source from 8 EVM chains, falls back to bytecode decompilation wh
 | **Pipeline** | [`bounty_pipeline.py`](bounty_pipeline.py) | One-shot download + audit driven by a target JSON. |
 | **Browse** | [`web.py`](web.py) + [`templates/`](templates/) | Local Flask dashboard over the registry; Jinja templates extend `base.html`; debug gated by `FLASK_DEBUG` env. |
 | **Reproduce** | [`tests/`](tests/) | Foundry forks + PoC templates (e.g. MARS staking sync drain). |
-| **Test** | [`tests/python/`](tests/python/) | 316 offline pytest cases over the whole pipeline (audit / cache / scanners / rule packs / similarity / web routes / whale watcher / bounty pipeline / IPFS extraction). |
+| **Test** | [`tests/python/`](tests/python/) | 330+ offline pytest cases over the whole pipeline (audit / cache / scanners / rule packs / similarity / web routes / whale watcher / bounty pipeline / IPFS extraction). |
 
 ## Architecture
 

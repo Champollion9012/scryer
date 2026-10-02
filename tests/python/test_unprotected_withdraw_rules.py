@@ -102,6 +102,27 @@ def test_batch_owners_and_receivers(tmp_path: Path, custom_rules: list) -> None:
     assert "TRANSFER_TO_PARAM_RECEIVER" in ids
 
 
+def test_owner_receiver_binding_any_param_order(tmp_path: Path, custom_rules: list) -> None:
+    """Receiver before owner must fire too — the rule checks that both kinds
+    of parameter are present, not their order."""
+    body = "function claim(address to, address owner, uint256 amount) external {}\n"
+    assert "MISSING_OWNER_RECEIVER_BINDING" in _scan(tmp_path, body, custom_rules)
+
+
+def test_owner_receiver_binding_multiline_signature(tmp_path: Path, custom_rules: list) -> None:
+    """One-parameter-per-line signatures (the common prettier/forge-fmt style)
+    must be caught, anchored on the `function` line and spanning to the `)`."""
+    body = "function claim(\n    address owner,\n    address to\n) external {}\n"
+    p = tmp_path / "Vuln.sol"
+    p.write_text(body, encoding="utf-8")
+    hits = [
+        f
+        for f in run_regex_scan([p], rules=custom_rules)["findings"]
+        if f["rule_id"] == "MISSING_OWNER_RECEIVER_BINDING"
+    ]
+    assert [(f["line"], f["end_line"]) for f in hits] == [(1, 4)]
+
+
 def test_call_value_to_param(tmp_path: Path, custom_rules: list) -> None:
     body = '(bool ok,) = to.call{value: amount}("");\n'
     assert "CALL_VALUE_TO_PARAM" in _scan(tmp_path, body, custom_rules)

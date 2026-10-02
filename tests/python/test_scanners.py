@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from scanners import (
     DEFAULT_REGEX_RULES,
     choose_entry_file,
@@ -75,6 +77,8 @@ def test_no_findings_on_clean_code(tmp_path: Path) -> None:
     # `pragma solidity` shouldn't trigger any rules.
     assert result["findings_total"] == 0
     assert result["files_scanned"] == 1
+    # Semantic-version marker consumers/docs rely on (3 = whole-file + comment masking).
+    assert result["rules_version"] == 3
 
 
 def test_max_findings_cap(tmp_path: Path) -> None:
@@ -82,6 +86,46 @@ def test_max_findings_cap(tmp_path: Path) -> None:
     f = _write(tmp_path / "Many.sol", f"contract X {{\n{body}\n}}\n")
     result = run_regex_scan([f], max_findings=5)
     assert result["findings_total"] <= 5
+
+
+def test_max_findings_cap_holds_across_rules_and_files(tmp_path: Path) -> None:
+    """The cap is global: several rules firing on every line and several files
+    must still yield exactly max_findings, and files past the cap are not read."""
+    body = "contract X {\n" + "    selfdestruct(tx.origin);\n" * 10 + "}\n"
+    a = _write(tmp_path / "A.sol", body)
+    b = _write(tmp_path / "B.sol", body)
+    one = run_regex_scan([a], max_findings=5)
+    assert one["findings_total"] == 5  # 20 hits from two rules, capped to 5
+    two = run_regex_scan([a, b], max_findings=5)
+    assert two["findings_total"] == 5
+    assert two["files_scanned"] == 1
+    assert two["lines_scanned"] == 12
+    # A float cap (historically accepted) still works.
+    assert run_regex_scan([a], max_findings=5.0)["findings_total"] == 5
+
+
+def test_max_findings_caps_matches_consumed_per_rule(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The per-rule cap must bound the matches pulled from finditer (the work),
+    not just the number of findings returned."""
+    import scanners
+
+    consumed: list[int] = []
+    real = scanners._as_multiline
+
+    class _Counting:
+        def __init__(self, pattern):
+            self._p = pattern
+
+        def finditer(self, text):
+            for m in self._p.finditer(text):
+                consumed.append(1)
+                yield m
+
+    monkeypatch.setattr(scanners, "_as_multiline", lambda p: _Counting(real(p)))
+    f = _write(tmp_path / "Dense.sol", "tx.origin " * 1000 + "\n")
+    result = run_regex_scan([f], max_findings=50)
+    assert result["findings_total"] == 50
+    assert len(consumed) == 50, f"{len(consumed)} matches consumed for a cap of 50"
 
 
 def test_findings_include_location(tmp_path: Path) -> None:
@@ -169,6 +213,14 @@ def test_comment_rules_still_see_comments(tmp_path: Path) -> None:
     assert [(x["rule_id"], x["line"]) for x in findings] == [("TODO_FIXME", 2)]
 
 
+def test_todo_rule_does_not_bridge_lines(tmp_path: Path) -> None:
+    """An empty `//` at the end of one line followed by `XXXToken` on the next
+    is not a TODO comment: the rule's `[ \\t]*` must not cross the newline
+    now that it runs over the whole file."""
+    f = _write(tmp_path / "T2.sol", "contract X {\n    uint256 x = 1; //\n    XXXToken t;\n}\n")
+    assert run_regex_scan([f])["findings"] == []
+
+
 def test_string_literal_with_double_slash_is_not_a_comment(tmp_path: Path) -> None:
     """`"https://..."` must not mask the rest of its line."""
     body = (
@@ -228,8 +280,11 @@ def test_max_findings_bounds_work_on_match_dense_line(tmp_path: Path) -> None:
 
 def test_all_rule_packs_are_linear_on_hostile_inputs(tmp_path: Path) -> None:
     """Whole-file matching must not turn `[^}]*` / `[^;]*` / `\\s*` windows
-    into quadratic scans. Each hostile 100-200 KB input used to exceed 15 s
-    on at least one rule; all must now finish in well under a second."""
+    into quadratic scans. Each input is a pathological anchor run for at least
+    one rule (40k anchors, 160 KB-1 MB); with the pre-session pattern forms
+    these take 6-60 s on a laptop, with the bounded forms well under a second.
+    A 2 s ceiling leaves headroom for slow CI while still failing loudly on
+    any quadratic regression (which scales ~4x per doubling)."""
     import time as _time
 
     from scanners import load_rules_from_file
@@ -237,24 +292,28 @@ def test_all_rule_packs_are_linear_on_hostile_inputs(tmp_path: Path) -> None:
     rules = list(DEFAULT_REGEX_RULES)
     for p in sorted((Path(__file__).resolve().parents[2] / "rules").glob("*.json")):
         rules += load_rules_from_file(p)
+    n = 40_000
     cases = {
-        "Call.sol": ".call{\n" * 20_000,
-        "ToCall.sol": "to.call{\n" * 20_000,
-        "For.sol": "for(\n" * 20_000,
-        "Fn.sol": "function f( address from\n" * 20_000,
-        "AddLiq.sol": "addLiquidity(\n" * 20_000,
-        "AddLiqArgs.sol": "addLiquidity(a, b, c,\n" * 20_000,
-        "Swap.sol": "swapExactTokensForTokens(\n" * 20_000,
-        "SwapWs.sol": "swap" + "\n" * 20_000 + "x",
-        "Allow.sol": ".allowance(x\n" * 20_000,
-        "Concat.sol": "bytes.concat(a,b\n" * 20_000,
+        "Call.sol": ".call{\n" * n,
+        "ToCall.sol": "to.call{\n" * n,
+        "For.sol": "for(\n" * n,
+        "Fn.sol": "function f( address from\n" * (n // 2),  # 500 KB; MISSING_OWNER_* lookaheads
+        "AddLiq.sol": "addLiquidity(\n" * n,
+        "AddLiqOpts.sol": "addLiquidityETH{\n" * n,
+        "AddLiqArgs.sol": "addLiquidity(a, b, c,\n" * n,
+        "Swap.sol": "swapExactTokensForTokens(\n" * n,
+        "SwapEth.sol": "swapExactETHForTokens{\n" * n,
+        "SwapWs.sol": "swap" + "\n" * n + "x",
+        "Allow.sol": ".allowance(x\n" * n,
+        "Concat.sol": "bytes.concat(a,b\n" * n,
+        "ConcatNest.sol": "bytes.concat(f(g(\n" * n,
     }
     for name, body in cases.items():
         f = _write(tmp_path / name, body)
         t0 = _time.perf_counter()
         run_regex_scan([f], rules=rules)
         elapsed = _time.perf_counter() - t0
-        assert elapsed < 5.0, f"{name} took {elapsed:.1f}s"
+        assert elapsed < 2.0, f"{name} took {elapsed:.1f}s"
 
 
 def test_run_regex_scan_handles_missing_file(tmp_path: Path) -> None:

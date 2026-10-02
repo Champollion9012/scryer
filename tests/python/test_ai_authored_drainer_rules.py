@@ -53,6 +53,24 @@ def test_bytes_concat_multi_arg(tmp_path: Path, rules: list) -> None:
     assert "BYTES_CONCAT_BUILDS_CALLDATA" in _scan(tmp_path, body, rules)
 
 
+def test_bytes_concat_counts_top_level_args_with_nested_casts(tmp_path: Path, rules: list) -> None:
+    """Uniswap-V3 path packing: three top-level args, two levels of casts."""
+    body = "bytes memory path = bytes.concat(bytes20(tokenIn), bytes3(uint24(fee)), bytes20(tokenOut));\n"
+    assert "BYTES_CONCAT_BUILDS_CALLDATA" in _scan(tmp_path, body, rules)
+
+
+def test_bytes_concat_two_args_with_nested_commas_does_not_fire(tmp_path: Path, rules: list) -> None:
+    """Commas inside a nested call are not argument separators (>=3 args means
+    two TOP-LEVEL commas)."""
+    body = "bytes memory d = bytes.concat(abi.encode(a, b, c), selector);\n"
+    assert "BYTES_CONCAT_BUILDS_CALLDATA" not in _scan(tmp_path, body, rules)
+
+
+def test_bytes_concat_multiline_three_args(tmp_path: Path, rules: list) -> None:
+    body = "bytes memory d = bytes.concat(\n    sel,\n    abi.encode(user, amount),\n    extra\n);\n"
+    assert "BYTES_CONCAT_BUILDS_CALLDATA" in _scan(tmp_path, body, rules)
+
+
 def test_loop_over_users_array(tmp_path: Path, rules: list) -> None:
     body = "for (uint256 i = 0; i < users.length; i++) {\n  drain(users[i]);\n}\n"
     assert "LOOP_OVER_ADDRESS_ARRAY_USER" in _scan(tmp_path, body, rules)

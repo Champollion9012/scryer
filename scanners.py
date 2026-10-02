@@ -356,6 +356,7 @@ def run_regex_scan(
     ``max_findings`` bounds both the output and the work done per file.
     """
     active_rules: Sequence[RegexRule] = rules if rules is not None else DEFAULT_REGEX_RULES
+    max_findings = int(max_findings)  # islice needs an int; callers historically passed floats like 1e9
     findings: list[dict] = []
     files_scanned = 0
     lines_scanned = 0
