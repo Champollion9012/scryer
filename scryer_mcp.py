@@ -624,8 +624,8 @@ def decompile(address: str, chain: str = "", chain_id: int = 0, block: str = "la
 # --------------------------------------------------------------------------- #
 # Relate + persist (clone discovery / vuln knowledge base over the local registry)
 # --------------------------------------------------------------------------- #
-def _bytecode_twins(chain_id: int, address: str) -> dict:
-    """Fingerprint the live bytecode and look for twins — the unverified-contract path."""
+def _live_runtime_hex(chain_id: int, address: str) -> tuple[str | None, str | None]:
+    """Fetch live runtime bytecode (hex, no 0x) at HEAD. Returns (hex, error)."""
     from web3 import Web3
 
     from etherscan_proxy_provider import make_web3
@@ -634,10 +634,17 @@ def _bytecode_twins(chain_id: int, address: str) -> dict:
         w3, _label = make_web3(chain_id)
         code = bytes(w3.eth.get_code(Web3.to_checksum_address(address)))
     except Exception as e:
-        return {"bytecode_match_error": f"{type(e).__name__}: {e}"}
+        return None, f"{type(e).__name__}: {e}"
     if not code:
-        return {"bytecode_match_note": "no code at this address (EOA or self-destructed)"}
-    runtime_hex = code.hex()
+        return None, "no code at this address (EOA or self-destructed)"
+    return code.hex(), None
+
+
+def _bytecode_twins(chain_id: int, address: str) -> dict:
+    """Fingerprint the live bytecode and look for twins — the unverified-contract path."""
+    runtime_hex, err = _live_runtime_hex(chain_id, address)
+    if err:
+        return {"bytecode_match_error": err}
     fp = ba.code_fingerprints(runtime_hex)
     ba.record_fingerprints(chain_id, address, runtime_hex)  # index the query contract too
     twins = ContractRegistry().find_code_twins(chain_id, address, fp)
@@ -692,34 +699,55 @@ def registry_tag_vulnerability(tag: str, source_hash: str = "", address: str = "
                                chain_id: int = 0, severity: str = "", description: str = "") -> dict:
     """Record a confirmed vuln so every clone of that code auto-flags later.
 
-    Key it by `source_hash` OR by `address` (+ chain/chain_id; resolved to the hash
-    internally). Call AFTER confirming a vuln. Echoes back the resolved source_hash
-    and the severity/description actually stored, so you can confirm it landed.
+    Key it by `source_hash`, or by `address` (+ chain/chain_id). For a VERIFIED contract the
+    tag is keyed by source_hash (source clones inherit it). For an UNVERIFIED / bytecode-only
+    contract — e.g. one you just Confirmed with a fork PoC — it falls back to tagging by
+    BYTECODE (the normalized runtime hash), so its byte-identical clones inherit it too. Call
+    AFTER confirming. Echoes what was stored so you can confirm it landed.
     """
     try:
         reg = ContractRegistry()
-        sh = source_hash
-        resolved_from = "source_hash"
-        if not sh:
-            if not address:
-                return {"error": "provide source_hash, or address (+ chain/chain_id)"}
-            cid = _resolve_chain(chain, chain_id)
-            sh = reg.get_hash_by_address(cid, address)
-            resolved_from = f"address {address.lower()} @ chain {cid}"
-            if not sh:
-                return {"error": f"{resolved_from} not in registry - download_contract it first, or pass source_hash"}
         sev = severity or "Unknown"
         desc = description or ""
-        reg.tag_vulnerability(sh, tag, severity=sev, description=desc)
-        return {"ok": True, "source_hash": sh, "tag": tag, "resolved_from": resolved_from,
-                "stored": {"severity": sev, "description": desc}}
+        if source_hash:
+            reg.tag_vulnerability(source_hash, tag, severity=sev, description=desc)
+            return {"ok": True, "source_hash": source_hash, "tag": tag, "keyed_by": "source_hash",
+                    "stored": {"severity": sev, "description": desc}}
+        if not address:
+            return {"error": "provide source_hash, or address (+ chain/chain_id)"}
+        cid = _resolve_chain(chain, chain_id)
+        sh = reg.get_hash_by_address(cid, address)
+        if sh:  # verified contract we have source for -> tag by source
+            reg.tag_vulnerability(sh, tag, severity=sev, description=desc)
+            return {"ok": True, "source_hash": sh, "tag": tag,
+                    "keyed_by": f"source_hash (resolved from {address.lower()} @ chain {cid})",
+                    "stored": {"severity": sev, "description": desc}}
+        # Unverified / not in registry -> tag by bytecode.
+        runtime_hex, err = _live_runtime_hex(cid, address)
+        if err:
+            return {"error": f"{address.lower()} @ chain {cid}: {err} — cannot tag"}
+        fp = ba.code_fingerprints(runtime_hex)
+        norm = fp.get("runtime_norm_hash")
+        if not norm:
+            return {"error": "could not fingerprint bytecode; nothing to tag"}
+        ba.record_fingerprints(cid, address, runtime_hex)  # index it so it appears in registry_vulnerable
+        affected = reg.tag_vulnerability_by_code(norm, tag, severity=sev, description=desc)
+        return {
+            "ok": True, "runtime_norm_hash": norm, "tag": tag,
+            "keyed_by": f"bytecode (unverified {address.lower()} @ chain {cid})",
+            "stored": {"severity": sev, "description": desc},
+            "affected_known_contracts": affected,
+            "note": "tagged by BYTECODE — byte-identical clones (same normalized runtime) inherit this tag.",
+        }
     except Exception as e:
         return _err(e)
 
 
 @mcp.tool()
 def registry_vulnerable(tag: str) -> dict:
-    """List contracts previously tagged with a given vuln tag (and thus their clones)."""
+    """List contracts tagged with a vuln tag (and their clones). Each row's `matched_via` is
+    "source" (source-hash clones of a verified contract) or "bytecode" (byte-identical clones of
+    an unverified one)."""
     try:
         return {"tag": tag, "contracts": ContractRegistry().get_vulnerable_contracts(tag)}
     except Exception as e:

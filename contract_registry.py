@@ -112,6 +112,21 @@ class ContractRegistry:
                 CREATE INDEX IF NOT EXISTS idx_fp_exact ON code_fingerprints(runtime_code_hash);
                 CREATE INDEX IF NOT EXISTS idx_fp_norm ON code_fingerprints(runtime_norm_hash);
                 CREATE INDEX IF NOT EXISTS idx_fp_sel ON code_fingerprints(selector_hash);
+
+                -- Vulnerability tags keyed by BYTECODE, for contracts with no verified source.
+                -- Parallels vulnerability_tags (which is keyed by source_hash). Keyed on the
+                -- normalized runtime (metadata-trailer stripped) so a confirmed bug on one
+                -- unverified deployment auto-flags every byte-identical clone.
+                CREATE TABLE IF NOT EXISTS code_vulnerability_tags (
+                    runtime_norm_hash TEXT NOT NULL,
+                    tag TEXT NOT NULL,
+                    severity TEXT,
+                    description TEXT,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(runtime_norm_hash, tag)
+                );
+                CREATE INDEX IF NOT EXISTS idx_codevuln_hash ON code_vulnerability_tags(runtime_norm_hash);
+                CREATE INDEX IF NOT EXISTS idx_codevuln_tag ON code_vulnerability_tags(tag);
             """)
             conn.commit()
         finally:
@@ -273,6 +288,47 @@ class ContractRegistry:
         finally:
             conn.close()
 
+    def tag_vulnerability_by_code(
+        self, runtime_norm_hash: str, tag: str, severity: str = "Unknown", description: str = ""
+    ) -> int:
+        """Tag a vuln keyed by BYTECODE (normalized runtime), for a contract with no verified
+        source. Every contract whose bytecode matches inherits it. Returns how many known
+        contracts share that hash (i.e. how many this flags)."""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute(
+                """
+                INSERT INTO code_vulnerability_tags (runtime_norm_hash, tag, severity, description)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(runtime_norm_hash, tag) DO UPDATE SET
+                    severity = excluded.severity,
+                    description = excluded.description
+                """,
+                (runtime_norm_hash, tag, severity, description),
+            )
+            conn.commit()
+            return conn.execute(
+                "SELECT COUNT(*) FROM code_fingerprints WHERE runtime_norm_hash = ?", (runtime_norm_hash,)
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+    def code_tags_for(self, runtime_norm_hash: str | None) -> list[dict]:
+        """Bytecode-keyed vuln tags for a given normalized-runtime hash."""
+        if not runtime_norm_hash:
+            return []
+        conn = sqlite3.connect(self.db_path)
+        try:
+            return [
+                {"tag": r[0], "severity": r[1], "description": r[2], "runtime_norm_hash": runtime_norm_hash}
+                for r in conn.execute(
+                    "SELECT tag, severity, description FROM code_vulnerability_tags WHERE runtime_norm_hash = ?",
+                    (runtime_norm_hash,),
+                ).fetchall()
+            ]
+        finally:
+            conn.close()
+
     def has_code_fingerprint(self, chain_id: int, address: str) -> bool:
         conn = sqlite3.connect(self.db_path)
         try:
@@ -355,6 +411,16 @@ class ContractRegistry:
                 ).fetchall():
                     tags.append({"source_hash": r[0], "tag": r[1], "severity": r[2], "description": r[3]})
             out["inherited_vulnerability_tags"] = tags
+            # Tags recorded directly against THIS bytecode (e.g. a prior unverified confirm).
+            norm = fp.get("runtime_norm_hash")
+            if norm:
+                out["code_vulnerability_tags"] = [
+                    {"tag": r[0], "severity": r[1], "description": r[2]}
+                    for r in conn.execute(
+                        "SELECT tag, severity, description FROM code_vulnerability_tags WHERE runtime_norm_hash = ?",
+                        (norm,),
+                    ).fetchall()
+                ]
         finally:
             conn.close()
         return out
@@ -520,18 +586,24 @@ class ContractRegistry:
             conn.close()
 
     def get_vulnerable_contracts(self, tag: str) -> list[dict]:
-        """Get all contracts affected by a vulnerability tag."""
+        """Every contract affected by a tag — both source-hash-tagged (verified contracts and
+        their source clones) and bytecode-tagged (unverified contracts and their byte clones)."""
         conn = sqlite3.connect(self.db_path)
         try:
             cursor = conn.execute(
                 """
-                SELECT c.chain_id, c.address, c.contract_name, v.severity, v.description
+                SELECT c.chain_id, c.address, c.contract_name, v.severity, v.description, 'source' AS via
                 FROM contracts c
                 JOIN vulnerability_tags v ON c.source_hash = v.source_hash
                 WHERE v.tag = ?
-                ORDER BY c.chain_id, c.address
-            """,
-                (tag,),
+                UNION
+                SELECT f.chain_id, f.address, NULL, cv.severity, cv.description, 'bytecode' AS via
+                FROM code_fingerprints f
+                JOIN code_vulnerability_tags cv ON f.runtime_norm_hash = cv.runtime_norm_hash
+                WHERE cv.tag = ?
+                ORDER BY chain_id, address
+                """,
+                (tag, tag),
             )
 
             return [
@@ -541,6 +613,7 @@ class ContractRegistry:
                     "contract_name": row[2],
                     "severity": row[3],
                     "description": row[4],
+                    "matched_via": row[5],
                 }
                 for row in cursor.fetchall()
             ]
