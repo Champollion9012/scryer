@@ -105,6 +105,37 @@ DEFAULT_REGEX_RULES: list[RegexRule] = [
         "delegatecall with storage access",
         re.compile(r"delegatecall.*storage|storage.*delegatecall", re.IGNORECASE),
     ),
+    # Loose LEADS (not verdicts) for the "token manipulates its own DEX pair" class — e.g.
+    # BigBull/BBD (BSC 0x5d52..3df9, ~$72k, Sep 2026): a transfer hook burns the pair's own
+    # balance then calls pair.sync(), resetting the constant-product K to drain LP reserves.
+    # Tuned for RECALL and deliberately naming-INDEPENDENT. The co-occurrence that actually
+    # confirms it (sync/skim reached FROM a transfer hook, targeting the real pair) is left to
+    # the LLM/hunter, and a fork PoC is the final proof — so these are Medium and expect false
+    # positives by design. Provenance: tests/python/test_pair_reserve_manipulation_rules.py
+    RegexRule(
+        "PAIR_SYNC_SKIM_CALL",
+        "Medium",
+        "Suspected: member-calls a DEX pair sync()/skim() — reserve/K manipulation IF reachable "
+        "from a transfer hook. Review the call path; confirm with a fork PoC.",
+        re.compile(r"\.(?:sync|skim)\s*\("),
+    ),
+    RegexRule(
+        "BURN_FROM_PAIR",
+        "Medium",
+        "Suspected: burns/moves tokens FROM a stored (non-sender) address — an LP/reserve drain if "
+        "that address is the DEX pair. Naming-independent lead; confirm the target and reachability.",
+        # Flags _burn/_transfer/transferFrom whose SOURCE arg is some stored address, EXCLUDING the
+        # ordinary self-burn / normal-transfer targets (msg.sender, from, account, this, 0, ...) and
+        # type keywords (so function *definitions* like `_burn(address account,..)` don't fire). A
+        # cast `address(x)` is unwrapped first so the real target x is judged. No longer keyed on the
+        # var being named *pair*/*lp* — that was trivially evaded by renaming.
+        re.compile(
+            r"\b(?:_burn|burnFrom|_transfer|transferFrom)\s*\(\s*(?:address\s*\(\s*)?"
+            r"(?!(?:msg\.sender|_?from|account|owner|sender|holder|recipient|spender|to|this|0"
+            r"|address|uint\d*|int\d*|bool|bytes\d*|string|mapping)\b)\w+",
+            re.IGNORECASE,
+        ),
+    ),
     # === Medium ===
     RegexRule("CALL_VALUE", "Medium", "Low-level call with value", re.compile(r"\.call\s*\{[^{}]*\bvalue\s*:")),
     RegexRule(
