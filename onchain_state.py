@@ -224,6 +224,14 @@ def get_state(chain_id: int, address: str, block: object = "latest") -> dict:
     pair = _pair_state(w3, address, block=blk, tally=tally)
     if pair:
         out["pair"] = pair
+    if not out["state"] and not pair:
+        # Every standard getter reverted. That is ambiguous on its own (non-standard naming vs a
+        # proxy shell), so point the caller at the bytecode route instead of returning a bare {}.
+        out["note"] = (
+            "no standard getter answered (owner/admin/paused/implementation/ERC20...). Either this "
+            "contract uses non-standard names or it is a proxy shell — call bytecode_abi(address) to "
+            "recover its REAL selectors from bytecode (and its proxy shape), then call_view them."
+        )
     return tally.apply(out)
 
 

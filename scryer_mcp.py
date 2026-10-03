@@ -38,6 +38,7 @@ except Exception:
 
 from mcp.server.fastmcp import FastMCP  # noqa: E402
 
+import bytecode_abi as ba  # noqa: E402
 import download_contract as dc  # noqa: E402
 import onchain_state as oc  # noqa: E402
 import verify_source as vs  # noqa: E402
@@ -364,7 +365,11 @@ def download_contract(address: str, chain: str = "", chain_id: int = 0, follow_p
                         "retry (see warnings/retry_after)."
                     )
                 else:
-                    out["note"] = "No verified source from any provider - only runtime bytecode exists on-chain."
+                    out["note"] = (
+                        "No verified source from any provider - only runtime bytecode exists on-chain. "
+                        "Call bytecode_abi(address) to recover its callable surface (selectors -> signatures) "
+                        "and its proxy shape straight from the bytecode."
+                    )
             # found:false -> stamp the full retry signal (rate_limited + retry_after).
             tally.apply(out)
         elif tally.hit:
@@ -482,6 +487,39 @@ def token_exposure(address: str, chain: str = "", chain_id: int = 0, block: str 
     """
     try:
         return oc.token_exposure(_resolve_chain(chain, chain_id), address, block=block)
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+def bytecode_abi(address: str, chain: str = "", chain_id: int = 0, block: str = "latest", resolve: bool = True) -> dict:
+    """Recover a contract's callable surface from RUNTIME BYTECODE — works with NO source.
+
+    **This is the way into an unverified / bytecode-only contract.** The function selectors are
+    physically present in the dispatcher: this extracts them (walking opcodes, so PUSH constants
+    are never mistaken for selectors) and reverse-looks-up each to a readable signature
+    (`transfer(address,uint256)`) via openchain/4byte. Feed a recovered `signature` straight into
+    `call_view` to read live values: bytecode -> selector -> signature -> value.
+
+    The shape flags tell you WHERE to analyze — do not skip them:
+    - `eip1167_implementation` set: EIP-1167 minimal proxy; the real logic is at that address.
+    - `diamond_like`: EIP-2535; `call_view facetAddresses()` to enumerate facets, analyze each.
+    - `proxy_like` true while download_contract reported `proxy.detected:false`: a NON-STANDARD
+      proxy shell — hunt the implementation slot (`read_storage`), don't analyze this bytecode.
+    - none set: a standalone contract; use the selectors.
+
+    `unresolved` = selectors absent from public signature DBs. They are still callable (fuzz
+    them); absence of a name is NOT absence of a function. A throttle surfaces as `rate_limited`
+    rather than silently looking like "no signatures found".
+
+    **Collisions**: `hex` is FACT (read from bytecode); `signature` is a GUESS (4-byte selectors
+    collide and public DBs carry spam collisions). When `collision:true`, read `candidates`:
+    `collision_cosmetic:true` means they differ only in NAME and encode identical calldata (safe
+    to call any). `collision_cosmetic:false` means the PARAMETER TYPES differ — call_view each
+    candidate's types and keep the one that decodes sensibly before trusting a name.
+    """
+    try:
+        return ba.analyze_contract(_resolve_chain(chain, chain_id), address, block=block, resolve=resolve)
     except Exception as e:
         return _err(e)
 
