@@ -16,11 +16,19 @@ from contract_registry import ContractRegistry
 
 
 def _with_trailer(body_hex: str, blob_hex: str) -> str:
-    """Append a CBOR-style metadata trailer (blob + its 2-byte length), like solc emits."""
-    return body_hex + blob_hex + f"{len(blob_hex) // 2:04x}"
+    """Append a CBOR-style metadata trailer (blob + its 2-byte length), like solc emits.
+
+    The blob embeds the ASCII 'solc' marker (736f6c63) because strip_metadata_trailer refuses to
+    strip a trailer with no ipfs/bzzr/solc marker (otherwise it would eat real code from Vyper /
+    hand-written-assembly contracts). Real solc trailers always carry such a marker; these synthetic
+    blobs must too, or the normalized-hash tier would never strip and clone matching would break.
+    """
+    blob = "736f6c63" + blob_hex  # 'solc' + the caller's differing bytes
+    return body_hex + blob + f"{len(blob) // 2:04x}"
 
 
-BODY = "6080604052" + "63aaaaaaaa14" + "63bbbbbbbb14" + "00"
+# DUP1 PUSH4 <sel> EQ for each selector — the real dispatcher shape extract_selectors requires.
+BODY = "6080604052" + "8063aaaaaaaa14" + "8063bbbbbbbb14" + "00"
 
 
 # --------------------------------------------------------------------------- #
@@ -45,15 +53,15 @@ def test_normalized_hash_ignores_metadata_trailer() -> None:
 
 def test_selector_hash_is_order_independent() -> None:
     """Selector-set identity must not depend on the order the dispatcher happens to emit."""
-    one = ba.code_fingerprints("63aaaaaaaa14" + "63bbbbbbbb14" + "00")
-    two = ba.code_fingerprints("63bbbbbbbb14" + "63aaaaaaaa14" + "00")
+    one = ba.code_fingerprints("8063aaaaaaaa14" + "8063bbbbbbbb14" + "00")
+    two = ba.code_fingerprints("8063bbbbbbbb14" + "8063aaaaaaaa14" + "00")
     assert one["selector_hash"] == two["selector_hash"]
     assert one["runtime_norm_hash"] != two["runtime_norm_hash"]  # but the bytecode genuinely differs
 
 
 def test_different_code_has_different_fingerprints() -> None:
-    a = ba.code_fingerprints("63aaaaaaaa14" + "00")
-    b = ba.code_fingerprints("63cccccccc14" + "00")
+    a = ba.code_fingerprints("8063aaaaaaaa14" + "00")
+    b = ba.code_fingerprints("8063cccccccc14" + "00")
     assert a["runtime_norm_hash"] != b["runtime_norm_hash"]
     assert a["selector_hash"] != b["selector_hash"]
 
@@ -104,10 +112,10 @@ def test_twin_lookup_excludes_self(reg: ContractRegistry) -> None:
 def test_abi_tier_matches_when_immutables_change_the_bytecode(reg: ContractRegistry) -> None:
     """Different bytecode (as `immutable` injection causes) but the same ABI surface."""
     reg.register_contract(chain_id=56, address=VERIFIED, sources={"A.sol": "contract A{}"})
-    reg.record_code_fingerprints(56, VERIFIED, ba.code_fingerprints("63aaaaaaaa14" + "63bbbbbbbb14" + "00"))
+    reg.record_code_fingerprints(56, VERIFIED, ba.code_fingerprints("8063aaaaaaaa14" + "8063bbbbbbbb14" + "00"))
 
     # Same two selectors, extra body bytes -> different code hash, same selector set.
-    other = ba.code_fingerprints("6080" + "63bbbbbbbb14" + "63aaaaaaaa14" + "00")
+    other = ba.code_fingerprints("6080" + "8063bbbbbbbb14" + "8063aaaaaaaa14" + "00")
     twins = reg.find_code_twins(1, UNVERIFIED, other)
     assert twins["normalized_matches"] == []
     assert len(twins["abi_matches"]) == 1
@@ -116,7 +124,7 @@ def test_abi_tier_matches_when_immutables_change_the_bytecode(reg: ContractRegis
 
 def test_abi_shared_by_exposes_low_confidence(reg: ContractRegistry) -> None:
     """A generic surface shared by many contracts must be self-evidently weak evidence."""
-    fp = ba.code_fingerprints("63aaaaaaaa14" + "00")
+    fp = ba.code_fingerprints("8063aaaaaaaa14" + "00")
     for i in range(5):
         reg.record_code_fingerprints(56, "0x" + f"{i:040x}", fp)
     twins = reg.find_code_twins(1, UNVERIFIED, fp)
@@ -146,9 +154,21 @@ def test_backfill_worklist_skips_already_fingerprinted(reg: ContractRegistry) ->
     todo = reg.addresses_missing_fingerprints(56)
     assert {a.lower() for _c, a in todo} == {VERIFIED.lower(), UNVERIFIED.lower()}
 
-    reg.record_code_fingerprints(56, VERIFIED, ba.code_fingerprints("63aaaaaaaa14" + "00"))
+    reg.record_code_fingerprints(56, VERIFIED, ba.code_fingerprints("8063aaaaaaaa14" + "00"))
     todo2 = reg.addresses_missing_fingerprints(56)
     assert {a.lower() for _c, a in todo2} == {UNVERIFIED.lower()}  # resumable: no rework
 
     assert reg.has_code_fingerprint(56, VERIFIED) is True
     assert reg.has_code_fingerprint(56, UNVERIFIED) is False
+
+
+def test_backfill_worklist_can_exclude_dead_chains(reg: ContractRegistry) -> None:
+    """exclude_chains drops whole chains from the work list. The backfill loop uses it to skip a
+    chain it found unreachable, so an ordered query doesn't re-serve that dead chain's rows every
+    pass and starve the chains that sort after it."""
+    reg.register_contract(chain_id=1, address=VERIFIED, sources={"A.sol": "contract A{}"})
+    reg.register_contract(chain_id=56, address=UNVERIFIED, sources={"B.sol": "contract B{}"})
+
+    assert {c for c, _a in reg.addresses_missing_fingerprints()} == {1, 56}
+    assert {c for c, _a in reg.addresses_missing_fingerprints(exclude_chains={1})} == {56}
+    assert reg.addresses_missing_fingerprints(exclude_chains={1, 56}) == []

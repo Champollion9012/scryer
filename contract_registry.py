@@ -425,8 +425,16 @@ class ContractRegistry:
             conn.close()
         return out
 
-    def addresses_missing_fingerprints(self, chain_id: int | None = None, limit: int = 500) -> list[tuple[int, str]]:
-        """Registered contracts with no bytecode fingerprint yet — the backfill work list."""
+    def addresses_missing_fingerprints(
+        self, chain_id: int | None = None, limit: int = 500, exclude_chains: "set[int] | None" = None
+    ) -> list[tuple[int, str]]:
+        """Registered contracts with no bytecode fingerprint yet — the backfill work list.
+
+        ``exclude_chains`` drops whole chains from the result. The backfill loop uses it to skip
+        chains it has found unreachable this run: those rows will never fingerprint, and without
+        excluding them the ``ORDER BY chain_id`` query keeps returning the same dead rows every
+        pass, starving reachable chains that sort after them.
+        """
         conn = sqlite3.connect(self.db_path)
         try:
             sql = """
@@ -439,6 +447,10 @@ class ContractRegistry:
             if chain_id is not None:
                 sql += " AND c.chain_id = ?"
                 params.append(chain_id)
+            if exclude_chains:
+                placeholders = ",".join("?" * len(exclude_chains))
+                sql += f" AND c.chain_id NOT IN ({placeholders})"
+                params.extend(sorted(exclude_chains))
             sql += " ORDER BY c.chain_id, c.address LIMIT ?"
             params.append(limit)
             return [(r[0], r[1]) for r in conn.execute(sql, params).fetchall()]
@@ -590,6 +602,12 @@ class ContractRegistry:
         their source clones) and bytecode-tagged (unverified contracts and their byte clones)."""
         conn = sqlite3.connect(self.db_path)
         try:
+            # A contract can be tagged under BOTH its source_hash and its bytecode hash. The two
+            # UNION halves project different columns (contract_name set vs NULL, via 'source' vs
+            # 'bytecode'), so UNION cannot fold the duplicate — it would be counted twice. The
+            # NOT EXISTS makes the source row authoritative: a contract already reported via source
+            # is excluded from the bytecode half (source carries the name + is the higher-fidelity
+            # match), so each (chain, address) appears exactly once.
             cursor = conn.execute(
                 """
                 SELECT c.chain_id, c.address, c.contract_name, v.severity, v.description, 'source' AS via
@@ -601,9 +619,14 @@ class ContractRegistry:
                 FROM code_fingerprints f
                 JOIN code_vulnerability_tags cv ON f.runtime_norm_hash = cv.runtime_norm_hash
                 WHERE cv.tag = ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM contracts c2
+                      JOIN vulnerability_tags v2 ON c2.source_hash = v2.source_hash
+                      WHERE v2.tag = ? AND c2.chain_id = f.chain_id AND c2.address = f.address
+                  )
                 ORDER BY chain_id, address
                 """,
-                (tag, tag),
+                (tag, tag, tag),
             )
 
             return [

@@ -40,26 +40,37 @@ def backfill(
     db_path: str = ".contract_registry.db",
 ) -> dict:
     reg = ContractRegistry(db_path)
-    stats = {"fingerprinted": 0, "no_code": 0, "failed": 0, "rate_limited": False}
+    stats = {"fingerprinted": 0, "no_code": 0, "failed": 0, "rate_limited": False, "dead_chains": []}
     w3_cache: dict[int, object] = {}
+    dead_chains: set[int] = set()
 
     while stats["fingerprinted"] + stats["no_code"] + stats["failed"] < limit:
         remaining = limit - stats["fingerprinted"] - stats["no_code"] - stats["failed"]
-        todo = reg.addresses_missing_fingerprints(chain_id, min(batch, remaining))
+        # Exclude chains already found unreachable this run: their rows will never fingerprint, and
+        # since the work list is ordered by chain_id, leaving them in would make every pass re-serve
+        # the same dead rows and never reach chains that sort after them (starvation).
+        todo = reg.addresses_missing_fingerprints(chain_id, min(batch, remaining), exclude_chains=dead_chains)
         if not todo:
             break
 
+        new_dead = False
         for cid, addr in todo:
+            if cid in dead_chains:
+                continue
             if cid not in w3_cache:
                 try:
                     w3_cache[cid], _label = make_web3(cid)
                 except Exception as e:
-                    _log.warning("chain %s unreachable (%s); skipping its rows this run", cid, e)
+                    _log.warning("chain %s unreachable (%s); excluding it this run", cid, e)
                     w3_cache[cid] = None
             w3 = w3_cache[cid]
             if w3 is None:
-                stats["failed"] += 1
-                continue
+                # Don't burn the limit budget on a dead chain's rows — mark it and re-query the
+                # work list with it excluded (the remaining rows in this batch may be other chains).
+                dead_chains.add(cid)
+                stats["dead_chains"] = sorted(dead_chains)
+                new_dead = True
+                break
 
             try:
                 code = bytes(w3.eth.get_code(Web3.to_checksum_address(addr)))
@@ -89,6 +100,10 @@ def backfill(
             if sleep_s:
                 time.sleep(sleep_s)
 
+        if new_dead:
+            # A chain was just marked dead mid-batch; re-query so its remaining rows are skipped.
+            continue
+
     return stats
 
 
@@ -106,7 +121,8 @@ def main() -> int:
     )
     print(
         f"fingerprinted={stats['fingerprinted']} no_code={stats['no_code']} "
-        f"failed={stats['failed']} rate_limited={stats['rate_limited']}"
+        f"failed={stats['failed']} rate_limited={stats['rate_limited']} "
+        f"dead_chains={stats['dead_chains']}"
     )
     return 0
 

@@ -136,6 +136,28 @@ def _src_files(prefix: str) -> list[Path]:
     return sorted(files)
 
 
+def _is_pseudo_src_name(name: str) -> bool:
+    """A decompiled/bytecode-only pseudo-source file (by naming convention): decompile() writes
+    `{prefix}_decompiled.sol` and the bytecode fallback writes `..._{target}.decompiled.sol` /
+    `..._{target}.BYTECODE_ONLY`. These are the only files that carry invented names, never
+    verified source."""
+    n = name.lower()
+    return n.endswith("decompiled.sol") or n.endswith(".bytecode_only")
+
+
+def _verified_src_files(prefix: str, meta: dict | None) -> list[Path]:
+    """Source files that are VERIFIED source. When the download meta is pseudo (decompiled /
+    bytecode_only) the pseudo files ARE this download's output — keep them so the caller can list
+    them. When the meta is verified, any pseudo file on disk is a STALE leftover from a prior
+    decompile()/fallback for the same address, so drop it: a later verified download must never
+    list or register a stale `_decompiled.sol` as if it were real source."""
+    files = _src_files(prefix)
+    meta_pseudo = bool(meta and (meta.get("decompiled") or meta.get("bytecode_only")))
+    if meta_pseudo:
+        return files
+    return [f for f in files if not _is_pseudo_src_name(f.name)]
+
+
 def _read_meta(meta_path: Path) -> dict | None:
     try:
         return json.loads(Path(meta_path).read_text(encoding="utf-8"))
@@ -196,15 +218,16 @@ _PSEUDO_NOTE = (
 def _collect_download(chain_id: int, address: str) -> dict:
     addr = dc.normalize_address(address)
     prefix = f"{chain_id}_{addr}"
-    src_files = _src_files(prefix)
     meta_path = SOURCES_DIR / f"{prefix}_download_meta.json"
+    meta = _read_meta(meta_path)
+    # Meta-aware: a verified download drops any stale `_decompiled.sol` left by a prior decompile().
+    src_files = _verified_src_files(prefix, meta)
     sources: dict[str, str] = {}
     for f in src_files:
         try:
             sources[f.name] = f.read_text(encoding="utf-8", errors="replace")
         except Exception:
             sources[f.name] = ""
-    meta = _read_meta(meta_path)
     # Prefer the logical-path hash recorded at download time (matches the crawler's
     # registry rows); only fall back to a flat-filename hash for legacy downloads.
     source_hash = (meta.get("source_hash") if meta else None) or (
@@ -265,22 +288,33 @@ def _proxy_block(chain_id: int, meta_path: str | None, requested: bool) -> dict:
     if impl:
         impl = impl.lower()
         block["implementation"] = impl
-        impl_files = _src_files(f"{chain_id}_{impl}")
+        impl_meta = _read_meta(SOURCES_DIR / f"{chain_id}_{impl}_download_meta.json")
+        # Meta-aware: keep pseudo files when the impl meta IS pseudo (so we can flag it), but drop
+        # a stale `_decompiled.sol` when the impl has real verified source.
+        impl_files = _verified_src_files(f"{chain_id}_{impl}", impl_meta)
         srcs: dict[str, str] = {}
         for f in impl_files:
             try:
                 srcs[f.name] = f.read_text(encoding="utf-8", errors="replace")
             except Exception:
                 srcs[f.name] = ""
-        impl_meta = _read_meta(SOURCES_DIR / f"{chain_id}_{impl}_download_meta.json")
+        # The impl files may be pseudo-source (decompiled / bytecode-only). That is NOT verified
+        # source, so it must not count as "source fetched" — otherwise download_contract flips
+        # found:true for a proxy whose implementation is only decompiler output (invented names).
+        impl_pseudo = bool(impl_meta and (impl_meta.get("decompiled") or impl_meta.get("bytecode_only")))
+        verified_impl_files = impl_files and not impl_pseudo
         block["implementation_files"] = [{"path": str(f), "name": f.name, "bytes": f.stat().st_size} for f in impl_files]
-        block["implementation_source_fetched"] = bool(impl_files)
-        block["implementation_source_hash"] = (impl_meta.get("source_hash") if impl_meta else None) or (
-            ContractRegistry.compute_source_hash(srcs) if srcs else None
-        )
+        block["implementation_source_fetched"] = bool(verified_impl_files)
+        block["implementation_pseudo_source"] = impl_pseudo
+        block["implementation_source_hash"] = (
+            None if impl_pseudo else (impl_meta.get("source_hash") if impl_meta else None)
+        ) or (ContractRegistry.compute_source_hash(srcs) if srcs and not impl_pseudo else None)
         block["note"] = (
             "PROXY: analyze implementation_files (the real logic); top-level `files` are just the proxy shell."
-            if impl_files
+            if verified_impl_files
+            else "PROXY: implementation is only PSEUDO-source (decompiled/bytecode-only) — trust opcodes, not "
+            "names; it is NOT verified source."
+            if impl_pseudo
             else f"PROXY: implementation detected but source not fetched; call "
             f"download_contract(address='{impl}', chain_id={chain_id})."
         )
@@ -294,18 +328,18 @@ def _register_from_disk(chain_id: int, address: str) -> str | None:
     """
     addr = address.lower()
     prefix = f"{chain_id}_{addr}"
+    meta = _read_meta(SOURCES_DIR / f"{prefix}_download_meta.json")
+    if meta and (meta.get("decompiled") or meta.get("bytecode_only")):
+        # Decompiler output is PSEUDO-source: its hash shifts with the decompiler version, so
+        # registering it would pollute clone matching with phantom "source" that matches nothing.
+        return None
     srcs: dict[str, str] = {}
-    for f in _src_files(prefix):
+    for f in _verified_src_files(prefix, meta):  # excludes any stale `_decompiled.sol`
         try:
             srcs[f.name] = f.read_text(encoding="utf-8", errors="replace")
         except Exception:
             pass
     if not srcs:
-        return None
-    meta = _read_meta(SOURCES_DIR / f"{prefix}_download_meta.json")
-    if meta and (meta.get("decompiled") or meta.get("bytecode_only")):
-        # Decompiler output is PSEUDO-source: its hash shifts with the decompiler version, so
-        # registering it would pollute clone matching with phantom "source" that matches nothing.
         return None
     logical_hash = meta.get("source_hash") if meta else None
     try:
@@ -596,9 +630,20 @@ def decompile(address: str, chain: str = "", chain_id: int = 0, block: str = "la
             return out
 
         src = res["source"] or ""
-        path = SOURCES_DIR / f"{cid}_{address.lower()}_decompiled.sol"
+        addr_l = address.lower()
+        path = SOURCES_DIR / f"{cid}_{addr_l}_decompiled.sol"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(src, encoding="utf-8")
+        # Write a meta sidecar flagged decompiled:true so the pseudo-source guards (which key off
+        # meta, not filename) see this file. Without it, a later VERIFIED download_contract of the
+        # same address would list this .sol among its verified files and fold it into the registry.
+        try:
+            (SOURCES_DIR / f"{cid}_{addr_l}_download_meta.json").write_text(
+                json.dumps({"decompiled": True, "decompiler": res["decompiler"], "source": "decompile_tool"}),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
         out.update(
             {
                 "path": str(path),
@@ -624,27 +669,54 @@ def decompile(address: str, chain: str = "", chain_id: int = 0, block: str = "la
 # --------------------------------------------------------------------------- #
 # Relate + persist (clone discovery / vuln knowledge base over the local registry)
 # --------------------------------------------------------------------------- #
-def _live_runtime_hex(chain_id: int, address: str) -> tuple[str | None, str | None]:
-    """Fetch live runtime bytecode (hex, no 0x) at HEAD. Returns (hex, error)."""
+def _live_runtime_hex(chain_id: int, address: str) -> tuple[str | None, str | None, dict | None]:
+    """Fetch live runtime bytecode (hex, no 0x) at HEAD.
+
+    Returns (hex, error, rate_limit). On a provider throttle the third element is
+    ``{"reason": str, "retry_after": int|None}`` so the caller surfaces a RETRYABLE condition
+    instead of asserting a permanent "no code" / "cannot tag". A throttle must never collapse
+    into a genuine-miss value — the same caller-facing rate-limit contract the rest of the
+    toolkit follows (the Etherscan-proxy fallback reports its throttle as a -32005 JSON-RPC
+    error, which ``rpc_rate_limit_reason`` recognizes; a native RPC raises ``RateLimited``).
+    """
     from web3 import Web3
 
     from etherscan_proxy_provider import make_web3
+    from scryer_http import RateLimited, rpc_rate_limit_reason
 
     try:
         w3, _label = make_web3(chain_id)
         code = bytes(w3.eth.get_code(Web3.to_checksum_address(address)))
+    except RateLimited as e:
+        return None, e.reason, {"reason": e.reason, "retry_after": e.retry_after}
     except Exception as e:
-        return None, f"{type(e).__name__}: {e}"
+        reason = rpc_rate_limit_reason(e)
+        if reason:
+            return None, reason, {"reason": reason, "retry_after": None}
+        return None, f"{type(e).__name__}: {e}", None
     if not code:
-        return None, "no code at this address (EOA or self-destructed)"
-    return code.hex(), None
+        return None, "no code at this address (EOA or self-destructed)", None
+    return code.hex(), None, None
+
+
+def _rl_fields(out: dict, rl: dict, note: str) -> dict:
+    """Stamp the retryable rate-limit signal onto a tool result so the agent retries instead of
+    treating a throttle as a confirmed miss."""
+    out["rate_limited"] = True
+    if rl.get("retry_after") is not None:
+        out["retry_after"] = rl["retry_after"]
+    out["note"] = note
+    return out
 
 
 def _bytecode_twins(chain_id: int, address: str) -> dict:
     """Fingerprint the live bytecode and look for twins — the unverified-contract path."""
-    runtime_hex, err = _live_runtime_hex(chain_id, address)
+    runtime_hex, err, rl = _live_runtime_hex(chain_id, address)
     if err:
-        return {"bytecode_match_error": err}
+        out = {"bytecode_match_error": err}
+        if rl:
+            _rl_fields(out, rl, "RPC was RATE-LIMITED — this is NOT a confirmed 'no twins'; retry (see retry_after).")
+        return out
     fp = ba.code_fingerprints(runtime_hex)
     ba.record_fingerprints(chain_id, address, runtime_hex)  # index the query contract too
     twins = ContractRegistry().find_code_twins(chain_id, address, fp)
@@ -723,9 +795,13 @@ def registry_tag_vulnerability(tag: str, source_hash: str = "", address: str = "
                     "keyed_by": f"source_hash (resolved from {address.lower()} @ chain {cid})",
                     "stored": {"severity": sev, "description": desc}}
         # Unverified / not in registry -> tag by bytecode.
-        runtime_hex, err = _live_runtime_hex(cid, address)
+        runtime_hex, err, rl = _live_runtime_hex(cid, address)
         if err:
-            return {"error": f"{address.lower()} @ chain {cid}: {err} — cannot tag"}
+            out = {"error": f"{address.lower()} @ chain {cid}: {err} — cannot tag"}
+            if rl:
+                _rl_fields(out, rl, "RPC was RATE-LIMITED — the tag was NOT stored; this is not a "
+                                    "permanent failure, retry (see retry_after).")
+            return out
         fp = ba.code_fingerprints(runtime_hex)
         norm = fp.get("runtime_norm_hash")
         if not norm:

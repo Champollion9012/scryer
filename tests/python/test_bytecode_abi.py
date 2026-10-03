@@ -32,31 +32,41 @@ def test_push32_constant_is_not_mistaken_for_a_selector() -> None:
 
 
 def test_real_push4_compare_is_extracted() -> None:
-    assert ba.extract_selectors("63deadbeef14" + "00") == ["0xdeadbeef"]
+    # DUP1 PUSH4 <sel> EQ — the real dispatcher shape (the dispatcher DUPs the cached selector
+    # before comparing). The DUP is what separates a selector from a 4-byte business constant.
+    assert ba.extract_selectors("80" + "63deadbeef14" + "00") == ["0xdeadbeef"]
 
 
 def test_push4_followed_by_compare_within_window() -> None:
-    # PUSH4 <sel> DUP2 EQ  — the comparison is not the immediately next opcode.
-    assert ba.extract_selectors("63cafebabe" + "81" + "14" + "00") == ["0xcafebabe"]
+    # DUP1 PUSH4 <sel> DUP2 EQ — the comparison is not the immediately next opcode.
+    assert ba.extract_selectors("80" + "63cafebabe" + "81" + "14" + "00") == ["0xcafebabe"]
 
 
 def test_push4_without_comparison_is_a_constant_not_a_selector() -> None:
-    # PUSH4 <value> ADD  — never compared, so it is a plain constant.
-    assert ba.extract_selectors("63cafebabe" + "01" + "00") == []
+    # DUP1 PUSH4 <value> ADD — DUP'd but never compared, so it is a plain constant, not a selector.
+    assert ba.extract_selectors("80" + "63cafebabe" + "01" + "00") == []
+
+
+def test_push4_compared_but_not_duped_is_a_constant_not_a_selector() -> None:
+    # PUSH4 <const> EQ with NO preceding DUP — a business-logic constant compare
+    # (e.g. require(block.timestamp < 0x5f5e1000)), not a dispatcher selector.
+    assert ba.extract_selectors("63cafebabe" + "14" + "00") == []
 
 
 def test_metadata_trailer_is_not_walked_as_code() -> None:
     """Bytes in the CBOR metadata trailer must not produce phantom selectors."""
     body = "6080604052" + "00"
-    fake = "63deadbeef14"  # looks like a selector comparison, but lives in the trailer
-    blob = fake + "00" * 10
+    # A full DUP1 PUSH4 <sel> EQ shape that WOULD be extracted if the trailer were walked as code.
+    fake = "80" + "63deadbeef14"
+    marker = "736f6c63"  # 'solc' — makes strip_metadata_trailer recognize this as a real trailer
+    blob = fake + marker + "00" * 4
     trailer_len = len(blob) // 2
     code = body + blob + f"{trailer_len:04x}"
     assert "0xdeadbeef" not in ba.extract_selectors(code)
 
 
 def test_selectors_are_deduped_and_ordered() -> None:
-    code = "63aaaaaaaa14" + "63bbbbbbbb14" + "63aaaaaaaa14" + "00"
+    code = "80" + "63aaaaaaaa14" + "80" + "63bbbbbbbb14" + "80" + "63aaaaaaaa14" + "00"
     assert ba.extract_selectors(code) == ["0xaaaaaaaa", "0xbbbbbbbb"]
 
 
@@ -111,7 +121,7 @@ def test_eip1167_minimal_proxy_yields_implementation_and_proxy_like() -> None:
 
 def test_diamond_loupe_detected() -> None:
     loupe = sorted(ba._DIAMOND_LOUPE)[:2]
-    code = "".join("63" + s[2:] + "14" for s in loupe) + "00"
+    code = "".join("80" + "63" + s[2:] + "14" for s in loupe) + "00"  # DUP1 PUSH4 <sel> EQ each
     info = ba.analyze_bytecode(code)
     assert info["diamond_like"] is True
     assert "facet" in ba._shape_note(info).lower()
@@ -129,8 +139,8 @@ def test_code_with_no_selectors_gets_its_own_diagnosis() -> None:
 
 
 def test_fat_contract_is_not_proxy_like() -> None:
-    # Many selectors, no delegatecall -> a standalone contract.
-    code = "".join(f"63{i:08x}14" for i in range(1, 12)) + "00"
+    # Many selectors, no delegatecall -> a standalone contract. DUP1 PUSH4 <sel> EQ each.
+    code = "".join(f"8063{i:08x}14" for i in range(1, 12)) + "00"
     info = ba.analyze_bytecode(code)
     assert info["proxy_like"] is False and info["has_delegatecall"] is False
 
@@ -193,7 +203,7 @@ def _patch_chain(monkeypatch: pytest.MonkeyPatch, runtime_hex: str) -> None:
 
 def test_analyze_contract_flags_type_vs_name_collisions(monkeypatch: pytest.MonkeyPatch) -> None:
     """A name-only collision is cosmetic (identical calldata); a TYPE collision is ambiguous."""
-    _patch_chain(monkeypatch, "63aaaaaaaa14" + "63bbbbbbbb14" + "00")
+    _patch_chain(monkeypatch, "80" + "63aaaaaaaa14" + "80" + "63bbbbbbbb14" + "00")
     monkeypatch.setattr(
         ba,
         "resolve_signatures",

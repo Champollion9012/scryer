@@ -123,10 +123,16 @@ class VerifyCache:
                     on_chain_no_meta_prefix TEXT,
                     compiled_no_meta_prefix TEXT,
                     notes_json TEXT,
+                    immutables_zeroed INTEGER DEFAULT 0,
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP
                 )
                 """
             )
+            # Migrate caches created before immutables_zeroed existed, so a cache hit reports the
+            # real count instead of a constant 0 (the column defaults to 0 for pre-migration rows).
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(verify_cache)")}
+            if "immutables_zeroed" not in cols:
+                conn.execute("ALTER TABLE verify_cache ADD COLUMN immutables_zeroed INTEGER DEFAULT 0")
             conn.commit()
 
     @staticmethod
@@ -153,7 +159,8 @@ class VerifyCache:
             row = conn.execute(
                 """
                 SELECT chain_id, address, verdict, compiler_version, on_chain_size,
-                       compiled_size, on_chain_no_meta_prefix, compiled_no_meta_prefix, notes_json
+                       compiled_size, on_chain_no_meta_prefix, compiled_no_meta_prefix, notes_json,
+                       immutables_zeroed
                 FROM verify_cache WHERE cache_key = ?
                 """,
                 (key,),
@@ -171,6 +178,7 @@ class VerifyCache:
             on_chain_no_meta_prefix=row[6],
             compiled_no_meta_prefix=row[7],
             notes=list(notes),
+            immutables_zeroed=int(row[9]) if row[9] is not None else 0,
             cache_hit=True,
         )
 
@@ -180,8 +188,9 @@ class VerifyCache:
                 """
                 INSERT OR REPLACE INTO verify_cache
                 (cache_key, chain_id, address, verdict, compiler_version, on_chain_size,
-                 compiled_size, on_chain_no_meta_prefix, compiled_no_meta_prefix, notes_json)
-                VALUES(?,?,?,?,?,?,?,?,?,?)
+                 compiled_size, on_chain_no_meta_prefix, compiled_no_meta_prefix, notes_json,
+                 immutables_zeroed)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     key,
@@ -194,6 +203,7 @@ class VerifyCache:
                     result.on_chain_no_meta_prefix,
                     result.compiled_no_meta_prefix,
                     json.dumps(result.notes or []),
+                    int(result.immutables_zeroed or 0),
                 ),
             )
             conn.commit()
@@ -225,6 +235,18 @@ def strip_metadata_trailer(bytecode_hex: str) -> str:
         return bc
     total_meta_chars = (meta_len + 2) * 2  # +2 for the length suffix itself
     if total_meta_chars >= len(bc) or total_meta_chars <= 0:
+        return bc
+    # Validate it is ACTUALLY a Solidity CBOR metadata blob before trimming — the length suffix
+    # alone is just two bytes that any bytecode happens to end with. For non-Solidity bytecode
+    # (Vyper, hand-written assembly, data/SSTORE2 blobs) blindly trimming removes real code and
+    # makes different contracts collide on the normalized hash. A genuine blob names its hash
+    # source (ipfs/bzzr0/bzzr1) and/or the compiler (solc), so require one of those markers.
+    region = bc[len(bc) - total_meta_chars : len(bc) - 4]
+    try:
+        region_bytes = bytes.fromhex(region)
+    except ValueError:
+        return bc
+    if not any(m in region_bytes for m in (b"ipfs", b"bzzr0", b"bzzr1", b"solc")):
         return bc
     return bc[: len(bc) - total_meta_chars]
 

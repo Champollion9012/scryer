@@ -48,6 +48,7 @@ _FOURBYTE = "https://www.4byte.directory/api/v1/signatures/"
 # --- EVM opcodes we care about ---------------------------------------------- #
 _PUSH1, _PUSH32 = 0x60, 0x7F
 _PUSH4 = 0x63
+_DUP1, _DUP16 = 0x80, 0x8F
 _LT, _GT, _EQ = 0x10, 0x11, 0x14
 _DELEGATECALL = 0xF4
 
@@ -56,6 +57,12 @@ _DELEGATECALL = 0xF4
 # binary-search pivots an optimized dispatcher emits — pivots are real selectors too).
 _COMPARE_OPS = frozenset({_EQ, _GT, _LT})
 _COMPARE_WINDOW = 3
+# ...AND the dispatcher DUPs the cached selector right before each comparison (DUP1 PUSH4 <sel>
+# EQ ...). Requiring a DUP just before the PUSH4 is what separates a real selector from an ordinary
+# 4-byte constant compare in business logic (e.g. `require(block.timestamp < 0x5f5e1000)` is
+# PUSH4 <const> LT with no preceding DUP) — otherwise such constants become PHANTOM selectors that
+# corrupt selector_count and the selector_hash fingerprint.
+_LOOKBACK = 2
 
 
 def _sig_selector(signature: str) -> str:
@@ -124,9 +131,12 @@ def extract_selectors(runtime_hex: str) -> list[str]:
     for idx, (_pc, op, imm) in enumerate(ops):
         if op != _PUSH4 or len(imm) != 4:
             continue
-        window = ops[idx + 1 : idx + 1 + _COMPARE_WINDOW]
-        if not any(w_op in _COMPARE_OPS for _pc2, w_op, _imm2 in window):
+        after = ops[idx + 1 : idx + 1 + _COMPARE_WINDOW]
+        if not any(w_op in _COMPARE_OPS for _pc2, w_op, _imm2 in after):
             continue  # a PUSH4 that is not compared is a constant, not a selector
+        before = ops[max(0, idx - _LOOKBACK) : idx]
+        if not any(_DUP1 <= b_op <= _DUP16 for _pc3, b_op, _imm3 in before):
+            continue  # no DUP of the cached selector before it -> a business-logic constant, not a selector
         sel = "0x" + imm.hex()
         if sel not in seen:
             seen.add(sel)
@@ -271,7 +281,8 @@ def params_of(signature: str) -> str | None:
 
 
 def resolve_signatures(
-    selectors: list[str], *, tally: RateLimitTally | None = None, use_fourbyte: bool = True
+    selectors: list[str], *, tally: RateLimitTally | None = None, use_fourbyte: bool = True,
+    throttled: set[str] | None = None,
 ) -> dict[str, list[str]]:
     """Map selector -> ALL candidate signature strings (best-ranked first).
 
@@ -301,6 +312,8 @@ def resolve_signatures(
             if reason:
                 if tally is not None:
                     tally.note(reason, provider="openchain", retry_after=retry_after_seconds(r))
+                if throttled is not None:
+                    throttled.update(chunk)  # these are unknown-because-throttled, not unknown
                 continue
             fn = ((r.json().get("result") or {}).get("function") or {}) if r.status_code == 200 else {}
             for sel in chunk:
@@ -325,6 +338,8 @@ def resolve_signatures(
                 if reason:
                     if tally is not None:
                         tally.note(reason, provider="4byte", retry_after=retry_after_seconds(r))
+                    if throttled is not None:
+                        throttled.update(s for s in remaining if s not in resolved)  # this one + the unreached tail
                     break
                 if r.status_code != 200:
                     continue
@@ -388,7 +403,8 @@ def analyze_contract(
 
     selectors: list[str] = out.get("selectors", [])
     if resolve and selectors:
-        sigs = resolve_signatures(selectors, tally=tally)
+        throttled: set[str] = set()
+        sigs = resolve_signatures(selectors, tally=tally, throttled=throttled)
         entries: list[dict] = []
         ambiguous = 0
         for s in selectors:
@@ -407,7 +423,11 @@ def analyze_contract(
             entries.append(entry)
         out["selectors"] = entries
         out["resolved_count"] = sum(1 for e in entries if "signature" in e)
-        out["unresolved"] = [s for s in selectors if s not in sigs]
+        # Keep "genuinely unknown" separate from "unknown because the lookup was throttled" —
+        # otherwise a 429 masquerades as "not in any signature DB" (the swallow this guards against).
+        out["unresolved"] = [s for s in selectors if s not in sigs and s not in throttled]
+        if throttled:
+            out["rate_limited_selectors"] = [s for s in selectors if s in throttled]
         if ambiguous:
             out["ambiguous_count"] = ambiguous
     else:

@@ -94,7 +94,10 @@ def decompile_with_heimdall_detailed(bytecode: str, timeout: int = 180) -> dict:
             # Convert the Windows temp path for WSL, and wrap in `bash -lc` so (a) $HOME in
             # HEIMDALL_PATH expands inside WSL and (b) login files set PATH. Without the
             # wrapper, Git Bash mangles /root/... into C:/Program Files/Git/root/...
-            target = temp_path.replace("\\", "/").replace("C:", "/mnt/c")
+            # Drive-agnostic (C:\ -> /mnt/c, D:\ -> /mnt/d): TEMP need not be on C:, and a
+            # hard-coded "C:" would mis-map a temp file on any other drive to a bogus path.
+            p = str(Path(temp_path).resolve())
+            target = (f"/mnt/{p[0].lower()}{p[2:]}" if len(p) >= 2 and p[1] == ":" else p).replace("\\", "/")
             cmd = ["wsl.exe", "--", "bash", "-lc",
                    f"{HEIMDALL_PATH} decompile {shlex.quote(target)} --output print --include-sol"]
         else:

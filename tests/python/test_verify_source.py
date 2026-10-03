@@ -86,8 +86,14 @@ def test_verify_no_target_none_match_is_indeterminate_not_mismatch(tmp_path: Pat
 
 
 def _make_bytecode_with_trailer(runtime_hex: str, meta_blob_bytes: int) -> str:
-    """Build hex: <runtime> + <meta_blob> + <2-byte length>."""
-    meta_blob = "ab" * meta_blob_bytes  # arbitrary
+    """Build hex: <runtime> + <meta_blob> + <2-byte length>.
+
+    The blob begins with the ASCII 'solc' marker (736f6c63) so strip_metadata_trailer recognizes
+    it as a genuine Solidity metadata trailer — it refuses to strip a trailer with no
+    ipfs/bzzr/solc marker (that guard stops it eating real code from Vyper/assembly bytecode).
+    """
+    marker = "736f6c63"  # 'solc' (4 bytes)
+    meta_blob = marker + "ab" * max(0, meta_blob_bytes - 4)  # total = meta_blob_bytes bytes
     length_suffix = format(meta_blob_bytes, "04x")
     return runtime_hex + meta_blob + length_suffix
 
@@ -439,8 +445,10 @@ def test_verify_partial_match_when_only_trailer_differs(tmp_path: Path) -> None:
     addr = "0x" + "cd" * 20
     sources_dir = _seed_meta_and_source(tmp_path, chain_id=1, address=addr)
     runtime_core = "60806040DEAD"
-    deployed_compiled = runtime_core + "ff" * 8 + "0008"  # what solc produces
-    deployed_on_chain = runtime_core + "11" * 8 + "0008"  # different trailer
+    # Both trailers carry the 'solc' marker (real solc always does; strip requires it); only the
+    # 4 hash bytes after it differ — the metadata-only difference that makes a partial_match.
+    deployed_compiled = runtime_core + "736f6c63" + "ffffffff" + "0008"  # what solc produces
+    deployed_on_chain = runtime_core + "736f6c63" + "11111111" + "0008"  # different ipfs/meta hash
 
     fake_proc = SimpleNamespace(returncode=0, stdout=_solc_output(deployed_compiled), stderr="")
     with (
@@ -547,6 +555,7 @@ def test_verify_cache_roundtrip(tmp_path: Path) -> None:
         on_chain_no_meta_prefix="6080",
         compiled_no_meta_prefix="6080",
         notes=["only trailer differs"],
+        immutables_zeroed=3,
     )
     cache.set(key, original)
 
@@ -556,6 +565,7 @@ def test_verify_cache_roundtrip(tmp_path: Path) -> None:
     assert hit.compiler_version == "0.8.34"
     assert hit.on_chain_size == 4157
     assert hit.notes == ["only trailer differs"]
+    assert hit.immutables_zeroed == 3  # persisted across the cache, not reset to 0 on a hit
     assert hit.cache_hit is True  # marker so caller knows it didn't recompile
 
 
