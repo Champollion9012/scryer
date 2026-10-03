@@ -189,7 +189,8 @@ def get_state(chain_id: int, address: str, block: object = "latest") -> dict:
     out: dict = {"chain_id": chain_id, "address": address.lower(), "rpc_url": url, "block": blk, "state": {}}
     tally = RateLimitTally()
     try:
-        out["has_code"] = len(w3.eth.get_code(Web3.to_checksum_address(address), block_identifier=blk)) > 0
+        _code = w3.eth.get_code(Web3.to_checksum_address(address), block_identifier=blk)
+        out["has_code"] = len(_code) > 0
     except Exception as e:
         reason = rpc_rate_limit_reason(e)
         if reason:
@@ -200,6 +201,16 @@ def get_state(chain_id: int, address: str, block: object = "latest") -> dict:
     if not out["has_code"]:
         out["note"] = "no contract code at this address at this block (EOA, not-yet-deployed, or self-destructed)"
         return out
+    if blk == "latest":
+        # Opportunistic backfill (B): get_state is the highest-traffic tool and already holds the
+        # code, so index its bytecode fingerprints for clone matching at zero extra network cost.
+        # HEAD only — a historical read would fingerprint the wrong code. Never fatal.
+        try:
+            from bytecode_abi import record_fingerprints
+
+            record_fingerprints(chain_id, address, bytes(_code).hex())
+        except Exception:
+            pass
     for name, sel in _VIEWS.items():
         b = _call(w3, address, sel, block=blk, tally=tally)
         if not b:

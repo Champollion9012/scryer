@@ -168,6 +168,57 @@ def analyze_bytecode(runtime_hex: str) -> dict:
     }
 
 
+def code_fingerprints(runtime_hex: str) -> dict:
+    """Three-tier bytecode identity, for matching an unverified contract to a verified twin.
+
+    The same source does NOT always produce the same runtime bytecode, so one hash is not
+    enough:
+
+    - ``runtime_code_hash`` — keccak of the exact runtime. Highest precision; only matches an
+      identical redeployment.
+    - ``runtime_norm_hash`` — keccak of the runtime with the CBOR metadata trailer removed, so
+      the same source compiled on another machine (different metadata / IPFS hash) still
+      matches. This is the workhorse tier.
+    - ``selector_hash`` — keccak of the sorted selector set: an ABI-surface fingerprint that
+      still matches when ``immutable`` values (injected at construction time) or linked library
+      addresses make the bytecode itself differ. Lower precision by nature — a vanilla ERC20
+      surface is shared by thousands — so callers must weigh it against how many contracts
+      share the same hash.
+    """
+    full = _hex_to_bytes(runtime_hex)
+    if not full:
+        return {}
+    norm = _strip_meta_bytes(full)
+    selectors = extract_selectors(runtime_hex)
+    out: dict[str, Any] = {
+        "runtime_code_hash": "0x" + bytes(Web3.keccak(full)).hex(),
+        "runtime_norm_hash": "0x" + bytes(Web3.keccak(norm)).hex(),
+        "selector_count": len(selectors),
+        "code_size": len(full),
+    }
+    if selectors:
+        out["selector_hash"] = "0x" + bytes(Web3.keccak(text=",".join(sorted(selectors)))).hex()
+    return out
+
+
+def record_fingerprints(chain_id: int, address: str, runtime_hex: str) -> None:
+    """Opportunistic backfill: stash this contract's bytecode fingerprints in the registry.
+
+    Called from tools that already hold the runtime bytecode, so the clone index fills with the
+    contracts you actually touch at zero extra network cost. Strictly best-effort — a registry
+    problem must never break the calling tool.
+    """
+    try:
+        fp = code_fingerprints(runtime_hex)
+        if not fp:
+            return
+        from contract_registry import ContractRegistry
+
+        ContractRegistry().record_code_fingerprints(chain_id, address, fp)
+    except Exception as e:  # pragma: no cover - advisory
+        _log.debug("fingerprint record failed for %s/%s: %s", chain_id, address, e)
+
+
 # --------------------------------------------------------------------------- #
 # Signature reverse-lookup (selector -> "name(type,type)")
 # --------------------------------------------------------------------------- #
@@ -330,6 +381,10 @@ def analyze_contract(
         return out
 
     out.update(analyze_bytecode(runtime_hex))
+    if blk == "latest":
+        # Opportunistic backfill (B): we already hold the code, so index it for clone matching.
+        # Only at HEAD — a historical read would record a fingerprint for the wrong code.
+        record_fingerprints(chain_id, address, runtime_hex)
 
     selectors: list[str] = out.get("selectors", [])
     if resolve and selectors:

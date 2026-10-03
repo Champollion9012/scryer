@@ -93,6 +93,25 @@ class ContractRegistry:
                     UNIQUE(chain_id, from_block, to_block)
                 );
                 CREATE INDEX IF NOT EXISTS idx_scanned_chain ON scanned_blocks(chain_id);
+
+                -- Bytecode identity, for matching an UNVERIFIED contract to a verified twin.
+                -- Kept in its own table (not on `contracts`) because a bytecode-only contract
+                -- has no source_hash, and `contracts.source_hash` is NOT NULL: `contracts`
+                -- means "has verified source", this means "we have seen its code".
+                CREATE TABLE IF NOT EXISTS code_fingerprints (
+                    chain_id INTEGER NOT NULL,
+                    address TEXT NOT NULL,
+                    runtime_code_hash TEXT,   -- exact runtime
+                    runtime_norm_hash TEXT,   -- runtime minus CBOR metadata trailer (workhorse)
+                    selector_hash TEXT,       -- sorted selector set (survives immutables)
+                    selector_count INTEGER,
+                    code_size INTEGER,
+                    seen_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (chain_id, address)
+                );
+                CREATE INDEX IF NOT EXISTS idx_fp_exact ON code_fingerprints(runtime_code_hash);
+                CREATE INDEX IF NOT EXISTS idx_fp_norm ON code_fingerprints(runtime_norm_hash);
+                CREATE INDEX IF NOT EXISTS idx_fp_sel ON code_fingerprints(selector_hash);
             """)
             conn.commit()
         finally:
@@ -216,6 +235,147 @@ class ContractRegistry:
                 }
                 for row in cursor.fetchall()
             ]
+        finally:
+            conn.close()
+
+    # ----------------------------------------------------------------- #
+    # Bytecode identity (clone matching for contracts with no source)
+    # ----------------------------------------------------------------- #
+    def record_code_fingerprints(self, chain_id: int, address: str, fp: dict) -> None:
+        """Store/refresh one contract's bytecode fingerprints (opportunistic backfill)."""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute(
+                """
+                INSERT INTO code_fingerprints
+                    (chain_id, address, runtime_code_hash, runtime_norm_hash,
+                     selector_hash, selector_count, code_size, seen_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(chain_id, address) DO UPDATE SET
+                    runtime_code_hash = excluded.runtime_code_hash,
+                    runtime_norm_hash = excluded.runtime_norm_hash,
+                    selector_hash     = excluded.selector_hash,
+                    selector_count    = excluded.selector_count,
+                    code_size         = excluded.code_size,
+                    seen_at           = excluded.seen_at
+                """,
+                (
+                    chain_id,
+                    address.lower(),
+                    fp.get("runtime_code_hash"),
+                    fp.get("runtime_norm_hash"),
+                    fp.get("selector_hash"),
+                    fp.get("selector_count"),
+                    fp.get("code_size"),
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def has_code_fingerprint(self, chain_id: int, address: str) -> bool:
+        conn = sqlite3.connect(self.db_path)
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM code_fingerprints WHERE chain_id = ? AND address = ?",
+                (chain_id, address.lower()),
+            ).fetchone()
+            return row is not None
+        finally:
+            conn.close()
+
+    def _match_tier(self, conn, column: str, value: str, chain_id: int, address: str, limit: int) -> list[dict]:
+        """Addresses sharing one fingerprint, annotated with whether they have verified source."""
+        cursor = conn.execute(
+            f"""
+            SELECT f.chain_id, f.address, c.contract_name, c.source_hash, c.compiler_version
+            FROM code_fingerprints f
+            LEFT JOIN contracts c
+                   ON c.chain_id = f.chain_id AND LOWER(c.address) = f.address
+            WHERE f.{column} = ?
+              AND NOT (f.chain_id = ? AND f.address = ?)
+            ORDER BY (c.source_hash IS NULL), f.chain_id, f.address
+            LIMIT ?
+            """,  # noqa: S608 - `column` is never user input (fixed tier names)
+            (value, chain_id, address.lower(), limit),
+        )
+        return [
+            {
+                "chain_id": r[0],
+                "address": r[1],
+                "contract_name": r[2],
+                "source_hash": r[3],
+                "compiler_version": r[4],
+                "has_verified_source": r[3] is not None,
+            }
+            for r in cursor.fetchall()
+        ]
+
+    def find_code_twins(self, chain_id: int, address: str, fp: dict, *, limit: int = 25) -> dict:
+        """Match bytecode fingerprints against the registry, tiered by precision.
+
+        ``abi_matches`` additionally reports ``shared_by`` — how many contracts in the registry
+        share that selector set. That count IS the confidence signal: 2 means a real twin,
+        thousands means a generic interface (e.g. a vanilla ERC20) and the match is worthless.
+        """
+        out: dict = {"exact_matches": [], "normalized_matches": [], "abi_matches": []}
+        conn = sqlite3.connect(self.db_path)
+        try:
+            if fp.get("runtime_code_hash"):
+                out["exact_matches"] = self._match_tier(
+                    conn, "runtime_code_hash", fp["runtime_code_hash"], chain_id, address, limit
+                )
+            if fp.get("runtime_norm_hash"):
+                out["normalized_matches"] = self._match_tier(
+                    conn, "runtime_norm_hash", fp["runtime_norm_hash"], chain_id, address, limit
+                )
+            if fp.get("selector_hash"):
+                shared = conn.execute(
+                    "SELECT COUNT(*) FROM code_fingerprints WHERE selector_hash = ?",
+                    (fp["selector_hash"],),
+                ).fetchone()[0]
+                out["abi_shared_by"] = shared
+                out["abi_matches"] = self._match_tier(
+                    conn, "selector_hash", fp["selector_hash"], chain_id, address, limit
+                )
+
+            # Inherit vulnerability knowledge: any tag on a matched twin's source_hash applies
+            # to this contract too, because it is the same code.
+            hashes = {
+                m["source_hash"]
+                for tier in ("exact_matches", "normalized_matches", "abi_matches")
+                for m in out[tier]
+                if m.get("source_hash")
+            }
+            tags: list[dict] = []
+            for h in hashes:
+                for r in conn.execute(
+                    "SELECT source_hash, tag, severity, description FROM vulnerability_tags WHERE source_hash = ?",
+                    (h,),
+                ).fetchall():
+                    tags.append({"source_hash": r[0], "tag": r[1], "severity": r[2], "description": r[3]})
+            out["inherited_vulnerability_tags"] = tags
+        finally:
+            conn.close()
+        return out
+
+    def addresses_missing_fingerprints(self, chain_id: int | None = None, limit: int = 500) -> list[tuple[int, str]]:
+        """Registered contracts with no bytecode fingerprint yet — the backfill work list."""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            sql = """
+                SELECT c.chain_id, c.address FROM contracts c
+                LEFT JOIN code_fingerprints f
+                       ON f.chain_id = c.chain_id AND f.address = LOWER(c.address)
+                WHERE f.address IS NULL
+            """
+            params: list = []
+            if chain_id is not None:
+                sql += " AND c.chain_id = ?"
+                params.append(chain_id)
+            sql += " ORDER BY c.chain_id, c.address LIMIT ?"
+            params.append(limit)
+            return [(r[0], r[1]) for r in conn.execute(sql, params).fetchall()]
         finally:
             conn.close()
 

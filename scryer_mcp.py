@@ -527,13 +527,50 @@ def bytecode_abi(address: str, chain: str = "", chain_id: int = 0, block: str = 
 # --------------------------------------------------------------------------- #
 # Relate + persist (clone discovery / vuln knowledge base over the local registry)
 # --------------------------------------------------------------------------- #
-@mcp.tool()
-def registry_clones(address: str = "", chain: str = "", chain_id: int = 0, source_hash: str = "") -> dict:
-    """Find every address sharing this contract's exact source - by source_hash OR (address + chain).
+def _bytecode_twins(chain_id: int, address: str) -> dict:
+    """Fingerprint the live bytecode and look for twins — the unverified-contract path."""
+    from web3 import Web3
 
-    A bug confirmed in one contract is confirmed in all its clones, so this sizes the
-    blast radius. Pass source_hash (from download_contract) for a direct lookup, or an
-    address (+ chain/chain_id; default BSC) to resolve the hash first.
+    from etherscan_proxy_provider import make_web3
+
+    try:
+        w3, _label = make_web3(chain_id)
+        code = bytes(w3.eth.get_code(Web3.to_checksum_address(address)))
+    except Exception as e:
+        return {"bytecode_match_error": f"{type(e).__name__}: {e}"}
+    if not code:
+        return {"bytecode_match_note": "no code at this address (EOA or self-destructed)"}
+    runtime_hex = code.hex()
+    fp = ba.code_fingerprints(runtime_hex)
+    ba.record_fingerprints(chain_id, address, runtime_hex)  # index the query contract too
+    twins = ContractRegistry().find_code_twins(chain_id, address, fp)
+    twins["fingerprints"] = fp
+    return twins
+
+
+
+@mcp.tool()
+def registry_clones(
+    address: str = "", chain: str = "", chain_id: int = 0, source_hash: str = "", bytecode: bool = True
+) -> dict:
+    """Find every address sharing this contract's code - by source_hash, or by BYTECODE.
+
+    A bug confirmed in one contract is confirmed in all its clones, so this sizes the blast
+    radius. Pass source_hash (from download_contract) for a direct source-level lookup, or an
+    address (+ chain/chain_id; default BSC).
+
+    **For an UNVERIFIED contract this is often the whole game**: with no source_hash it falls
+    back to bytecode matching and can map the contract to a VERIFIED twin whose source you then
+    download and read. Matches are tiered by precision:
+    - `exact_matches` - identical runtime bytecode.
+    - `normalized_matches` - identical except the metadata trailer (same source compiled
+      elsewhere). The workhorse tier.
+    - `abi_matches` - identical selector set; survives `immutable`/library differences that
+      change the bytecode. Judge with `abi_shared_by`: 2 means a real twin, thousands means a
+      generic interface (vanilla ERC20) and the match is meaningless.
+
+    Each match flags `has_verified_source` - go `download_contract` THAT address to read real
+    source. `inherited_vulnerability_tags` are tags on a twin's source: same code, same bug.
     """
     try:
         reg = ContractRegistry()
@@ -542,10 +579,13 @@ def registry_clones(address: str = "", chain: str = "", chain_id: int = 0, sourc
         if not address:
             return {"error": "provide either source_hash, or address (+ chain/chain_id)"}
         cid = _resolve_chain(chain, chain_id)
-        return {
+        out = {
             "query": {"chain_id": cid, "address": address.lower()},
             "related": reg.find_related_contracts(cid, address),
         }
+        if bytecode:
+            out.update(_bytecode_twins(cid, address))
+        return out
     except Exception as e:
         return _err(e)
 
