@@ -58,83 +58,109 @@ HEIMDALL_PATH = _default_heimdall_path()
 # ============================================================================
 
 
-def decompile_with_heimdall(bytecode: str, timeout: int = 120) -> str | None:
-    """
-    Decompile bytecode using Heimdall-rs via WSL.
+INSTALL_HINT = (
+    "install: wsl.exe -- bash -lc 'curl -L https://get.bifrost.sh | bash && ~/.bifrost/bin/bifrost'"
+    if sys.platform == "win32"
+    else "install: curl -L https://get.bifrost.sh | bash && ~/.bifrost/bin/bifrost"
+)
 
-    Args:
-        bytecode: EVM bytecode (with or without 0x prefix)
-        timeout: Maximum time in seconds to wait for decompilation
 
-    Returns:
-        Decompiled Solidity source code, or None if decompilation fails
+def decompile_with_heimdall_detailed(bytecode: str, timeout: int = 180) -> dict:
+    """Decompile via Heimdall-rs, reporting WHY it failed.
+
+    ``decompile_with_heimdall`` collapses every failure mode to ``None``, so a caller cannot
+    tell "Heimdall is not installed" (actionable — go install it) from "this bytecode defeated
+    the decompiler" (not actionable) from "it timed out" (raise the timeout). This returns
+    ``{status, source, detail, decompiler}`` with status one of:
+    ``ok`` | ``not_installed`` | ``timeout`` | ``failed`` | ``too_short``.
     """
-    # Remove 0x prefix if present
     if bytecode.startswith("0x"):
         bytecode = bytecode[2:]
-
-    # Skip if bytecode is too short
     if len(bytecode) < 10:
-        return None
+        return {
+            "status": "too_short",
+            "source": None,
+            "detail": f"only {len(bytecode) // 2} bytes of code — nothing to decompile",
+            "decompiler": "heimdall",
+        }
 
+    temp_path: str | None = None
     try:
-        # Write bytecode to temp file
         with tempfile.NamedTemporaryFile(mode="w", suffix=".bin", delete=False) as f:
             f.write(bytecode)
             temp_path = f.name
 
-        # Convert Windows path to WSL path
-        wsl_path = temp_path.replace("\\", "/").replace("C:", "/mnt/c")
-
-        # Wrap in `bash -lc` so:
-        #   (a) ``$HOME`` / ``~`` in HEIMDALL_PATH expands inside WSL (the
-        #       default path uses ``$HOME/.bifrost/bin/heimdall`` for portability)
-        #   (b) zsh/bash startup files load PATH so users with custom rust
-        #       toolchain locations still work
-        # Without this wrapper, Windows-side Git Bash mangles ``/root/...`` →
-        # ``C:/Program Files/Git/root/...`` because of MSYS path translation.
-        heimdall_cmd = f"{HEIMDALL_PATH} decompile {shlex.quote(wsl_path)} --output print --include-sol"
-        cmd = ["wsl.exe", "--", "bash", "-lc", heimdall_cmd]
+        if sys.platform == "win32":
+            # Convert the Windows temp path for WSL, and wrap in `bash -lc` so (a) $HOME in
+            # HEIMDALL_PATH expands inside WSL and (b) login files set PATH. Without the
+            # wrapper, Git Bash mangles /root/... into C:/Program Files/Git/root/...
+            target = temp_path.replace("\\", "/").replace("C:", "/mnt/c")
+            cmd = ["wsl.exe", "--", "bash", "-lc",
+                   f"{HEIMDALL_PATH} decompile {shlex.quote(target)} --output print --include-sol"]
+        else:
+            cmd = ["bash", "-lc",
+                   f"{HEIMDALL_PATH} decompile {shlex.quote(temp_path)} --output print --include-sol"]
 
         result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
+            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout
         )
-
-        # Clean up temp file
-        with contextlib.suppress(OSError):
-            Path(temp_path).unlink()
-
-        if result.returncode == 0 and result.stdout.strip():
-            output = result.stdout
-
-            # Extract only Solidity source if present
-            if "Source:" in output:
-                parts = output.split("Source:", 1)
-                if len(parts) > 1:
-                    return DECOMPILED_HEADER.format(decompiler="Heimdall-rs") + parts[1].strip()
-
-            # Fallback to full output if Source marker not found
-            return DECOMPILED_HEADER.format(decompiler="Heimdall-rs") + output
-
-        return None
-
     except subprocess.TimeoutExpired:
-        # Clean up on timeout
-        with contextlib.suppress(OSError, NameError):
-            Path(temp_path).unlink()
-        return None
+        return {
+            "status": "timeout",
+            "source": None,
+            "detail": f"heimdall exceeded {timeout}s — a large contract may just need a bigger timeout",
+            "decompiler": "heimdall",
+        }
     except FileNotFoundError:
-        # wsl.exe not found
-        return None
+        return {
+            "status": "not_installed",
+            "source": None,
+            "detail": f"{'wsl.exe' if sys.platform == 'win32' else 'bash'} not found — {INSTALL_HINT}",
+            "decompiler": "heimdall",
+        }
     except (KeyboardInterrupt, SystemExit):
         raise
-    except Exception:
-        return None
+    except Exception as e:
+        return {"status": "failed", "source": None, "detail": f"{type(e).__name__}: {e}", "decompiler": "heimdall"}
+    finally:
+        if temp_path:
+            with contextlib.suppress(OSError):
+                Path(temp_path).unlink()
+
+    stderr = (result.stderr or "").strip()
+    if result.returncode != 0 or not (result.stdout or "").strip():
+        low = stderr.lower()
+        if "no such file" in low or "command not found" in low:
+            return {
+                "status": "not_installed",
+                "source": None,
+                "detail": f"{stderr[:200]} — {INSTALL_HINT}",
+                "decompiler": "heimdall",
+            }
+        return {
+            "status": "failed",
+            "source": None,
+            "detail": stderr[:400] or f"heimdall exited {result.returncode} with no output",
+            "decompiler": "heimdall",
+        }
+
+    output = result.stdout
+    if "Source:" in output:  # heimdall prints a banner before the Solidity
+        output = output.split("Source:", 1)[1].strip()
+    return {
+        "status": "ok",
+        "source": DECOMPILED_HEADER.format(decompiler="Heimdall-rs") + output,
+        "detail": "",
+        "decompiler": "heimdall",
+    }
+
+
+def decompile_with_heimdall(bytecode: str, timeout: int = 120) -> str | None:
+    """Decompile bytecode using Heimdall-rs. Returns the source, or None on any failure.
+
+    Thin back-compat wrapper; prefer :func:`decompile_with_heimdall_detailed`, which says why.
+    """
+    return decompile_with_heimdall_detailed(bytecode, timeout=timeout).get("source")
 
 
 # ============================================================================

@@ -184,6 +184,15 @@ def health() -> dict:
 # --------------------------------------------------------------------------- #
 # Fetch
 # --------------------------------------------------------------------------- #
+_PSEUDO_NOTE = (
+    "Only PSEUDO-SOURCE is on disk (decompiled or bytecode-only), so found:false — it is NOT "
+    "verified source and is deliberately not registered (a decompiled hash would pollute clone "
+    "matching). Read it for structure, but trust the opcodes and never the invented names. Use "
+    "bytecode_abi(address) for the authoritative selector surface, decompile(address) to "
+    "regenerate readable logic, and registry_clones(address) to look for a verified twin."
+)
+
+
 def _collect_download(chain_id: int, address: str) -> dict:
     addr = dc.normalize_address(address)
     prefix = f"{chain_id}_{addr}"
@@ -213,6 +222,9 @@ def _collect_download(chain_id: int, address: str) -> dict:
         "source_hash": source_hash,
         "meta_path": str(meta_path) if meta_path.exists() else None,
         "sources_dir": str(SOURCES_DIR),
+        # Decompiled / bytecode-only output is pseudo-source, not verified source — callers
+        # must not treat it as `found`.
+        "pseudo_source": bool(meta and (meta.get("decompiled") or meta.get("bytecode_only"))),
     }
 
 
@@ -291,6 +303,10 @@ def _register_from_disk(chain_id: int, address: str) -> str | None:
     if not srcs:
         return None
     meta = _read_meta(SOURCES_DIR / f"{prefix}_download_meta.json")
+    if meta and (meta.get("decompiled") or meta.get("bytecode_only")):
+        # Decompiler output is PSEUDO-source: its hash shifts with the decompiler version, so
+        # registering it would pollute clone matching with phantom "source" that matches nothing.
+        return None
     logical_hash = meta.get("source_hash") if meta else None
     try:
         return ContractRegistry().register_contract(chain_id, addr, srcs, source_hash=logical_hash)
@@ -328,8 +344,11 @@ def download_contract(address: str, chain: str = "", chain_id: int = 0, follow_p
         if not refresh:
             cached = _collect_download(cid, address)
             if cached["file_count"] > 0 and cached["meta_path"]:
-                cached["found"] = True
+                # Pseudo-source on disk is NOT a verified-source hit.
+                cached["found"] = not cached.get("pseudo_source")
                 cached["cached"] = True
+                if cached.get("pseudo_source"):
+                    cached["note"] = _PSEUDO_NOTE
                 if follow_proxy:
                     cached["proxy"] = _proxy_block(cid, cached.get("meta_path"), follow_proxy)
                 return cached
@@ -339,7 +358,11 @@ def download_contract(address: str, chain: str = "", chain_id: int = 0, follow_p
         )
         out = _collect_download(cid, address)
         out["cached"] = False
-        out["found"] = bool(ok and out["file_count"] > 0)
+        # Decompiled / bytecode-only output lands as a .sol on disk, but it is pseudo-source:
+        # `found` must mean VERIFIED source, or the agent analyzes invented names as fact.
+        out["found"] = bool(ok and out["file_count"] > 0 and not out.get("pseudo_source"))
+        if out.get("pseudo_source") and "note" not in out:
+            out["note"] = _PSEUDO_NOTE
         if out["found"]:
             out["registered"] = _register_from_disk(cid, out["address"]) is not None
         if follow_proxy:
@@ -367,8 +390,9 @@ def download_contract(address: str, chain: str = "", chain_id: int = 0, follow_p
                 else:
                     out["note"] = (
                         "No verified source from any provider - only runtime bytecode exists on-chain. "
-                        "Call bytecode_abi(address) to recover its callable surface (selectors -> signatures) "
-                        "and its proxy shape straight from the bytecode."
+                        "This is NOT a dead end: registry_clones(address) may find a VERIFIED twin by "
+                        "bytecode, bytecode_abi(address) recovers the callable surface (selectors -> "
+                        "signatures) + proxy shape, and decompile(address) produces readable pseudo-source."
                     )
             # found:false -> stamp the full retry signal (rate_limited + retry_after).
             tally.apply(out)
@@ -520,6 +544,79 @@ def bytecode_abi(address: str, chain: str = "", chain_id: int = 0, block: str = 
     """
     try:
         return ba.analyze_contract(_resolve_chain(chain, chain_id), address, block=block, resolve=resolve)
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+def decompile(address: str, chain: str = "", chain_id: int = 0, block: str = "latest", timeout: int = 180) -> dict:
+    """Decompile an UNVERIFIED contract's bytecode into readable pseudo-Solidity (Heimdall-rs).
+
+    Use when `download_contract` found no verified source and you need to read LOGIC, not just
+    the callable surface. Writes the result to `sources/` and returns its path + a preview —
+    **Read the file** for the full text.
+
+    **This is PSEUDO-SOURCE, not the original.** Trust the opcodes and control flow; do NOT
+    trust the names — every function/variable name is invented by the decompiler, and selectors
+    it cannot resolve appear as `Unresolved_xxxxxxxx`. Never feed it to `verify_source` (it is
+    not the deployed source and will not compile). It is deliberately NOT registered in the
+    registry: a decompiled hash is unstable and would pollute clone matching.
+
+    Pair it with `bytecode_abi` (the authoritative selector list, with real signatures) and
+    `call_view` (actual live values). `status` says exactly what happened: ok / not_installed
+    (with the install command) / timeout (raise `timeout`) / failed / too_short.
+
+    **Heimdall is slow on real contracts** — measured ~136s for a 7 KB contract — so expect a
+    long call and raise `timeout` (default 180s) for anything larger. If you only need the
+    callable surface, `bytecode_abi` answers in seconds instead.
+    """
+    try:
+        import decompilers
+        from web3 import Web3
+
+        from etherscan_proxy_provider import make_web3
+
+        cid = _resolve_chain(chain, chain_id)
+        blk, berr = oc._parse_block(block)
+        if berr:
+            return {"error": berr}
+        w3, _label = make_web3(cid)
+        code = bytes(w3.eth.get_code(Web3.to_checksum_address(address), block_identifier=blk))
+        out: dict = {"chain_id": cid, "address": address.lower(), "block": blk, "code_size": len(code)}
+        if not code:
+            out["status"] = "no_code"
+            out["error"] = "no code at this address at this block (EOA, not yet deployed, or self-destructed)"
+            return out
+
+        res = decompilers.decompile_with_heimdall_detailed(code.hex(), timeout=timeout)
+        out["decompiler"] = res["decompiler"]
+        out["status"] = res["status"]
+        if res["status"] != "ok":
+            out["error"] = res["detail"]
+            return out
+
+        src = res["source"] or ""
+        path = SOURCES_DIR / f"{cid}_{address.lower()}_decompiled.sol"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(src, encoding="utf-8")
+        out.update(
+            {
+                "path": str(path),
+                "line_count": src.count("\n") + 1,
+                "char_count": len(src),
+                "preview": src[:2000],
+                "pseudo_source": True,
+                "registered": False,
+                "note": (
+                    "PSEUDO-SOURCE from bytecode — NOT the original source. Trust the opcodes and control "
+                    "flow, never the names (they are invented; unresolved selectors show as "
+                    "Unresolved_xxxxxxxx). Do not pass this to verify_source. Not registered, so it cannot "
+                    "pollute clone matching. Cross-check the real surface with bytecode_abi and read live "
+                    "values with call_view."
+                ),
+            }
+        )
+        return out
     except Exception as e:
         return _err(e)
 
