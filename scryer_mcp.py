@@ -560,6 +560,21 @@ def token_exposure(address: str, chain: str = "", chain_id: int = 0, block: str 
         return _err(e)
 
 
+@mcp.tool()
+def price_token(token: str, chain: str = "", chain_id: int = 0, block: str = "latest") -> dict:
+    """USD price of ANY token - DeFiLlama first, then an on-chain LP route as fallback.
+
+    For meme / non-major tokens that price feeds don't cover: if DeFiLlama has no price, it derives
+    one from DEX reserves (token/USD, else token/WETH x WETH/USD). `price_source` says which path
+    produced it ("defillama" or "lp:..."); `price` is null if neither could. `block` pins it to a
+    historical point. The LP route needs a known DEX for the chain (currently ETH, BSC).
+    """
+    try:
+        return oc.price_token(_resolve_chain(chain, chain_id), token, block=block)
+    except Exception as e:
+        return _err(e)
+
+
 # --------------------------------------------------------------------------- #
 # Chain activity: transactions, logs, fund flow, deployer (native RPC only)
 # --------------------------------------------------------------------------- #

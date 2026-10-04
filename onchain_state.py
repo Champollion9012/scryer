@@ -20,7 +20,6 @@ from eth_abi import decode as abi_decode
 from eth_abi import encode as abi_encode
 from web3 import Web3
 
-import scryer_config
 from scryer_http import RateLimitTally, rate_limit_reason, retry_after_seconds, rpc_rate_limit_reason
 
 # No-argument view selectors worth probing on an unknown contract.
@@ -42,24 +41,73 @@ _UINT = {"decimals", "totalSupply"}
 _STR = {"name", "symbol"}
 
 _NATIVE = {
-    1: "ETH", 10: "ETH", 56: "BNB", 137: "MATIC", 250: "FTM", 8453: "ETH", 42161: "ETH", 43114: "AVAX",
-    59144: "ETH", 534352: "ETH", 81457: "ETH", 5000: "MNT", 100: "xDAI", 324: "ETH", 1101: "ETH",
-    204: "BNB", 42220: "CELO", 25: "CRO", 1284: "GLMR", 1088: "METIS",
+    1: "ETH",
+    10: "ETH",
+    56: "BNB",
+    137: "MATIC",
+    250: "FTM",
+    8453: "ETH",
+    42161: "ETH",
+    43114: "AVAX",
+    59144: "ETH",
+    534352: "ETH",
+    81457: "ETH",
+    5000: "MNT",
+    100: "xDAI",
+    324: "ETH",
+    1101: "ETH",
+    204: "BNB",
+    42220: "CELO",
+    25: "CRO",
+    1284: "GLMR",
+    1088: "METIS",
 }
 
 # DeFiLlama (free, no API key) price API: per-chain prefix for tokens, and the
 # coingecko id used to price each chain's native coin.
 _DL_CHAIN = {
-    1: "ethereum", 10: "optimism", 56: "bsc", 137: "polygon", 250: "fantom", 8453: "base",
-    42161: "arbitrum", 43114: "avax", 59144: "linea", 534352: "scroll", 81457: "blast", 5000: "mantle",
-    100: "xdai", 324: "era", 1101: "polygon_zkevm", 204: "op_bnb", 42220: "celo", 25: "cronos",
-    1284: "moonbeam", 1088: "metis",
+    1: "ethereum",
+    10: "optimism",
+    56: "bsc",
+    137: "polygon",
+    250: "fantom",
+    8453: "base",
+    42161: "arbitrum",
+    43114: "avax",
+    59144: "linea",
+    534352: "scroll",
+    81457: "blast",
+    5000: "mantle",
+    100: "xdai",
+    324: "era",
+    1101: "polygon_zkevm",
+    204: "op_bnb",
+    42220: "celo",
+    25: "cronos",
+    1284: "moonbeam",
+    1088: "metis",
 }
 _DL_NATIVE_CGID = {
-    1: "ethereum", 10: "ethereum", 42161: "ethereum", 8453: "ethereum", 56: "binancecoin",
-    137: "matic-network", 250: "fantom", 43114: "avalanche-2", 59144: "ethereum", 534352: "ethereum",
-    81457: "ethereum", 324: "ethereum", 1101: "ethereum", 5000: "mantle", 100: "xdai",
-    204: "binancecoin", 42220: "celo", 25: "crypto-com-chain", 1284: "moonbeam", 1088: "metis-token",
+    1: "ethereum",
+    10: "ethereum",
+    42161: "ethereum",
+    8453: "ethereum",
+    56: "binancecoin",
+    137: "matic-network",
+    250: "fantom",
+    43114: "avalanche-2",
+    59144: "ethereum",
+    534352: "ethereum",
+    81457: "ethereum",
+    324: "ethereum",
+    1101: "ethereum",
+    5000: "mantle",
+    100: "xdai",
+    204: "binancecoin",
+    42220: "celo",
+    25: "crypto-com-chain",
+    1284: "moonbeam",
+    1088: "metis-token",
 }
 
 # Major tokens per chain: (symbol, address, decimals, is_stable). Stablecoin
@@ -118,7 +166,12 @@ def _parse_block(block) -> tuple[object, str | None]:
 
 
 def _call(
-    w3: Web3, address: str, selector: str, suffix: str = "", block: object = "latest", tally: RateLimitTally | None = None
+    w3: Web3,
+    address: str,
+    selector: str,
+    suffix: str = "",
+    block: object = "latest",
+    tally: RateLimitTally | None = None,
 ) -> bytes | None:
     try:
         raw = w3.eth.call(
@@ -315,8 +368,13 @@ def read_storage(chain_id: int, address: str, slot: int | str, decode_as: str = 
         reason = rpc_rate_limit_reason(e)
         if reason:
             return {
-                "chain_id": chain_id, "address": address.lower(), "slot": hex(s), "block": blk,
-                "rate_limited": True, "warnings": [f"rpc: {reason}"], "error": f"rpc rate-limited: {reason}",
+                "chain_id": chain_id,
+                "address": address.lower(),
+                "slot": hex(s),
+                "block": blk,
+                "rate_limited": True,
+                "warnings": [f"rpc: {reason}"],
+                "error": f"rpc rate-limited: {reason}",
             }
         return {"error": f"rpc: {type(e).__name__}: {e} (historical reads need an archive RPC)"}
     out: dict = {
@@ -383,8 +441,13 @@ def call_view(
         if reason:
             # A throttle is NOT a revert — the view may well return a value; retry, don't conclude "no value".
             return {
-                "chain_id": chain_id, "address": address.lower(), "signature": sig, "block": blk,
-                "rate_limited": True, "warnings": [f"rpc: {reason}"], "error": f"rpc rate-limited: {reason} (not a revert)",
+                "chain_id": chain_id,
+                "address": address.lower(),
+                "signature": sig,
+                "block": blk,
+                "rate_limited": True,
+                "warnings": [f"rpc: {reason}"],
+                "error": f"rpc rate-limited: {reason} (not a revert)",
             }
         return {"error": f"eth_call failed/reverted: {type(e).__name__}: {e}"}
     out: dict = {
@@ -431,6 +494,139 @@ def _defillama_prices(
         return {k: v["price"] for k, v in coins.items() if isinstance(v, dict) and "price" in v}
     except Exception:
         return {}
+
+
+# UniswapV2-style DEX per chain, for the on-chain LP pricing fallback: (factory, CREATE2 pair
+# init-code hash, WETH/wrapped-native (addr, decimals), USD stable (addr, decimals)). The pair
+# address is derived deterministically (no factory call), reserves give the price. Verified against
+# the canonical Uniswap-V2 USDC/WETH and PancakeSwap-V2 WBNB/BUSD pair addresses.
+_DEX_V2: dict[int, dict] = {
+    1: {
+        "factory": "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f",
+        "init_code_hash": "0x96e8ac4277198ff8b6f785478aa9a39f403cb768dd02cbee326c3e7da348845f",
+        "weth": ("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", 18),
+        "usd": ("0xdAC17F958D2ee523a2206206994597C13D831ec7", 6),  # USDT
+    },
+    56: {
+        "factory": "0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73",
+        "init_code_hash": "0x00fb7f630766e6a796048ea87d01acd3068e8ff67d078148a3fa3f4a84f69bd5",
+        "weth": ("0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c", 18),  # WBNB
+        "usd": ("0x55d398326f99059fF775485246999027B3197955", 18),  # USDT (18 on BSC)
+    },
+}
+
+
+def _v2_pair(factory: str, init_code_hash: str, token_a: str, token_b: str) -> str:
+    """CREATE2 address of the UniswapV2 pair for (token_a, token_b) — no factory call needed."""
+    a = bytes.fromhex(token_a[2:])
+    b = bytes.fromhex(token_b[2:])
+    t0, t1 = (a, b) if a < b else (b, a)
+    salt = Web3.keccak(t0 + t1)
+    pre = b"\xff" + bytes.fromhex(factory[2:]) + salt + bytes.fromhex(init_code_hash[2:])
+    return "0x" + bytes(Web3.keccak(pre))[-20:].hex()
+
+
+def _price_via_pair(
+    w3: Web3,
+    cfg: dict,
+    token: str,
+    token_dec: int,
+    quote: str,
+    quote_dec: int,
+    block: object,
+    tally: RateLimitTally | None,
+) -> float | None:
+    """Price of ``token`` in units of ``quote`` from the derived pair's reserves, or None if the
+    pair has no liquidity / does not actually hold this exact token pair."""
+    pair = _v2_pair(cfg["factory"], cfg["init_code_hash"], token, quote)
+    st = _pair_state(w3, pair, block=block, tally=tally)
+    if not st:
+        return None
+    t0 = (st.get("token0") or "").lower()
+    t1 = (st.get("token1") or "").lower()
+    if token == t0 and quote == t1:
+        r_token, r_quote = st["reserve0"], st["reserve1"]
+    elif token == t1 and quote == t0:
+        r_token, r_quote = st["reserve1"], st["reserve0"]
+    else:
+        return None  # derived pair isn't this token/quote (collision / not deployed)
+    if r_token == 0:
+        return None
+    return (r_quote / 10**quote_dec) / (r_token / 10**token_dec)
+
+
+def _lp_price_usd(
+    w3: Web3, chain_id: int, token: str, token_dec: int, block: object = "latest", tally: RateLimitTally | None = None
+) -> tuple[float | None, str | None]:
+    """Best-effort USD price of ``token`` from on-chain LP reserves: token/USD direct, else
+    token/WETH x WETH/USD. Returns (price, source) or (None, None). The route for meme/non-major
+    tokens that price feeds don't cover."""
+    cfg = _DEX_V2.get(chain_id)
+    if not cfg:
+        return None, None
+    token = token.lower()
+    usd_addr, usd_dec = cfg["usd"][0].lower(), cfg["usd"][1]
+    weth_addr, weth_dec = cfg["weth"][0].lower(), cfg["weth"][1]
+    if token == usd_addr:
+        return 1.0, "lp:is_usd"
+    direct = _price_via_pair(w3, cfg, token, token_dec, usd_addr, usd_dec, block, tally)
+    if direct is not None:
+        return direct, "lp:token/usd"
+    weth_usd = (
+        1.0 if weth_addr == usd_addr else _price_via_pair(w3, cfg, weth_addr, weth_dec, usd_addr, usd_dec, block, tally)
+    )
+    if token == weth_addr:
+        return (weth_usd, "lp:weth/usd") if weth_usd is not None else (None, None)
+    if weth_usd is None:
+        return None, None
+    token_in_weth = _price_via_pair(w3, cfg, token, token_dec, weth_addr, weth_dec, block, tally)
+    if token_in_weth is None:
+        return None, None
+    return token_in_weth * weth_usd, "lp:token/weth/usd"
+
+
+def _token_decimals(w3: Web3, token: str, block: object, tally: RateLimitTally | None) -> int:
+    """ERC20 decimals(), defaulting to 18 if the getter is absent/reverts."""
+    b = _call(w3, token, "313ce567", block=block, tally=tally)  # decimals()
+    if b:
+        d = int.from_bytes(b[-32:], "big")
+        if 0 < d <= 36:
+            return d
+    return 18
+
+
+def price_token(chain_id: int, token: str, block: object = "latest") -> dict:
+    """USD price of any token: DeFiLlama first, then the on-chain LP route (so meme/non-major
+    tokens still get a figure). ``price_source`` says which produced it; price is null if neither
+    could. The LP route needs a known DEX for the chain (see ``_DEX_V2``)."""
+    w3, url = _w3(chain_id)
+    blk, berr = _parse_block(block)
+    if berr:
+        return {"chain_id": chain_id, "token": token.lower(), "error": berr}
+    tally = RateLimitTally()
+    taddr = token.lower()
+    out: dict = {"chain_id": chain_id, "token": taddr, "rpc_url": url, "block": blk}
+    dl_chain = _DL_CHAIN.get(chain_id)
+    ts = None
+    if blk != "latest":
+        try:
+            ts = w3.eth.get_block(blk)["timestamp"]  # type: ignore[arg-type]  # blk validated by _parse_block
+        except Exception:
+            ts = None
+    if dl_chain:
+        dl = _defillama_prices([f"{dl_chain}:{taddr}"], timestamp=ts, tally=tally)
+        p = dl.get(f"{dl_chain}:{taddr}")
+        if p:
+            out.update(price=p, price_source="defillama")
+            return tally.apply(out)
+    dec = _token_decimals(w3, taddr, blk, tally)
+    lp_price, lp_src = _lp_price_usd(w3, chain_id, taddr, dec, block=blk, tally=tally)
+    out.update(price=lp_price, price_source=lp_src, decimals=dec)
+    if lp_price is None and "defillama" in tally.providers:
+        out["note"] = "DeFiLlama was rate-limited and no LP route priced it — price UNKNOWN (null), retry."
+    elif lp_price is None:
+        out["note"] = "no DeFiLlama price and no on-chain LP route found for this token on this chain."
+    return tally.apply(out)
 
 
 def token_exposure(chain_id: int, address: str, block: object = "latest") -> dict:
@@ -487,11 +683,26 @@ def token_exposure(chain_id: int, address: str, block: object = "latest") -> dic
     prices = _defillama_prices([native_key, *token_keys.values()], timestamp=ts, tally=tally)
     price_throttled = "defillama" in tally.providers
 
+    dec_by_token = {addr.lower(): dec for _s, addr, dec, _st in _TOKENS.get(chain_id, [])}
     native_price = prices.get(native_key)
     native_usd = round(native_amt * native_price, 2) if native_price else None
     total = native_usd or 0.0
+    used_lp = False
     for h in holdings:
         p = prices.get(token_keys.get(h["token"], ""))
+        if p:
+            h["price_source"] = "defillama"
+        elif not price_throttled:
+            # DeFiLlama had no price -> derive one from on-chain LP reserves (meme/non-major tokens).
+            lp_p, lp_src = _lp_price_usd(
+                w3, chain_id, h["token"], dec_by_token.get(h["token"], 18), block=blk, tally=tally
+            )
+            if lp_p is not None:
+                p, h["price_source"], used_lp = lp_p, lp_src, True
+            else:
+                h["price_source"] = None
+        else:
+            h["price_source"] = None
         h["usd"] = round(h["amount"] * p, 2) if p else None
         if h["usd"]:
             total += h["usd"]
@@ -501,14 +712,15 @@ def token_exposure(chain_id: int, address: str, block: object = "latest") -> dic
     # A throttled price fetch must NOT be reported as an authoritative $0 — that would deflate
     # the $-at-risk severity input. Report total_usd as UNKNOWN (null) when pricing was throttled.
     out["total_usd"] = None if price_throttled else round(total, 2)
-    out["price_source"] = "defillama"
+    out["price_source"] = "defillama+lp_route" if used_lp else "defillama"
     out["price_block_timestamp"] = ts
     out["note"] = (
         "DeFiLlama pricing was rate-limited: total_usd is UNKNOWN (null), NOT $0 - retry for the real $-at-risk."
         if price_throttled
         else (
-            "total_usd = native + priced tokens (DeFiLlama, best-effort; usd=null means no price). "
-            "Fixed major-token list per chain, not the full token set - total_usd is a floor, not exhaustive TVL."
+            "total_usd = native + priced tokens (DeFiLlama, then on-chain LP route as fallback; each holding's "
+            "price_source says which, usd=null means neither priced it). Fixed major-token list per chain, not the "
+            "full token set - total_usd is a floor, not exhaustive TVL."
         )
     )
     return tally.apply(out)
