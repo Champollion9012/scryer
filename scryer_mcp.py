@@ -17,6 +17,7 @@ Relative paths (sources/, .contract_registry.db) resolve against the repo root.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sys
@@ -41,6 +42,7 @@ from mcp.server.fastmcp import FastMCP  # noqa: E402
 import bytecode_abi as ba  # noqa: E402
 import download_contract as dc  # noqa: E402
 import onchain_state as oc  # noqa: E402
+import scryer_chain as cm  # noqa: E402
 import verify_source as vs  # noqa: E402
 from contract_registry import ContractRegistry  # noqa: E402
 from scryer_http import RateLimited, RateLimitTally, rpc_rate_limit_reason  # noqa: E402
@@ -335,10 +337,8 @@ def _register_from_disk(chain_id: int, address: str) -> str | None:
         return None
     srcs: dict[str, str] = {}
     for f in _verified_src_files(prefix, meta):  # excludes any stale `_decompiled.sol`
-        try:
+        with contextlib.suppress(Exception):
             srcs[f.name] = f.read_text(encoding="utf-8", errors="replace")
-        except Exception:
-            pass
     if not srcs:
         return None
     logical_hash = meta.get("source_hash") if meta else None
@@ -549,6 +549,83 @@ def token_exposure(address: str, chain: str = "", chain_id: int = 0, block: str 
         return _err(e)
 
 
+# --------------------------------------------------------------------------- #
+# Chain activity: transactions, logs, fund flow, deployer (native RPC only)
+# --------------------------------------------------------------------------- #
+@mcp.tool()
+async def get_logs(address: str = "", topics: list[str] | None = None, from_block: str = "0",
+                   to_block: str = "latest", chain: str = "", chain_id: int = 0, chunk: int = 0) -> dict:
+    """eth_getLogs over ANY block range — auto-chunked past the provider's max-range cap.
+
+    No manual chunking: the range is split into windows (default 10 blocks, the Alchemy free-tier
+    cap) fetched concurrently, and a window that still trips a range/size error is halved and
+    retried down to one block. `address` filters by emitter; `topics` is the raw topic filter
+    (topic0 is the event signature hash, e.g. the Sync/Transfer/Swap topic). `from_block`/`to_block`
+    accept a number, 0x-hex, or a tag. Results are merged + de-duplicated; `count` is the total and
+    `partial:true` (+ `errors`/`rate_limited`) flags any window that could not be fully read — it
+    NEVER silently truncates. Uses the chain's native RPC (logs are paywalled on Etherscan's free
+    tier for non-ETH chains), so the chain needs a *_URL in .env.
+    """
+    try:
+        return await cm.get_logs(
+            _resolve_chain(chain, chain_id), address, topics=topics,
+            from_block=from_block, to_block=to_block, chunk=(chunk or None),
+        )
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def get_tx(tx_hash: str, chain: str = "", chain_id: int = 0) -> dict:
+    """Decode a transaction's token movements — from/to/selector/status/gas + events + net flows.
+
+    Fetches the tx + receipt and decodes ERC20 Transfer, UniswapV2 Swap/Sync, and WETH/WBNB
+    Deposit/Withdrawal logs. `net_flows` is a per-token {address: net} summary (received - sent) —
+    the fast read on "what moved and to whom" without hand-parsing receipts. Native RPC only.
+    """
+    try:
+        return await cm.get_tx(_resolve_chain(chain, chain_id), tx_hash)
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def asset_transfers(address: str, direction: str = "in", category: list[str] | None = None,
+                          from_block: str = "0", to_block: str = "latest",
+                          chain: str = "", chain_id: int = 0, max_pages: int = 20) -> dict:
+    """Trace an address's fund flow (who funded it / where value went) via Alchemy asset transfers.
+
+    `direction`: "in" (received — the "who funded X" primitive), "out" (sent), or "both".
+    `category`: Alchemy categories, default ["external","erc20"] (native + token). Paginates the
+    provider's pageKey automatically and returns counterparties (count/value/assets) + the earliest
+    block seen. `truncated:true` means more pages exist beyond `max_pages`. Needs an Alchemy-family
+    native RPC for the chain.
+    """
+    try:
+        return await cm.asset_transfers(
+            _resolve_chain(chain, chain_id), address, direction=direction, category=category,
+            from_block=from_block, to_block=to_block, max_pages=max_pages,
+        )
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def deployer(address: str, chain: str = "", chain_id: int = 0) -> dict:
+    """Resolve a contract's deployer EOA, creation tx, and factory (if factory-made).
+
+    Native-RPC only (Etherscan's getcontractcreation is paywalled on BSC): binary-searches
+    eth_getCode for the deploy block, reverses the creation tx from the first mint/log at that
+    block, and reports `deployer` (tx.from), `creation_tx`, and `factory` (tx.to — null => a direct
+    CREATE, an address => the factory that deployed it; `via` says which). Historical eth_getCode
+    needs an archive RPC.
+    """
+    try:
+        return await cm.deployer(_resolve_chain(chain, chain_id), address)
+    except Exception as e:
+        return _err(e)
+
+
 @mcp.tool()
 def bytecode_abi(address: str, chain: str = "", chain_id: int = 0, block: str = "latest", resolve: bool = True) -> dict:
     """Recover a contract's callable surface from RUNTIME BYTECODE — works with NO source.
@@ -605,9 +682,9 @@ def decompile(address: str, chain: str = "", chain_id: int = 0, block: str = "la
     callable surface, `bytecode_abi` answers in seconds instead.
     """
     try:
-        import decompilers
         from web3 import Web3
 
+        import decompilers
         from etherscan_proxy_provider import make_web3
 
         cid = _resolve_chain(chain, chain_id)
@@ -637,13 +714,11 @@ def decompile(address: str, chain: str = "", chain_id: int = 0, block: str = "la
         # Write a meta sidecar flagged decompiled:true so the pseudo-source guards (which key off
         # meta, not filename) see this file. Without it, a later VERIFIED download_contract of the
         # same address would list this .sol among its verified files and fold it into the registry.
-        try:
+        with contextlib.suppress(Exception):
             (SOURCES_DIR / f"{cid}_{addr_l}_download_meta.json").write_text(
                 json.dumps({"decompiled": True, "decompiler": res["decompiler"], "source": "decompile_tool"}),
                 encoding="utf-8",
             )
-        except Exception:
-            pass
         out.update(
             {
                 "path": str(path),

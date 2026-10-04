@@ -149,6 +149,31 @@ def _sync_transport(*, use_socks_proxy: bool, retries: int) -> httpx.BaseTranspo
     return httpx.HTTPTransport(retries=retries)
 
 
+def redact_rpc_url(url: str) -> str:
+    """Reduce an RPC endpoint to a non-secret label for inclusion in tool output.
+
+    Provider API keys live in the path (Alchemy ``/v2/<KEY>``), the query (``?apikey=``), or
+    occasionally a subdomain; returning ``scheme://host`` drops the path and query, which removes
+    the key for every common provider. A value that is not an http(s) URL — e.g. the
+    ``etherscan-v2-proxy:56`` label or a test stub like ``fake-rpc`` — carries no secret and is
+    returned unchanged. This never returns the key.
+    """
+    if not url:
+        return url
+    if "://" not in url:
+        return url  # already a non-URL label (e.g. 'etherscan-v2-proxy:56')
+    try:
+        from urllib.parse import urlsplit
+
+        parts = urlsplit(url)
+        host = parts.hostname or ""
+        if not host:
+            return "<redacted-rpc>"
+        return f"{parts.scheme}://{host}"
+    except Exception:
+        return "<redacted-rpc>"
+
+
 # ---------------------------------------------------------------------------
 # Rate-limit detection & propagation
 #
@@ -317,7 +342,7 @@ class RateLimitTally:
             if retry_after is not None:
                 self.retry_after = retry_after if self.retry_after is None else max(self.retry_after, retry_after)
 
-    def note_exc(self, exc: "RateLimited") -> None:
+    def note_exc(self, exc: RateLimited) -> None:
         """Record a caught :class:`RateLimited`."""
         self.note(exc.detail or exc.reason, provider=exc.provider, retry_after=exc.retry_after)
 
