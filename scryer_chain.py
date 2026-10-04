@@ -31,8 +31,11 @@ from collections.abc import Sequence
 from typing import Any
 
 import httpx
+from eth_abi import decode as abi_decode
+from eth_abi import encode as abi_encode
 from web3 import Web3
 
+import onchain_state as oc
 import scryer_config
 from scryer_http import (
     RateLimited,
@@ -605,4 +608,285 @@ async def deployer(chain_id: int, address: str) -> dict:
         out["via"] = "factory" if to_l else "direct_create"
     else:
         out["note"] = "deploy block located, but no mint/log at that block to reverse the creation tx from"
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# P1: chain head helpers
+# --------------------------------------------------------------------------- #
+async def block_number(chain_id: int) -> dict:
+    """Current head block for ``chain_id`` (native RPC)."""
+    url = _rpc_url(chain_id)
+    if not url:
+        return {"chain_id": chain_id, "error": f"no native RPC configured for chain {chain_id}"}
+    async with async_client() as client:
+        try:
+            bn = _int(await _rpc(client, url, "eth_blockNumber", []))
+        except RateLimited as e:
+            return _rl_out({"chain_id": chain_id}, e)
+        except Exception as e:  # noqa: BLE001
+            return {"chain_id": chain_id, "error": f"{type(e).__name__}: {e}"}
+    return {"chain_id": chain_id, "block_number": bn, "rpc_url": redact_rpc_url(url)}
+
+
+async def block_at(chain_id: int, timestamp: int) -> dict:
+    """The latest block whose timestamp is <= ``timestamp`` (binary search over block timestamps).
+
+    The standard "what block was it at time T" primitive for pinning a historical read/log scan to
+    a wall-clock moment. Clamps to [genesis, head]. Needs the node to serve block headers by number.
+    """
+    url = _rpc_url(chain_id)
+    if not url:
+        return {"chain_id": chain_id, "error": f"no native RPC configured for chain {chain_id}"}
+    target = int(timestamp)
+    async with async_client() as client:
+        try:
+
+            async def ts_of(b: int) -> int:
+                blk = await _rpc(client, url, "eth_getBlockByNumber", [hex(b), False])
+                if not blk:
+                    raise RpcError(f"block {b} not found")
+                return _int(blk.get("timestamp"))
+
+            head = _int(await _rpc(client, url, "eth_blockNumber", []))
+            lo_ts = await ts_of(0)
+            if target <= lo_ts:
+                return {
+                    "chain_id": chain_id,
+                    "timestamp": target,
+                    "block_number": 0,
+                    "block_timestamp": lo_ts,
+                    "rpc_url": redact_rpc_url(url),
+                }
+            head_ts = await ts_of(head)
+            if target >= head_ts:
+                return {
+                    "chain_id": chain_id,
+                    "timestamp": target,
+                    "block_number": head,
+                    "block_timestamp": head_ts,
+                    "rpc_url": redact_rpc_url(url),
+                }
+            lo, hi = 0, head
+            while lo < hi:  # largest block with timestamp <= target
+                mid = (lo + hi + 1) // 2
+                if await ts_of(mid) <= target:
+                    lo = mid
+                else:
+                    hi = mid - 1
+            found_ts = await ts_of(lo)
+        except RateLimited as e:
+            return _rl_out({"chain_id": chain_id, "timestamp": target}, e)
+        except Exception as e:  # noqa: BLE001
+            return {"chain_id": chain_id, "timestamp": target, "error": f"{type(e).__name__}: {e}"}
+    return {
+        "chain_id": chain_id,
+        "timestamp": target,
+        "block_number": lo,
+        "block_timestamp": found_ts,
+        "rpc_url": redact_rpc_url(url),
+    }
+
+
+async def chain_heads(chain_ids: Sequence[int]) -> dict[int, int | None]:
+    """Best-effort current head for several chains concurrently (for health()).
+
+    Only chains with a configured native RPC are queried; a chain with no RPC, or one that errors
+    or times out, maps to ``None`` so a slow/missing node never breaks the caller.
+    """
+
+    async def one(cid: int) -> tuple[int, int | None]:
+        url = scryer_config.get_rpc_url(cid)
+        if not url:
+            return cid, None
+        try:
+            async with async_client(timeout=8) as client:
+                return cid, _int(await _rpc(client, url, "eth_blockNumber", []))
+        except Exception:  # noqa: BLE001 - head probe is advisory
+            return cid, None
+
+    pairs = await asyncio.gather(*(one(c) for c in chain_ids))
+    return dict(pairs)
+
+
+# --------------------------------------------------------------------------- #
+# P1: batch view calls
+# --------------------------------------------------------------------------- #
+def _args_for(args: Any, idx: int, n_sigs: int) -> list:
+    """Resolve the argument list for signature #idx. ``args`` is either a single arg list applied
+    to every signature, or (when there are multiple signatures) a list-of-lists aligned per
+    signature."""
+    if not args:
+        return []
+    if n_sigs > 1 and len(args) == n_sigs and all(isinstance(a, (list, tuple)) for a in args):
+        return list(args[idx])
+    return list(args)
+
+
+async def call_view_many(
+    chain_id: int,
+    address: str,
+    signatures: Any,
+    *,
+    args: Any = None,
+    returns: str = "",
+    blocks: Any = None,
+    concurrency: int | None = None,
+) -> dict:
+    """Call one or many view signatures across one or many blocks, concurrently.
+
+    Runs the full (signature x block) cross product under a concurrency cap — the fast path for the
+    repeated forensic reads call_view does one-at-a-time (e.g. getReserves() across 50 blocks, or a
+    batch of getters at one block). ``args``: a single arg list for all signatures, or a list-of-
+    lists aligned per signature. ``returns``: shared output types to decode each result. Each entry
+    carries its own signature/block and raw/decoded or error, so one revert never sinks the batch.
+    """
+    url = _rpc_url(chain_id)
+    if not url:
+        return {
+            "chain_id": chain_id,
+            "address": address.lower(),
+            "error": f"no native RPC configured for chain {chain_id}",
+        }
+    if isinstance(signatures, str):
+        signatures = [signatures]
+    signatures = list(signatures)
+    if not signatures:
+        return {"chain_id": chain_id, "address": address.lower(), "error": "no signatures given"}
+    if blocks is None:
+        blocks = ["latest"]
+    elif not isinstance(blocks, (list, tuple)):
+        blocks = [blocks]
+    blocks = list(blocks)
+    checks = Web3.to_checksum_address(address)
+    out_types = [t for t in (p.strip() for p in returns.split(",")) if t] if returns else []
+
+    prepared: list[tuple[str, str | None, str | None]] = []  # (sig, calldata, encode_error)
+    for i, raw_sig in enumerate(signatures):
+        s = str(raw_sig).strip().replace(" ", "")
+        try:
+            in_types = oc._sig_input_types(s)
+            selector = bytes(Web3.keccak(text=s))[:4]
+            data = (
+                "0x"
+                + (selector + (abi_encode(in_types, _args_for(args, i, len(signatures))) if in_types else b"")).hex()
+            )
+            prepared.append((s, data, None))
+        except Exception as e:  # noqa: BLE001
+            prepared.append((s, None, f"encode failed: {type(e).__name__}: {e}"))
+
+    sem = asyncio.Semaphore(int(concurrency or _concurrency()))
+    rl: dict[str, Any] = {"hit": False, "retry_after": None}
+
+    async with async_client() as client:
+
+        async def one(sig: str, data: str | None, enc_err: str | None, blk: Any) -> dict:
+            base = {"signature": sig, "block": blk}
+            if enc_err:
+                return {**base, "error": enc_err}
+            try:
+                async with sem:
+                    raw = await _rpc(client, url, "eth_call", [{"to": checks, "data": data}, _block_tag(blk)])
+                res: dict = {**base, "raw": raw}
+                if out_types:
+                    try:
+                        rawb = bytes.fromhex(raw[2:] if isinstance(raw, str) and raw.startswith("0x") else (raw or ""))
+                        res["decoded"] = oc._jsonable(abi_decode(out_types, rawb))
+                    except Exception as e:  # noqa: BLE001
+                        res["decode_error"] = f"{type(e).__name__}: {e}"
+                return res
+            except RateLimited as e:
+                rl["hit"] = True
+                rl["retry_after"] = e.retry_after
+                return {**base, "rate_limited": True, "error": e.reason}
+            except Exception as e:  # noqa: BLE001
+                return {**base, "error": f"eth_call failed/reverted: {type(e).__name__}: {e}"}
+
+        tasks = [one(sig, data, err, blk) for (sig, data, err) in prepared for blk in blocks]
+        results = await asyncio.gather(*tasks)
+
+    out: dict = {
+        "chain_id": chain_id,
+        "address": address.lower(),
+        "signatures": signatures,
+        "blocks": blocks,
+        "count": len(results),
+        "results": results,
+        "rpc_url": redact_rpc_url(url),
+    }
+    if rl["hit"]:
+        out["rate_limited"] = True
+        if rl["retry_after"] is not None:
+            out["retry_after"] = rl["retry_after"]
+        out["note"] = "some eth_call(s) were RATE-LIMITED; those entries are incomplete — retry them."
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# P1: reserve history (the single most-repeated forensic pattern)
+# --------------------------------------------------------------------------- #
+def _spread(lo: int, hi: int, n: int) -> list[int]:
+    """``n`` evenly-spaced block numbers across [lo, hi] inclusive (deduped, ascending)."""
+    if hi <= lo or n <= 1:
+        return [lo] if n >= 1 else []
+    n = min(n, hi - lo + 1)
+    step = (hi - lo) / (n - 1)
+    return sorted({lo + round(i * step) for i in range(n)})
+
+
+def _downsample(series: list[dict], n: int) -> list[dict]:
+    """Keep at most ``n`` points, evenly spaced, preserving order and always the first and last."""
+    if n <= 0 or len(series) <= n:
+        return series
+    if n == 1:
+        return [series[-1]]
+    step = (len(series) - 1) / (n - 1)
+    idxs = sorted({round(i * step) for i in range(n)})
+    return [series[i] for i in idxs]
+
+
+async def reserves_history(
+    chain_id: int, pair: str, *, from_block: Any = 0, to_block: Any = "latest", points: int = 50
+) -> dict:
+    """Reserve trajectory of a UniV2-style pair over a block range — the most-repeated forensic read.
+
+    Derived from the pair's own ``Sync`` logs (exact reserves at each change) via get_logs; if no
+    Sync logs are found (or logs are unavailable) it falls back to sampling ``getReserves()`` at
+    ``points`` evenly-spaced blocks. The result is downsampled to ``points`` and carries
+    ``source`` so the caller knows which path produced it.
+    """
+    logs_out = await get_logs(chain_id, pair, topics=[SYNC_TOPIC], from_block=from_block, to_block=to_block)
+    if logs_out.get("error"):
+        return logs_out
+    series: list[dict] = [
+        {"block": ev["block_number"], "reserve0": ev["reserve0"], "reserve1": ev["reserve1"]}
+        for ev in _decode_events(logs_out.get("logs", []))
+        if ev.get("type") == "Sync"
+    ]
+    source = "sync_logs"
+    lo, hi = logs_out.get("from_block", 0), logs_out.get("to_block", 0)
+    if not series:
+        cv = await call_view_many(
+            chain_id, pair, "getReserves()", returns="uint112,uint112,uint32", blocks=_spread(lo, hi, points)
+        )
+        for r in cv.get("results", []):
+            dec = r.get("decoded")
+            if dec and len(dec) >= 2:
+                series.append({"block": r["block"], "reserve0": dec[0], "reserve1": dec[1]})
+        source = "sampled_getReserves"
+        if cv.get("rate_limited"):
+            logs_out["rate_limited"] = True
+    sampled = _downsample(series, points)
+    out: dict = {
+        "chain_id": chain_id,
+        "pair": pair.lower(),
+        "from_block": lo,
+        "to_block": hi,
+        "points": len(sampled),
+        "source": source,
+        "series": sampled,
+    }
+    for k in ("partial", "rate_limited", "retry_after"):
+        if k in logs_out:
+            out[k] = logs_out[k]
     return out

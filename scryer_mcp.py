@@ -43,6 +43,7 @@ import bytecode_abi as ba  # noqa: E402
 import download_contract as dc  # noqa: E402
 import onchain_state as oc  # noqa: E402
 import scryer_chain as cm  # noqa: E402
+import scryer_config  # noqa: E402
 import verify_source as vs  # noqa: E402
 from contract_registry import ContractRegistry  # noqa: E402
 from scryer_http import RateLimited, RateLimitTally, rpc_rate_limit_reason  # noqa: E402
@@ -186,6 +187,15 @@ def health() -> dict:
     except Exception:
         reg = None
     has_key = bool(os.getenv("ETHERSCAN_API_KEY"))
+    # Current head per chain that has a native RPC CONFIGURED in .env (so we don't fire 20 public
+    # endpoints on every health call). Best-effort + concurrent; a down/missing node maps to null.
+    chain_heads: dict[int, int | None] = {}
+    try:
+        configured = [cid for cid in _CHAIN_NAMES if any(scryer_config.get(n) for n in scryer_config.rpc_env_names(cid))]
+        if configured:
+            chain_heads = cm.run(cm.chain_heads(configured))
+    except Exception:
+        chain_heads = {}
     return {
         "repo": str(REPO),
         "python": sys.version.split()[0],
@@ -194,6 +204,7 @@ def health() -> dict:
         "solc": bool(which("solc")),
         "registry": reg,
         "chains": _supported_chains(),
+        "chain_heads": chain_heads,  # {chain_id: current block} for chains with a native RPC in .env
         "state_rpc_fallback": (
             "get_state/call_view/read_storage/token_exposure also work on ANY Etherscan-V2-supported "
             "chain (70+) with no native RPC in `chains` — pass its chain_id and reads fall back to the "
@@ -622,6 +633,62 @@ async def deployer(address: str, chain: str = "", chain_id: int = 0) -> dict:
     """
     try:
         return await cm.deployer(_resolve_chain(chain, chain_id), address)
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def call_view_many(address: str, signatures: list[str], args: list | None = None, returns: str = "",
+                         blocks: list | None = None, chain: str = "", chain_id: int = 0) -> dict:
+    """Batch view calls: one/many signatures across one/many blocks, run concurrently.
+
+    The fast path for the forensic reads call_view does one at a time — e.g. getReserves() across
+    50 blocks, or a batch of getters at a single block. `signatures`: ["getReserves()", ...].
+    `blocks`: numbers/0x-hex/tags (default ["latest"]). `args`: a single arg list applied to every
+    signature, or a list-of-lists aligned per signature. `returns`: shared output types to decode.
+    Each result entry carries its own signature/block + raw/decoded (or error), so one revert never
+    sinks the batch. Native RPC only.
+    """
+    try:
+        return await cm.call_view_many(
+            _resolve_chain(chain, chain_id), address, signatures,
+            args=args, returns=returns, blocks=blocks,
+        )
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def reserves_history(pair: str, from_block: str = "0", to_block: str = "latest",
+                           points: int = 50, chain: str = "", chain_id: int = 0) -> dict:
+    """Reserve trajectory of a UniswapV2-style pair over a block range (reserve0/reserve1 per point).
+
+    The single most-repeated forensic pattern (did reserves get drained / manipulated, and when).
+    Derived from the pair's own Sync logs (exact), falling back to sampled getReserves() if none are
+    found; downsampled to `points`. `source` says which path produced it. Native RPC only.
+    """
+    try:
+        return await cm.reserves_history(
+            _resolve_chain(chain, chain_id), pair, from_block=from_block, to_block=to_block, points=points,
+        )
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def block_number(chain: str = "", chain_id: int = 0) -> dict:
+    """Current head block number for a chain (native RPC)."""
+    try:
+        return await cm.block_number(_resolve_chain(chain, chain_id))
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def block_at(timestamp: int, chain: str = "", chain_id: int = 0) -> dict:
+    """The latest block at or before a unix `timestamp` (binary search) — pin a read/scan to a time."""
+    try:
+        return await cm.block_at(_resolve_chain(chain, chain_id), timestamp)
     except Exception as e:
         return _err(e)
 

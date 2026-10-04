@@ -366,3 +366,127 @@ def test_redact_rpc_url_drops_key() -> None:
     assert redact_rpc_url("https://h/rpc?apikey=ABC") == "https://h"
     assert redact_rpc_url("etherscan-v2-proxy:56") == "etherscan-v2-proxy:56"
     assert redact_rpc_url("") == ""
+
+
+# --------------------------------------------------------------------------- #
+# call_view_many — batched eth_call across blocks / signatures
+# --------------------------------------------------------------------------- #
+def _enc_words(*vals: int) -> str:
+    return "0x" + b"".join(v.to_bytes(32, "big") for v in vals).hex()
+
+
+def test_call_view_many_across_blocks(monkeypatch) -> None:
+    """One signature across many blocks runs concurrently and decodes each result."""
+    reserves = {100: (10, 20), 200: (30, 40)}
+
+    def handler(req: dict) -> dict:
+        assert req["method"] == "eth_call"
+        blk = int(req["params"][1], 16)
+        r0, r1 = reserves[blk]
+        return _ok(req, _enc_words(r0, r1, 1700000000))
+
+    _patch(monkeypatch, handler)
+    out = asyncio.run(cm.call_view_many(56, PAIR, "getReserves()", returns="uint112,uint112,uint32", blocks=[100, 200]))
+    assert out["count"] == 2
+    by_block = {r["block"]: r for r in out["results"]}
+    assert by_block[100]["decoded"][:2] == [10, 20]
+    assert by_block[200]["decoded"][:2] == [30, 40]
+    assert "SECRETKEY" not in str(out)
+
+
+def test_call_view_many_isolates_a_revert(monkeypatch) -> None:
+    """A revert on one signature does not sink the others in the batch."""
+    from web3 import Web3
+
+    good = "0x" + bytes(Web3.keccak(text="totalSupply()"))[:4].hex()
+
+    def handler(req: dict) -> dict:
+        data = req["params"][0]["data"]
+        if data.startswith(good):
+            return _ok(req, _enc_words(12345))
+        return _err(req, "execution reverted")
+
+    _patch(monkeypatch, handler)
+    out = asyncio.run(cm.call_view_many(56, TOKEN, ["totalSupply()", "missingFn()"], returns="uint256"))
+    res = {r["signature"]: r for r in out["results"]}
+    assert res["totalSupply()"]["decoded"] == [12345]
+    assert "error" in res["missingFn()"] and "revert" in res["missingFn()"]["error"]
+
+
+# --------------------------------------------------------------------------- #
+# reserves_history — from Sync logs, and the sampled fallback
+# --------------------------------------------------------------------------- #
+def test_reserves_history_from_sync_logs(monkeypatch) -> None:
+    def handler(req: dict) -> dict:
+        if req["method"] == "eth_blockNumber":
+            return _ok(req, "0x14")  # 20
+        if req["method"] == "eth_getLogs":
+            f = req["params"][0]
+            a = int(f["fromBlock"], 16)
+            # one Sync per window, reserves growing with block
+            return _ok(
+                req,
+                [_log(a, 0, f"0x{a:064x}", topics=[cm.SYNC_TOPIC], data=_enc_words(1000 + a, 2000 + a), address=PAIR)],
+            )
+        raise AssertionError(req["method"])
+
+    _patch(monkeypatch, handler)
+    out = asyncio.run(cm.reserves_history(56, PAIR, from_block=0, to_block=20, points=50))
+    assert out["source"] == "sync_logs"
+    assert out["points"] >= 2
+    assert out["series"][0]["reserve0"] == 1000  # block 0 window
+
+
+def test_reserves_history_falls_back_to_sampled_getreserves(monkeypatch) -> None:
+    def handler(req: dict) -> dict:
+        if req["method"] == "eth_blockNumber":
+            return _ok(req, "0x64")  # 100
+        if req["method"] == "eth_getLogs":
+            return _ok(req, [])  # no Sync logs -> force fallback
+        if req["method"] == "eth_call":
+            blk = int(req["params"][1], 16)
+            return _ok(req, _enc_words(blk, blk * 2, 0))
+        raise AssertionError(req["method"])
+
+    _patch(monkeypatch, handler)
+    out = asyncio.run(cm.reserves_history(56, PAIR, from_block=0, to_block=100, points=5))
+    assert out["source"] == "sampled_getReserves"
+    assert out["points"] == 5
+    assert out["series"][-1]["reserve0"] == 100  # last sampled block
+
+
+# --------------------------------------------------------------------------- #
+# block head
+# --------------------------------------------------------------------------- #
+def test_block_number(monkeypatch) -> None:
+    _patch(monkeypatch, lambda req: _ok(req, "0x2a"))
+    out = asyncio.run(cm.block_number(56))
+    assert out["block_number"] == 42
+    assert out["rpc_url"] == "https://bnb-mainnet.g.alchemy.com"
+
+
+def test_block_at_binary_search(monkeypatch) -> None:
+    head = 100
+
+    def handler(req: dict) -> dict:
+        if req["method"] == "eth_blockNumber":
+            return _ok(req, hex(head))
+        if req["method"] == "eth_getBlockByNumber":
+            b = int(req["params"][0], 16)
+            return _ok(req, {"timestamp": hex(b * 10)})  # ts = block*10, monotonic
+        raise AssertionError(req["method"])
+
+    _patch(monkeypatch, handler)
+    out = asyncio.run(cm.block_at(56, 355))
+    assert out["block_number"] == 35 and out["block_timestamp"] == 350  # latest block with ts<=355
+
+
+def test_chain_heads_best_effort(monkeypatch) -> None:
+    # chain 1 configured+ok, chain 999 has no RPC -> None
+    def handler(req: dict) -> dict:
+        return _ok(req, "0x7b")  # 123
+
+    monkeypatch.setattr(cm, "async_client", lambda **k: FakeClient(handler))
+    monkeypatch.setattr(cm.scryer_config, "get_rpc_url", lambda cid: URL if cid == 1 else "")
+    heads = asyncio.run(cm.chain_heads([1, 999]))
+    assert heads[1] == 123 and heads[999] is None
