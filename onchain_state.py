@@ -20,7 +20,7 @@ from eth_abi import decode as abi_decode
 from eth_abi import encode as abi_encode
 from web3 import Web3
 
-from scryer_http import RateLimitTally, rate_limit_reason, retry_after_seconds, rpc_rate_limit_reason
+from scryer_http import RateLimitTally, rate_limit_reason, redact_rpc_url, retry_after_seconds, rpc_rate_limit_reason
 
 # No-argument view selectors worth probing on an unknown contract.
 _VIEWS: dict[str, str] = {
@@ -239,7 +239,7 @@ def get_state(chain_id: int, address: str, block: object = "latest") -> dict:
     blk, berr = _parse_block(block)
     if berr:
         return {"chain_id": chain_id, "address": address.lower(), "error": berr}
-    out: dict = {"chain_id": chain_id, "address": address.lower(), "rpc_url": url, "block": blk, "state": {}}
+    out: dict = {"chain_id": chain_id, "address": address.lower(), "rpc_url": redact_rpc_url(url), "block": blk, "state": {}}
     tally = RateLimitTally()
     try:
         _code = w3.eth.get_code(Web3.to_checksum_address(address), block_identifier=blk)
@@ -456,7 +456,7 @@ def call_view(
         "signature": sig,
         "block": blk,
         "raw": "0x" + raw.hex(),
-        "rpc_url": url,
+        "rpc_url": redact_rpc_url(url),
     }
     out_types = [t for t in (p.strip() for p in returns.split(",")) if t] if returns else []
     if out_types:
@@ -605,7 +605,7 @@ def price_token(chain_id: int, token: str, block: object = "latest") -> dict:
         return {"chain_id": chain_id, "token": token.lower(), "error": berr}
     tally = RateLimitTally()
     taddr = token.lower()
-    out: dict = {"chain_id": chain_id, "token": taddr, "rpc_url": url, "block": blk}
+    out: dict = {"chain_id": chain_id, "token": taddr, "rpc_url": redact_rpc_url(url), "block": blk}
     dl_chain = _DL_CHAIN.get(chain_id)
     ts = None
     if blk != "latest":
@@ -641,7 +641,7 @@ def token_exposure(chain_id: int, address: str, block: object = "latest") -> dic
     blk, berr = _parse_block(block)
     if berr:
         return {"chain_id": chain_id, "address": address.lower(), "error": berr}
-    out: dict = {"chain_id": chain_id, "address": address.lower(), "rpc_url": url, "block": blk}
+    out: dict = {"chain_id": chain_id, "address": address.lower(), "rpc_url": redact_rpc_url(url), "block": blk}
     tally = RateLimitTally()
     checks = Web3.to_checksum_address(address)
     try:

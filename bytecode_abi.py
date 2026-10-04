@@ -33,7 +33,7 @@ from typing import Any
 from web3 import Web3
 
 import scryer_http
-from scryer_http import RateLimitTally, rate_limit_reason, retry_after_seconds, rpc_rate_limit_reason
+from scryer_http import RateLimitTally, rate_limit_reason, redact_rpc_url, retry_after_seconds, rpc_rate_limit_reason
 from scryer_logging import get_logger
 from verify_source import strip_metadata_trailer
 
@@ -388,7 +388,7 @@ def analyze_contract(
             return {**out, "rate_limited": True, "warnings": [f"rpc: {reason}"], "error": f"rpc rate-limited: {reason}"}
         return {**out, "error": f"rpc: {type(e).__name__}: {e}"}
 
-    out["rpc_url"] = rpc_label
+    out["rpc_url"] = redact_rpc_url(rpc_label)
     runtime_hex = bytes(raw).hex()
     if not runtime_hex:
         out["code_size"] = 0

@@ -194,3 +194,20 @@ def test_token_exposure_uses_lp_fallback_for_unpriced_holding(monkeypatch) -> No
     assert holds[wbnb]["usd"] == pytest.approx(1200.0)  # 2 WBNB * $600
     assert out["price_source"] == "defillama+lp_route"
     assert out["total_usd"] == pytest.approx(1200.0)
+
+
+# --------------------------------------------------------------------------- #
+# P2 security: state tools must not leak the RPC key in rpc_url
+# --------------------------------------------------------------------------- #
+def test_state_tools_redact_rpc_url(monkeypatch) -> None:
+    class _Eth:
+        def get_code(self, addr, block_identifier=None):
+            return b""  # EOA -> get_state returns early, exercising the rpc_url field
+
+    class _W3:
+        eth = _Eth()
+
+    monkeypatch.setattr(oc, "_w3", lambda cid: (_W3(), "https://bsc.g.alchemy.com/v2/SUPERSECRETKEY"))
+    out = oc.get_state(BSC, "0x" + "11" * 20)
+    assert out["rpc_url"] == "https://bsc.g.alchemy.com"
+    assert "SUPERSECRETKEY" not in str(out)

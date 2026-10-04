@@ -16,10 +16,10 @@ from web3 import Web3
 
 import scryer_config
 import scryer_http
-from scryer_http import RateLimitTally, rate_limit_reason, retry_after_seconds, rpc_rate_limit_reason
-from etherscan_proxy_provider import make_web3
 from contract_registry import ContractRegistry
 from decompilers import decompile_with_heimdall, decompile_with_panoramix
+from etherscan_proxy_provider import make_web3
+from scryer_http import RateLimitTally, rate_limit_reason, redact_rpc_url, retry_after_seconds, rpc_rate_limit_reason
 from scryer_logging import get_logger
 
 _log = get_logger(__name__)
@@ -185,11 +185,11 @@ def resolve_proxy_targets(
     - EIP-1167 minimal proxy runtime code
     """
     address = normalize_address(address)
-    result: dict = {"chain_id": chain_id, "address": address, "rpc_url": rpc_url, "proxy": {}}
+    result: dict = {"chain_id": chain_id, "address": address, "rpc_url": redact_rpc_url(rpc_url), "proxy": {}}
 
     try:
         w3, label = make_web3(chain_id, rpc_url)  # native RPC, else Etherscan proxy (niche chains)
-        result["rpc_url"] = label
+        result["rpc_url"] = redact_rpc_url(label)
         code = w3.eth.get_code(Web3.to_checksum_address(address))
     except Exception as e:
         reason = rpc_rate_limit_reason(e)
