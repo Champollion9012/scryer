@@ -56,7 +56,8 @@ def test_price_via_pair_handles_both_orientations(monkeypatch) -> None:
             "reserve1": 20000 * 10**6,
         },
     )
-    assert oc._price_via_pair(None, cfg, token, 18, usd, 6, "latest", None) == pytest.approx(2000.0)
+    price, depth = oc._price_via_pair(None, cfg, token, 18, usd, 6, "latest", None)
+    assert price == pytest.approx(2000.0) and depth == pytest.approx(20000.0)  # depth = quote reserve
 
     # swapped: token is token1
     monkeypatch.setattr(
@@ -69,7 +70,8 @@ def test_price_via_pair_handles_both_orientations(monkeypatch) -> None:
             "reserve1": 10 * 10**18,
         },
     )
-    assert oc._price_via_pair(None, cfg, token, 18, usd, 6, "latest", None) == pytest.approx(2000.0)
+    price, depth = oc._price_via_pair(None, cfg, token, 18, usd, 6, "latest", None)
+    assert price == pytest.approx(2000.0) and depth == pytest.approx(20000.0)
 
 
 def test_price_via_pair_none_when_pair_mismatch_or_empty(monkeypatch) -> None:
@@ -81,10 +83,10 @@ def test_price_via_pair_none_when_pair_mismatch_or_empty(monkeypatch) -> None:
         "_pair_state",
         lambda *a, **k: {"token0": "0x" + "11" * 20, "token1": "0x" + "22" * 20, "reserve0": 1, "reserve1": 1},
     )
-    assert oc._price_via_pair(None, cfg, TOKEN, 18, usd, 6, "latest", None) is None
+    assert oc._price_via_pair(None, cfg, TOKEN, 18, usd, 6, "latest", None) == (None, 0.0)
     # no liquidity
     monkeypatch.setattr(oc, "_pair_state", lambda *a, **k: None)
-    assert oc._price_via_pair(None, cfg, TOKEN, 18, usd, 6, "latest", None) is None
+    assert oc._price_via_pair(None, cfg, TOKEN, 18, usd, 6, "latest", None) == (None, 0.0)
 
 
 # --------------------------------------------------------------------------- #
@@ -93,7 +95,7 @@ def test_price_via_pair_none_when_pair_mismatch_or_empty(monkeypatch) -> None:
 def test_lp_price_usd_direct_route(monkeypatch) -> None:
     def fake(w3, cfg, token, td, quote, qd, block, tally):
         usd = cfg["usd"][0].lower()
-        return 3.5 if quote == usd else None
+        return (3.5, 1000.0) if quote == usd else (None, 0.0)
 
     monkeypatch.setattr(oc, "_price_via_pair", fake)
     price, src = oc._lp_price_usd(None, ETH, TOKEN, 18)
@@ -107,16 +109,37 @@ def test_lp_price_usd_via_weth(monkeypatch) -> None:
 
     def fake(w3, cfg, token, td, quote, qd, block, tally):
         if token == TOKEN and quote == usd:
-            return None  # no direct token/USD pair
+            return None, 0.0  # no direct token/USD pair
         if token == TOKEN and quote == weth:
-            return 0.01  # 1 token = 0.01 WETH
+            return 0.01, 500.0  # 1 token = 0.01 WETH, depth 500 WETH
         if token == weth and quote == usd:
-            return 2500.0  # 1 WETH = $2500
-        return None
+            return 2500.0, 1_000_000.0  # 1 WETH = $2500
+        return None, 0.0
 
     monkeypatch.setattr(oc, "_price_via_pair", fake)
     price, src = oc._lp_price_usd(None, ETH, TOKEN, 18)
     assert price == pytest.approx(25.0) and src == "lp:token/weth/usd"  # 0.01 * 2500
+
+
+def test_lp_price_usd_picks_deepest_route_not_dust(monkeypatch) -> None:
+    """The LABUBU bug: a dust token/USD pair ($34) must NOT outvote a deep token/WETH pool ($2.8M).
+    Route selection is by liquidity depth, not 'first pair found'."""
+    usd = oc._DEX_V2[ETH]["usd"][0].lower()
+    weth = oc._DEX_V2[ETH]["weth"][0].lower()
+
+    def fake(w3, cfg, token, td, quote, qd, block, tally):
+        if token == TOKEN and quote == usd:
+            return 0.066, 34.0  # dust direct pair -> WRONG price, tiny depth
+        if token == TOKEN and quote == weth:
+            return 0.0072, 4800.0  # the real pool: 4800 WETH deep
+        if token == weth and quote == usd:
+            return 576.0, 1_000_000.0
+        return None, 0.0
+
+    monkeypatch.setattr(oc, "_price_via_pair", fake)
+    price, src = oc._lp_price_usd(None, ETH, TOKEN, 18)
+    assert src == "lp:token/weth/usd"  # deep route wins (4800*576 >> 34)
+    assert price == pytest.approx(0.0072 * 576.0)  # ~4.15, not the 0.066 dust price
 
 
 def test_lp_price_usd_is_usd_and_unknown() -> None:

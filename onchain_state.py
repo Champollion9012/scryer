@@ -535,13 +535,14 @@ def _price_via_pair(
     quote_dec: int,
     block: object,
     tally: RateLimitTally | None,
-) -> float | None:
-    """Price of ``token`` in units of ``quote`` from the derived pair's reserves, or None if the
-    pair has no liquidity / does not actually hold this exact token pair."""
+) -> tuple[float | None, float]:
+    """``(price_of_token_in_quote, quote_side_depth)`` from the derived pair's reserves — the depth
+    (quote reserve in whole units) lets the caller compare routes and reject a dust pool. Returns
+    ``(None, 0.0)`` if the pair has no liquidity or does not hold this exact token/quote pair."""
     pair = _v2_pair(cfg["factory"], cfg["init_code_hash"], token, quote)
     st = _pair_state(w3, pair, block=block, tally=tally)
     if not st:
-        return None
+        return None, 0.0
     t0 = (st.get("token0") or "").lower()
     t1 = (st.get("token1") or "").lower()
     if token == t0 and quote == t1:
@@ -549,18 +550,21 @@ def _price_via_pair(
     elif token == t1 and quote == t0:
         r_token, r_quote = st["reserve1"], st["reserve0"]
     else:
-        return None  # derived pair isn't this token/quote (collision / not deployed)
+        return None, 0.0  # derived pair isn't this token/quote (collision / not deployed)
     if r_token == 0:
-        return None
-    return (r_quote / 10**quote_dec) / (r_token / 10**token_dec)
+        return None, 0.0
+    quote_depth = r_quote / 10**quote_dec
+    return quote_depth / (r_token / 10**token_dec), quote_depth
 
 
 def _lp_price_usd(
     w3: Web3, chain_id: int, token: str, token_dec: int, block: object = "latest", tally: RateLimitTally | None = None
 ) -> tuple[float | None, str | None]:
-    """Best-effort USD price of ``token`` from on-chain LP reserves: token/USD direct, else
-    token/WETH x WETH/USD. Returns (price, source) or (None, None). The route for meme/non-major
-    tokens that price feeds don't cover."""
+    """Best-effort USD price of ``token`` from on-chain LP reserves, via whichever route has the
+    DEEPEST liquidity: token/USD direct, or token/WETH x WETH/USD. Picking by depth (not "first
+    pair found") is essential — a dust/attacker-seeded token/USD pair ($34) must never outvote the
+    real token/WETH pool ($2.8M). Returns (price, source) or (None, None). The route for meme/
+    non-major tokens that price feeds don't cover."""
     cfg = _DEX_V2.get(chain_id)
     if not cfg:
         return None, None
@@ -569,20 +573,28 @@ def _lp_price_usd(
     weth_addr, weth_dec = cfg["weth"][0].lower(), cfg["weth"][1]
     if token == usd_addr:
         return 1.0, "lp:is_usd"
-    direct = _price_via_pair(w3, cfg, token, token_dec, usd_addr, usd_dec, block, tally)
-    if direct is not None:
-        return direct, "lp:token/usd"
-    weth_usd = (
-        1.0 if weth_addr == usd_addr else _price_via_pair(w3, cfg, weth_addr, weth_dec, usd_addr, usd_dec, block, tally)
+
+    # (depth_in_usd, price_in_usd, source) for each viable route; pick the deepest.
+    candidates: list[tuple[float, float, str]] = []
+
+    p_usd, depth_usd = _price_via_pair(w3, cfg, token, token_dec, usd_addr, usd_dec, block, tally)
+    if p_usd is not None:
+        candidates.append((depth_usd, p_usd, "lp:token/usd"))  # USD depth ~ quote reserve in USD
+
+    weth_usd, _wd = (1.0, 0.0) if weth_addr == usd_addr else _price_via_pair(
+        w3, cfg, weth_addr, weth_dec, usd_addr, usd_dec, block, tally
     )
     if token == weth_addr:
         return (weth_usd, "lp:weth/usd") if weth_usd is not None else (None, None)
-    if weth_usd is None:
+    if weth_usd is not None:
+        p_weth, depth_weth = _price_via_pair(w3, cfg, token, token_dec, weth_addr, weth_dec, block, tally)
+        if p_weth is not None:
+            candidates.append((depth_weth * weth_usd, p_weth * weth_usd, "lp:token/weth/usd"))
+
+    if not candidates:
         return None, None
-    token_in_weth = _price_via_pair(w3, cfg, token, token_dec, weth_addr, weth_dec, block, tally)
-    if token_in_weth is None:
-        return None, None
-    return token_in_weth * weth_usd, "lp:token/weth/usd"
+    _depth, price, source = max(candidates, key=lambda c: c[0])
+    return price, source
 
 
 def _token_decimals(w3: Web3, token: str, block: object, tally: RateLimitTally | None) -> int:
