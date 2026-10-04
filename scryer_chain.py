@@ -86,6 +86,14 @@ class RpcError(Exception):
     """A JSON-RPC error that is NOT a throttle (throttles raise ``RateLimited``)."""
 
 
+class _EndpointError(Exception):
+    """This endpoint/key is unusable (HTTP 401/403 — bad key, or chain not enabled on the app).
+    Not a throttle and not node-independent: rotate to the next key AND drop this one for the run."""
+
+
+_dead_urls: set[str] = set()  # endpoints that auth-failed this process — excluded from rotation
+
+
 def _rpc_url(chain_id: int) -> str:
     """Primary native RPC URL for ``chain_id``, or ``""`` — the no-RPC guard + the redacted
     ``rpc_url`` field both key off this.
@@ -98,46 +106,76 @@ def _rpc_url(chain_id: int) -> str:
 
 _rr_counter = itertools.count()  # process-wide round-robin cursor (GIL-atomic next())
 
+# Archive-capable, keyed provider endpoints — the only ones safe to rotate scryer_chain over. The
+# tools here do HISTORICAL reads (getCode/eth_call/getLogs at old blocks); a public shared node is
+# non-archive and answers those with "missing trie node" / empty, so mixing public nodes into the
+# rotation silently breaks historical reads. A keyed provider URL (/v2|/v3 path or a known
+# archive host) is the signal; bare public hosts (bsc-dataseed, *.publicnode.com, llamarpc, 1rpc…)
+# are excluded from rotation (they remain in get_rpc_urls for other consumers / as last resort).
+_PREMIUM_RPC_RE = re.compile(
+    r"alchemy|infura|quiknode|quicknode|chainstack|nodereal|blastapi|blockpi|drpc\.org|"
+    r"ankr\.com/[a-z]+/|/v2/|/v3/|[?&]apikey=",
+    re.IGNORECASE,
+)
+
 
 def _rpc_urls(chain_id: int, *, alchemy_only: bool = False) -> list[str]:
-    """The round-robin pool for ``chain_id``: every configured RPC URL, primary first, then the
-    fallbacks — both Alchemy keys (ALCHEMY_KEY, ALCHEMY_KEY_2) and the public nodes. Spreading the
-    concurrent fan-out across this pool is the throughput lever against Alchemy's per-key limits.
-    ``alchemy_only`` keeps just the Alchemy endpoints, for a method only Alchemy serves
-    (alchemy_getAssetTransfers)."""
+    """The round-robin pool for ``chain_id`` — the archive-capable provider endpoints only.
+
+    Rotating the concurrent fan-out across the keyed provider endpoints (e.g. ALCHEMY_KEY +
+    ALCHEMY_KEY_2) is the throughput lever against a single key's limits. Public shared nodes are
+    deliberately EXCLUDED: they are non-archive, so a historical getCode/eth_call/getLogs round-robined
+    onto one fails with "missing trie node" / empty and breaks the read. If no keyed provider is
+    configured we fall back to whatever URLs exist (best effort). ``alchemy_only`` narrows further to
+    Alchemy endpoints, for a method only Alchemy serves (alchemy_getAssetTransfers)."""
     urls = scryer_config.get_rpc_urls(chain_id)
     if not urls:
         one = _rpc_url(chain_id)
         urls = [one] if one else []
+    urls = [u for u in urls if u not in _dead_urls]  # drop endpoints that auth-failed this run
     if alchemy_only:
-        alc = [u for u in urls if "alchemy" in u]
+        alc = [u for u in urls if "alchemy" in u.lower()]
         return alc or urls
-    return urls
+    premium = [u for u in urls if _PREMIUM_RPC_RE.search(u)]
+    return premium or urls
 
 
 async def _rpc_rotating(
-    client: httpx.AsyncClient, urls: Sequence[str], method: str, params: Sequence[Any], *, start: int = 0, req_id: int = 1
+    client: httpx.AsyncClient,
+    urls: Sequence[str],
+    method: str,
+    params: Sequence[Any],
+    *,
+    start: int = 0,
+    req_id: int = 1,
 ) -> Any:
     """``_rpc`` with key-pool round-robin + throttle fallback.
 
-    Starts at ``urls[start % n]`` (so concurrent callers spread across keys) and, ONLY on a throttle
-    (``RateLimited``), falls back to the next URL/key rather than failing the call — so one key being
-    rate-limited is covered by the other. A non-throttle ``RpcError`` (e.g. a getLogs range error)
-    propagates immediately: it is node-independent, so another key would not help, and the caller
-    needs to see it (to halve the window). Raises ``RateLimited`` only when EVERY key throttled.
+    Starts at ``urls[start % n]`` (so concurrent callers spread across keys) and falls back to the
+    next URL/key when THIS key can't serve the request: a throttle (``RateLimited``) or an auth/
+    not-enabled failure (``_EndpointError`` — HTTP 401/403; the bad key is also dropped from the pool
+    for the rest of the run so it isn't retried). A plain ``RpcError`` (e.g. a getLogs range error)
+    propagates immediately: it is node-independent, so another key would not help and the caller needs
+    to see it (to halve the window). Raises only when EVERY key failed that way.
     """
-    pool = list(urls)
+    pool = [u for u in urls if u not in _dead_urls] or list(urls)
     if not pool:
         raise RpcError(f"{method}: no RPC url configured")
     n = len(pool)
-    last_rl: RateLimited | None = None
+    last_exc: Exception | None = None
     for i in range(n):
+        u = pool[(start + i) % n]
         try:
-            return await _rpc(client, pool[(start + i) % n], method, params, req_id=req_id)
+            return await _rpc(client, u, method, params, req_id=req_id)
         except RateLimited as e:
-            last_rl = e  # this key is throttled — try the next one
-    assert last_rl is not None  # the loop ran at least once, so a throttle was recorded
-    raise last_rl
+            last_exc = e  # this key is throttled — try the next one
+        except _EndpointError as e:
+            if u not in _dead_urls:
+                _dead_urls.add(u)  # bad key / chain-not-enabled — stop using it this run
+                _log.warning("RPC endpoint dropped (auth/not-enabled), falling back: %s", e)
+            last_exc = e
+    assert last_exc is not None  # the loop ran at least once
+    raise last_exc
 
 
 def _err_text(err: Any) -> str:
@@ -152,6 +190,9 @@ async def _rpc(client: httpx.AsyncClient, url: str, method: str, params: Sequenc
     reason = rate_limit_reason(resp)  # status-based (429/403/503)
     if reason:
         raise RateLimited(provider=f"rpc:{method}", retry_after=retry_after_seconds(resp), detail=reason)
+    # 401/403 that isn't a throttle = a bad key or a chain not enabled on this app — rotate off it.
+    if resp.status_code in (401, 403):
+        raise _EndpointError(f"HTTP {resp.status_code}: {(resp.text or '').strip()[:140]}")
     resp.raise_for_status()
     body = resp.json()
     err = body.get("error")
@@ -653,7 +694,11 @@ async def deployer(chain_id: int, address: str) -> dict:
                     lo = mid + 1
             out["deploy_block"] = lo
             creation = await _first_log_tx_at(client, urls, checks, lo, start=base_rr)
-            tx = await _rpc_rotating(client, urls, "eth_getTransactionByHash", [creation], start=base_rr) if creation else None
+            tx = (
+                await _rpc_rotating(client, urls, "eth_getTransactionByHash", [creation], start=base_rr)
+                if creation
+                else None
+            )
         except RateLimited as e:
             return _rl_out(out, e)
         except Exception as e:  # noqa: BLE001
@@ -706,7 +751,9 @@ async def block_at(chain_id: int, timestamp: int) -> dict:
         try:
 
             async def ts_of(b: int) -> int:
-                blk = await _rpc_rotating(client, urls, "eth_getBlockByNumber", [hex(b), False], start=next(_rr_counter))
+                blk = await _rpc_rotating(
+                    client, urls, "eth_getBlockByNumber", [hex(b), False], start=next(_rr_counter)
+                )
                 if not blk:
                     raise RpcError(f"block {b} not found")
                 return _int(blk.get("timestamp"))
@@ -850,7 +897,9 @@ async def call_view_many(
                 return {**base, "error": enc_err}
             try:
                 async with sem:
-                    raw = await _rpc_rotating(client, urls, "eth_call", [{"to": checks, "data": data}, _block_tag(blk)], start=start)
+                    raw = await _rpc_rotating(
+                        client, urls, "eth_call", [{"to": checks, "data": data}, _block_tag(blk)], start=start
+                    )
                 res: dict = {**base, "raw": raw}
                 if out_types:
                     try:

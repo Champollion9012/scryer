@@ -7,6 +7,7 @@ async public coroutines are driven with ``asyncio.run`` (no pytest-asyncio depen
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
@@ -29,6 +30,10 @@ class FakeResp:
         self._payload = payload
         self.status_code = status_code
         self.headers = headers or {}
+
+    @property
+    def text(self) -> str:
+        return json.dumps(self._payload)
 
     def json(self) -> dict:
         return self._payload
@@ -73,6 +78,7 @@ def _err(req: dict, message: str, code: int = -32000) -> dict:
 
 
 def _patch(monkeypatch, handler, url: str = URL) -> FakeClient:
+    cm._dead_urls.clear()
     client = FakeClient(handler)
     monkeypatch.setattr(cm, "async_client", lambda **k: client)
     monkeypatch.setattr(cm.scryer_config, "get_rpc_url", lambda cid: url)
@@ -504,6 +510,7 @@ POOL = ["https://keyA.example/v2/AAA", "https://keyB.example/v2/BBB"]
 
 
 def _patch_pool(monkeypatch, handler):
+    cm._dead_urls.clear()
     client = FakeClient(handler)
     monkeypatch.setattr(cm, "async_client", lambda **k: client)
     monkeypatch.setattr(cm.scryer_config, "get_rpc_url", lambda cid: POOL[0])
@@ -556,3 +563,23 @@ def test_all_keys_throttled_surfaces_rate_limited(monkeypatch) -> None:
     _patch_pool(monkeypatch, handler)
     out = asyncio.run(cm.get_tx(56, "0xabc"))
     assert out["rate_limited"] is True and out.get("retry_after") == 5
+
+
+def test_auth_error_drops_key_and_falls_back(monkeypatch) -> None:
+    """A 401/403 (bad key / chain-not-enabled) on one endpoint drops it and falls back — a
+    misconfigured key must never break a call another key can serve (the ALCHEMY_KEY_2 case)."""
+
+    def handler(req, url):
+        if "keyA" in url:
+            return FakeResp({"error": {"code": -32600, "message": "BNB_MAINNET is not enabled"}}, status_code=403)
+        if req["method"] == "eth_getTransactionByHash":
+            return _ok(req, {"from": "0xf", "to": None, "input": "0x", "value": "0x0", "blockNumber": "0x1"})
+        if req["method"] == "eth_getTransactionReceipt":
+            return _ok(req, {"status": "0x1", "gasUsed": "0x1", "logs": []})
+        return _ok(req, "0x1")
+
+    _patch_pool(monkeypatch, handler)
+    out = asyncio.run(cm.get_tx(56, "0xabc"))
+    assert out.get("status") == 1 and "error" not in out  # succeeded via keyB
+    assert any("keyA" in u for u in cm._dead_urls)  # keyA dropped from rotation
+    cm._dead_urls.clear()
