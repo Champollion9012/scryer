@@ -26,6 +26,7 @@ explicit concurrency cap. Public coroutines are async; ``run()`` executes one fr
 from __future__ import annotations
 
 import asyncio
+import itertools
 import re
 from collections.abc import Sequence
 from typing import Any
@@ -86,12 +87,57 @@ class RpcError(Exception):
 
 
 def _rpc_url(chain_id: int) -> str:
-    """Native RPC URL for ``chain_id``, or ``""``.
+    """Primary native RPC URL for ``chain_id``, or ``""`` — the no-RPC guard + the redacted
+    ``rpc_url`` field both key off this.
 
     tx/logs/funding/creation MUST use a native RPC — the Etherscan V2 free tier paywalls these on
     non-ETH chains — so callers treat ``""`` as a hard error and never fall back to the proxy.
     """
     return scryer_config.get_rpc_url(chain_id)
+
+
+_rr_counter = itertools.count()  # process-wide round-robin cursor (GIL-atomic next())
+
+
+def _rpc_urls(chain_id: int, *, alchemy_only: bool = False) -> list[str]:
+    """The round-robin pool for ``chain_id``: every configured RPC URL, primary first, then the
+    fallbacks — both Alchemy keys (ALCHEMY_KEY, ALCHEMY_KEY_2) and the public nodes. Spreading the
+    concurrent fan-out across this pool is the throughput lever against Alchemy's per-key limits.
+    ``alchemy_only`` keeps just the Alchemy endpoints, for a method only Alchemy serves
+    (alchemy_getAssetTransfers)."""
+    urls = scryer_config.get_rpc_urls(chain_id)
+    if not urls:
+        one = _rpc_url(chain_id)
+        urls = [one] if one else []
+    if alchemy_only:
+        alc = [u for u in urls if "alchemy" in u]
+        return alc or urls
+    return urls
+
+
+async def _rpc_rotating(
+    client: httpx.AsyncClient, urls: Sequence[str], method: str, params: Sequence[Any], *, start: int = 0, req_id: int = 1
+) -> Any:
+    """``_rpc`` with key-pool round-robin + throttle fallback.
+
+    Starts at ``urls[start % n]`` (so concurrent callers spread across keys) and, ONLY on a throttle
+    (``RateLimited``), falls back to the next URL/key rather than failing the call — so one key being
+    rate-limited is covered by the other. A non-throttle ``RpcError`` (e.g. a getLogs range error)
+    propagates immediately: it is node-independent, so another key would not help, and the caller
+    needs to see it (to halve the window). Raises ``RateLimited`` only when EVERY key throttled.
+    """
+    pool = list(urls)
+    if not pool:
+        raise RpcError(f"{method}: no RPC url configured")
+    n = len(pool)
+    last_rl: RateLimited | None = None
+    for i in range(n):
+        try:
+            return await _rpc(client, pool[(start + i) % n], method, params, req_id=req_id)
+        except RateLimited as e:
+            last_rl = e  # this key is throttled — try the next one
+    assert last_rl is not None  # the loop ran at least once, so a throttle was recorded
+    raise last_rl
 
 
 def _err_text(err: Any) -> str:
@@ -285,6 +331,7 @@ async def get_logs(
             "error": f"no native RPC configured for chain {chain_id}; eth_getLogs requires one "
             "(Etherscan logs are paywalled on non-ETH chains). Set the chain's *_URL in .env.",
         }
+    urls = _rpc_urls(chain_id)  # spread the concurrent windows across the key pool
     chunk = int(chunk or _logs_chunk())
     if chunk < 1:
         chunk = 1
@@ -309,30 +356,32 @@ async def get_logs(
         if hi < lo:
             return {"chain_id": chain_id, "error": f"to_block ({hi}) < from_block ({lo})"}
 
-        async def fetch(a: int, b: int) -> list[dict] | None:
+        async def fetch(a: int, b: int, start: int) -> list[dict] | None:
             flt = {**base, "fromBlock": hex(a), "toBlock": hex(b)}
             try:
                 async with sem:
-                    res = await _rpc(client, url, "eth_getLogs", [flt])
+                    res = await _rpc_rotating(client, urls, "eth_getLogs", [flt], start=start)
                 return list(res or [])
             except RateLimited as e:
+                # every key in the pool throttled — retryable; do NOT recurse (not a range problem)
                 rl["hit"] = True
                 rl["retry_after"] = e.retry_after
                 rl["reason"] = e.reason
-                return None  # a throttle is retryable — do NOT recurse (it is not a range problem)
+                return None
             except Exception as e:  # noqa: BLE001
                 if _is_range_error(e) and b > a:
                     mid = (a + b) // 2
-                    left = await fetch(a, mid)
-                    right = await fetch(mid + 1, b)
+                    left = await fetch(a, mid, start)
+                    right = await fetch(mid + 1, b, start + 1)
                     if left is None or right is None:
                         return None
                     return left + right
                 errors.append({"from": a, "to": b, "error": str(e)[:200]})
                 return []
 
+        base_rr = next(_rr_counter)
         windows = [(s, min(s + chunk - 1, hi)) for s in range(lo, hi + 1, chunk)]
-        gathered = await asyncio.gather(*(fetch(a, b) for a, b in windows))
+        gathered = await asyncio.gather(*(fetch(a, b, base_rr + i) for i, (a, b) in enumerate(windows)))
 
     merged: list[dict] = []
     seen: set[tuple[Any, Any]] = set()
@@ -381,11 +430,13 @@ async def get_tx(chain_id: int, tx_hash: str) -> dict:
     url = _rpc_url(chain_id)
     if not url:
         return {"chain_id": chain_id, "tx_hash": tx_hash, "error": f"no native RPC configured for chain {chain_id}"}
+    urls = _rpc_urls(chain_id)
+    base_rr = next(_rr_counter)
     async with async_client() as client:
         try:
             tx, receipt = await asyncio.gather(
-                _rpc(client, url, "eth_getTransactionByHash", [tx_hash]),
-                _rpc(client, url, "eth_getTransactionReceipt", [tx_hash]),
+                _rpc_rotating(client, urls, "eth_getTransactionByHash", [tx_hash], start=base_rr),
+                _rpc_rotating(client, urls, "eth_getTransactionReceipt", [tx_hash], start=base_rr + 1),
             )
         except RateLimited as e:
             return _rl_out({"chain_id": chain_id, "tx_hash": tx_hash}, e)
@@ -457,6 +508,10 @@ async def asset_transfers(
         }
     category = category or ["external", "erc20"]
     checks = Web3.to_checksum_address(address)
+    # One Alchemy endpoint per invocation, round-robin across the key pool — spreads load across
+    # calls while keeping a single key for the whole pageKey sequence (pageKeys are provider-scoped).
+    alc = _rpc_urls(chain_id, alchemy_only=True)
+    url_pick = alc[next(_rr_counter) % len(alc)] if alc else url
     base = {
         "fromBlock": _block_tag(from_block),
         "toBlock": _block_tag(to_block),
@@ -486,7 +541,7 @@ async def asset_transfers(
                 page = dict(params)
                 pages = 0
                 while True:
-                    res = await _rpc(client, url, "alchemy_getAssetTransfers", [page])
+                    res = await _rpc(client, url_pick, "alchemy_getAssetTransfers", [page])
                     batch = (res or {}).get("transfers", []) or []
                     for t in batch:
                         t["_direction"] = dname
@@ -545,14 +600,16 @@ async def asset_transfers(
 # --------------------------------------------------------------------------- #
 # P0: deployer resolution (native RPC only — getcontractcreation is paywalled on BSC)
 # --------------------------------------------------------------------------- #
-async def _first_log_tx_at(client: httpx.AsyncClient, url: str, checks: str, block: int) -> str | None:
+async def _first_log_tx_at(
+    client: httpx.AsyncClient, urls: Sequence[str], checks: str, block: int, *, start: int = 0
+) -> str | None:
     """The tx hash of the contract's first log at ``block`` — preferring a mint ``Transfer(from=0)``
     (emitted in the creation tx for a token), else any log the contract emitted at deploy."""
     mint = {"address": checks, "fromBlock": hex(block), "toBlock": hex(block), "topics": [TRANSFER_TOPIC, ZERO_TOPIC]}
-    logs = await _rpc(client, url, "eth_getLogs", [mint]) or []
+    logs = await _rpc_rotating(client, urls, "eth_getLogs", [mint], start=start) or []
     if not logs:
         anylog = {"address": checks, "fromBlock": hex(block), "toBlock": hex(block)}
-        logs = await _rpc(client, url, "eth_getLogs", [anylog]) or []
+        logs = await _rpc_rotating(client, urls, "eth_getLogs", [anylog], start=start + 1) or []
     if not logs:
         return None
     logs.sort(key=lambda lg: _int(lg.get("logIndex")))
@@ -574,26 +631,29 @@ async def deployer(chain_id: int, address: str) -> dict:
             "address": address.lower(),
             "error": f"no native RPC configured for chain {chain_id}",
         }
+    urls = _rpc_urls(chain_id)
+    base_rr = next(_rr_counter)
     checks = Web3.to_checksum_address(address)
     out: dict = {"chain_id": chain_id, "address": address.lower(), "rpc_url": redact_rpc_url(url)}
     async with async_client() as client:
         try:
-            head = _int(await _rpc(client, url, "eth_blockNumber", []))
-            code_now = await _rpc(client, url, "eth_getCode", [checks, hex(head)])
+            head = _int(await _rpc_rotating(client, urls, "eth_blockNumber", [], start=base_rr))
+            code_now = await _rpc_rotating(client, urls, "eth_getCode", [checks, hex(head)], start=base_rr)
             if not code_now or code_now == "0x":
                 out["note"] = "no code at head (EOA or self-destructed) — cannot binary-search a deploy block"
                 return out
-            lo, hi = 0, head
+            lo, hi, step = 0, head, 0
             while lo < hi:  # smallest block whose getCode is non-empty == deploy block
                 mid = (lo + hi) // 2
-                code = await _rpc(client, url, "eth_getCode", [checks, hex(mid)])
+                code = await _rpc_rotating(client, urls, "eth_getCode", [checks, hex(mid)], start=base_rr + step)
+                step += 1
                 if code and code != "0x":
                     hi = mid
                 else:
                     lo = mid + 1
             out["deploy_block"] = lo
-            creation = await _first_log_tx_at(client, url, checks, lo)
-            tx = await _rpc(client, url, "eth_getTransactionByHash", [creation]) if creation else None
+            creation = await _first_log_tx_at(client, urls, checks, lo, start=base_rr)
+            tx = await _rpc_rotating(client, urls, "eth_getTransactionByHash", [creation], start=base_rr) if creation else None
         except RateLimited as e:
             return _rl_out(out, e)
         except Exception as e:  # noqa: BLE001
@@ -619,9 +679,10 @@ async def block_number(chain_id: int) -> dict:
     url = _rpc_url(chain_id)
     if not url:
         return {"chain_id": chain_id, "error": f"no native RPC configured for chain {chain_id}"}
+    urls = _rpc_urls(chain_id)
     async with async_client() as client:
         try:
-            bn = _int(await _rpc(client, url, "eth_blockNumber", []))
+            bn = _int(await _rpc_rotating(client, urls, "eth_blockNumber", [], start=next(_rr_counter)))
         except RateLimited as e:
             return _rl_out({"chain_id": chain_id}, e)
         except Exception as e:  # noqa: BLE001
@@ -638,17 +699,19 @@ async def block_at(chain_id: int, timestamp: int) -> dict:
     url = _rpc_url(chain_id)
     if not url:
         return {"chain_id": chain_id, "error": f"no native RPC configured for chain {chain_id}"}
+    urls = _rpc_urls(chain_id)
+    base_rr = next(_rr_counter)
     target = int(timestamp)
     async with async_client() as client:
         try:
 
             async def ts_of(b: int) -> int:
-                blk = await _rpc(client, url, "eth_getBlockByNumber", [hex(b), False])
+                blk = await _rpc_rotating(client, urls, "eth_getBlockByNumber", [hex(b), False], start=next(_rr_counter))
                 if not blk:
                     raise RpcError(f"block {b} not found")
                 return _int(blk.get("timestamp"))
 
-            head = _int(await _rpc(client, url, "eth_blockNumber", []))
+            head = _int(await _rpc_rotating(client, urls, "eth_blockNumber", [], start=base_rr))
             lo_ts = await ts_of(0)
             if target <= lo_ts:
                 return {
@@ -748,6 +811,7 @@ async def call_view_many(
             "address": address.lower(),
             "error": f"no native RPC configured for chain {chain_id}",
         }
+    urls = _rpc_urls(chain_id)  # spread the batch across the key pool
     if isinstance(signatures, str):
         signatures = [signatures]
     signatures = list(signatures)
@@ -780,13 +844,13 @@ async def call_view_many(
 
     async with async_client() as client:
 
-        async def one(sig: str, data: str | None, enc_err: str | None, blk: Any) -> dict:
+        async def one(sig: str, data: str | None, enc_err: str | None, blk: Any, start: int) -> dict:
             base = {"signature": sig, "block": blk}
             if enc_err:
                 return {**base, "error": enc_err}
             try:
                 async with sem:
-                    raw = await _rpc(client, url, "eth_call", [{"to": checks, "data": data}, _block_tag(blk)])
+                    raw = await _rpc_rotating(client, urls, "eth_call", [{"to": checks, "data": data}, _block_tag(blk)], start=start)
                 res: dict = {**base, "raw": raw}
                 if out_types:
                     try:
@@ -802,7 +866,11 @@ async def call_view_many(
             except Exception as e:  # noqa: BLE001
                 return {**base, "error": f"eth_call failed/reverted: {type(e).__name__}: {e}"}
 
-        tasks = [one(sig, data, err, blk) for (sig, data, err) in prepared for blk in blocks]
+        base_rr = next(_rr_counter)
+        tasks = [
+            one(sig, data, err, blk, base_rr + i)
+            for i, ((sig, data, err), blk) in enumerate((p, b) for p in prepared for b in blocks)
+        ]
         results = await asyncio.gather(*tasks)
 
     out: dict = {

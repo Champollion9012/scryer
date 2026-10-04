@@ -44,6 +44,7 @@ class FakeClient:
     def __init__(self, handler) -> None:
         self.handler = handler
         self.requests: list[dict] = []
+        self.urls: list[str] = []  # every url hit, in order (for rotation tests)
 
     async def __aenter__(self) -> FakeClient:
         return self
@@ -53,7 +54,11 @@ class FakeClient:
 
     async def post(self, url: str, json: dict | None = None) -> FakeResp:
         self.requests.append(json or {})
-        body = self.handler(json or {})
+        self.urls.append(url)
+        try:
+            body = self.handler(json or {}, url)  # url-aware handler (rotation tests)
+        except TypeError:
+            body = self.handler(json or {})  # back-compat 1-arg handler
         if isinstance(body, FakeResp):
             return body
         return FakeResp(body)
@@ -490,3 +495,64 @@ def test_chain_heads_best_effort(monkeypatch) -> None:
     monkeypatch.setattr(cm.scryer_config, "get_rpc_url", lambda cid: URL if cid == 1 else "")
     heads = asyncio.run(cm.chain_heads([1, 999]))
     assert heads[1] == 123 and heads[999] is None
+
+
+# --------------------------------------------------------------------------- #
+# Key-pool round-robin + throttle fallback (ALCHEMY_KEY + ALCHEMY_KEY_2)
+# --------------------------------------------------------------------------- #
+POOL = ["https://keyA.example/v2/AAA", "https://keyB.example/v2/BBB"]
+
+
+def _patch_pool(monkeypatch, handler):
+    client = FakeClient(handler)
+    monkeypatch.setattr(cm, "async_client", lambda **k: client)
+    monkeypatch.setattr(cm.scryer_config, "get_rpc_url", lambda cid: POOL[0])
+    monkeypatch.setattr(cm.scryer_config, "get_rpc_urls", lambda cid: POOL)
+    return client
+
+
+def test_key_pool_round_robin_spreads_windows(monkeypatch) -> None:
+    """Concurrent get_logs windows spread across the key pool (round-robin), not all on one key."""
+
+    def handler(req, url):
+        if req["method"] == "eth_blockNumber":
+            return _ok(req, "0x13")  # 19
+        if req["method"] == "eth_getLogs":
+            a = int(req["params"][0]["fromBlock"], 16)
+            return _ok(req, [_log(a, 0, f"0x{a:064x}", topics=[cm.SYNC_TOPIC])])
+        raise AssertionError(req["method"])
+
+    client = _patch_pool(monkeypatch, handler)
+    out = asyncio.run(cm.get_logs(56, PAIR, topics=[cm.SYNC_TOPIC], from_block=0, to_block=19, chunk=10))
+    assert out["count"] == 2  # two windows
+    log_urls = {u for u, r in zip(client.urls, client.requests, strict=True) if r["method"] == "eth_getLogs"}
+    assert log_urls == set(POOL)  # both keys were used
+
+
+def test_throttle_falls_back_to_other_key(monkeypatch) -> None:
+    """A 429 on one key does NOT fail the call — it falls back to the other key and succeeds."""
+
+    def handler(req, url):
+        if "keyA" in url:
+            return FakeResp({}, status_code=429, headers={"Retry-After": "2"})  # keyA always throttles
+        if req["method"] == "eth_getTransactionByHash":
+            return _ok(req, {"from": "0xf", "to": None, "input": "0x", "value": "0x0", "blockNumber": "0x1"})
+        if req["method"] == "eth_getTransactionReceipt":
+            return _ok(req, {"status": "0x1", "gasUsed": "0x1", "logs": []})
+        return _ok(req, "0x1")
+
+    client = _patch_pool(monkeypatch, handler)
+    out = asyncio.run(cm.get_tx(56, "0xabc"))
+    assert out.get("status") == 1 and "rate_limited" not in out  # succeeded via keyB
+    assert any("keyA" in u for u in client.urls) and any("keyB" in u for u in client.urls)  # both tried
+
+
+def test_all_keys_throttled_surfaces_rate_limited(monkeypatch) -> None:
+    """When EVERY key in the pool throttles, the throttle is surfaced (not a silent success)."""
+
+    def handler(req, url):
+        return FakeResp({}, status_code=429, headers={"Retry-After": "5"})
+
+    _patch_pool(monkeypatch, handler)
+    out = asyncio.run(cm.get_tx(56, "0xabc"))
+    assert out["rate_limited"] is True and out.get("retry_after") == 5
