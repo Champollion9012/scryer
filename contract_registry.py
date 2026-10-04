@@ -426,7 +426,7 @@ class ContractRegistry:
         return out
 
     def addresses_missing_fingerprints(
-        self, chain_id: int | None = None, limit: int = 500, exclude_chains: "set[int] | None" = None
+        self, chain_id: int | None = None, limit: int = 500, exclude_chains: set[int] | None = None
     ) -> list[tuple[int, str]]:
         """Registered contracts with no bytecode fingerprint yet — the backfill work list.
 
@@ -560,6 +560,70 @@ class ContractRegistry:
         if not source_hash:
             return []
         return self.get_addresses_by_hash(source_hash)
+
+    def enqueue_siblings(
+        self, chain_id: int, address: str, *, extra_addresses: list[str] | None = None, limit: int = 200
+    ) -> dict:
+        """Queue a contract's on-chain siblings for a (re)crawl so the whole family is represented.
+
+        Siblings are the registry's KNOWN clones of this contract — same ``source_hash`` and same
+        normalized bytecode — plus any ``extra_addresses`` the caller discovered on-chain (e.g. same
+        deployer or same LP counterpart, found with the chain tools; scryer is the data layer, the
+        caller does that analysis). Each is claimed via :meth:`claim_addresses_for_crawl`, so a later
+        crawl fetches its source; a sibling that already has source is a no-op (INSERT OR IGNORE).
+        Returns the candidate count and what was newly queued, per chain.
+        """
+        addr = address.lower()
+        candidates: dict[int, set[str]] = {}
+
+        def _add(cid: int, a: str | None) -> None:
+            if a:
+                candidates.setdefault(int(cid), set()).add(a.lower())
+
+        # 1) same source hash (verified clones)
+        sh = self.get_hash_by_address(chain_id, addr)
+        if sh:
+            for row in self.get_addresses_by_hash(sh):
+                _add(row["chain_id"], row["address"])
+
+        # 2) same normalized bytecode (byte-identical clones, incl. unverified ones)
+        conn = sqlite3.connect(self.db_path)
+        try:
+            row = conn.execute(
+                "SELECT runtime_norm_hash FROM code_fingerprints WHERE chain_id = ? AND address = ?",
+                (chain_id, addr),
+            ).fetchone()
+            norm = row[0] if row else None
+            if norm:
+                for cr in conn.execute(
+                    "SELECT chain_id, address FROM code_fingerprints WHERE runtime_norm_hash = ? LIMIT ?",
+                    (norm, limit),
+                ):
+                    _add(cr[0], cr[1])
+        finally:
+            conn.close()
+
+        # 3) caller-supplied on-chain siblings (same deployer / LP counterpart), on the query chain
+        for a in extra_addresses or []:
+            _add(chain_id, a)
+
+        candidates.get(chain_id, set()).discard(addr)  # never enqueue self
+
+        enqueued: dict[str, list[str]] = {}
+        total = 0
+        for cid, addrs in candidates.items():
+            total += len(addrs)
+            claimed = self.claim_addresses_for_crawl(cid, sorted(addrs))
+            if claimed:
+                enqueued[str(cid)] = claimed
+        return {
+            "tagged": {"chain_id": chain_id, "address": addr},
+            "candidate_siblings": total,
+            "newly_enqueued": sum(len(v) for v in enqueued.values()),
+            "enqueued_by_chain": enqueued,
+            "note": "newly_enqueued are placeholder rows for a later crawl to fetch source; siblings "
+            "that already have source are left as-is.",
+        }
 
     def tag_vulnerability(
         self,

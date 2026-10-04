@@ -172,3 +172,39 @@ def test_backfill_worklist_can_exclude_dead_chains(reg: ContractRegistry) -> Non
     assert {c for c, _a in reg.addresses_missing_fingerprints()} == {1, 56}
     assert {c for c, _a in reg.addresses_missing_fingerprints(exclude_chains={1})} == {56}
     assert reg.addresses_missing_fingerprints(exclude_chains={1, 56}) == []
+
+
+# --------------------------------------------------------------------------- #
+# P2: enqueue on-chain siblings of a tagged/matched family member
+# --------------------------------------------------------------------------- #
+def test_enqueue_siblings_queues_unsourced_bytecode_clone(reg: ContractRegistry) -> None:
+    """A byte-identical clone with no source yet is queued for a crawl; self is never queued, and a
+    second call does not re-queue an already-claimed address."""
+    reg.register_contract(chain_id=56, address=VERIFIED, sources={"A.sol": "contract A{}"})
+    reg.record_code_fingerprints(56, VERIFIED, ba.code_fingerprints(_with_trailer(BODY, "aa" * 20)))
+    clone = "0x" + "77" * 20  # same normalized bytecode, NOT in the registry yet
+    reg.record_code_fingerprints(56, clone, ba.code_fingerprints(_with_trailer(BODY, "bb" * 20)))
+
+    res = reg.enqueue_siblings(56, VERIFIED)
+    queued = res["enqueued_by_chain"].get("56", [])
+    assert clone.lower() in queued
+    assert VERIFIED.lower() not in queued  # never self
+    # claimed now -> a second enqueue does not re-queue it
+    assert clone.lower() not in reg.enqueue_siblings(56, VERIFIED)["enqueued_by_chain"].get("56", [])
+
+
+def test_enqueue_siblings_includes_caller_supplied(reg: ContractRegistry) -> None:
+    """On-chain siblings the caller discovered (same deployer / LP counterpart) are queued too."""
+    reg.register_contract(chain_id=56, address=VERIFIED, sources={"A.sol": "contract A{}"})
+    discovered = "0x" + "99" * 20
+    res = reg.enqueue_siblings(56, VERIFIED, extra_addresses=[discovered])
+    assert discovered.lower() in res["enqueued_by_chain"].get("56", [])
+
+
+def test_enqueue_siblings_skips_already_sourced_clone(reg: ContractRegistry) -> None:
+    """A verified source-clone that already has source is a candidate but is not re-queued."""
+    reg.register_contract(chain_id=56, address=VERIFIED, sources={"A.sol": "contract A{}"})
+    reg.register_contract(chain_id=1, address="0x" + "88" * 20, sources={"A.sol": "contract A{}"})  # same source_hash
+    res = reg.enqueue_siblings(56, VERIFIED)
+    assert res["candidate_siblings"] >= 1  # the source-clone is seen
+    assert res["newly_enqueued"] == 0  # but it already has source -> nothing new to crawl

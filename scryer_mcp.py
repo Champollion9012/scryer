@@ -925,7 +925,8 @@ def registry_clones(
 
 @mcp.tool()
 def registry_tag_vulnerability(tag: str, source_hash: str = "", address: str = "", chain: str = "",
-                               chain_id: int = 0, severity: str = "", description: str = "") -> dict:
+                               chain_id: int = 0, severity: str = "", description: str = "",
+                               enqueue_siblings: bool = False, sibling_addresses: list[str] | None = None) -> dict:
     """Record a confirmed vuln so every clone of that code auto-flags later.
 
     Key it by `source_hash`, or by `address` (+ chain/chain_id). For a VERIFIED contract the
@@ -933,24 +934,43 @@ def registry_tag_vulnerability(tag: str, source_hash: str = "", address: str = "
     contract — e.g. one you just Confirmed with a fork PoC — it falls back to tagging by
     BYTECODE (the normalized runtime hash), so its byte-identical clones inherit it too. Call
     AFTER confirming. Echoes what was stored so you can confirm it landed.
+
+    Set `enqueue_siblings=True` (needs `address`) to also queue this contract's family for a crawl,
+    so registry_clones/registry_vulnerable fill in the whole family: its known same-source and
+    same-bytecode clones, plus any `sibling_addresses` YOU discovered on-chain (same deployer via
+    deployer(), same LP counterpart via get_state/get_logs). Queued contracts get their source
+    fetched on the next crawl; ones that already have source are left as-is.
     """
     try:
         reg = ContractRegistry()
         sev = severity or "Unknown"
         desc = description or ""
+
+        def _maybe_enqueue(cid: int, out: dict) -> dict:
+            if enqueue_siblings or sibling_addresses:
+                try:
+                    out["enqueued_siblings"] = reg.enqueue_siblings(cid, address, extra_addresses=sibling_addresses)
+                except Exception as e:  # enqueue is best-effort — never fail the tag over it
+                    out["enqueued_siblings"] = {"error": f"{type(e).__name__}: {e}"}
+            return out
+
         if source_hash:
             reg.tag_vulnerability(source_hash, tag, severity=sev, description=desc)
-            return {"ok": True, "source_hash": source_hash, "tag": tag, "keyed_by": "source_hash",
-                    "stored": {"severity": sev, "description": desc}}
+            out = {"ok": True, "source_hash": source_hash, "tag": tag, "keyed_by": "source_hash",
+                   "stored": {"severity": sev, "description": desc}}
+            if (enqueue_siblings or sibling_addresses) and address:
+                _maybe_enqueue(_resolve_chain(chain, chain_id), out)
+            return out
         if not address:
             return {"error": "provide source_hash, or address (+ chain/chain_id)"}
         cid = _resolve_chain(chain, chain_id)
         sh = reg.get_hash_by_address(cid, address)
         if sh:  # verified contract we have source for -> tag by source
             reg.tag_vulnerability(sh, tag, severity=sev, description=desc)
-            return {"ok": True, "source_hash": sh, "tag": tag,
-                    "keyed_by": f"source_hash (resolved from {address.lower()} @ chain {cid})",
-                    "stored": {"severity": sev, "description": desc}}
+            return _maybe_enqueue(cid, {
+                "ok": True, "source_hash": sh, "tag": tag,
+                "keyed_by": f"source_hash (resolved from {address.lower()} @ chain {cid})",
+                "stored": {"severity": sev, "description": desc}})
         # Unverified / not in registry -> tag by bytecode.
         runtime_hex, err, rl = _live_runtime_hex(cid, address)
         if err:
@@ -965,13 +985,13 @@ def registry_tag_vulnerability(tag: str, source_hash: str = "", address: str = "
             return {"error": "could not fingerprint bytecode; nothing to tag"}
         ba.record_fingerprints(cid, address, runtime_hex)  # index it so it appears in registry_vulnerable
         affected = reg.tag_vulnerability_by_code(norm, tag, severity=sev, description=desc)
-        return {
+        return _maybe_enqueue(cid, {
             "ok": True, "runtime_norm_hash": norm, "tag": tag,
             "keyed_by": f"bytecode (unverified {address.lower()} @ chain {cid})",
             "stored": {"severity": sev, "description": desc},
             "affected_known_contracts": affected,
             "note": "tagged by BYTECODE — byte-identical clones (same normalized runtime) inherit this tag.",
-        }
+        })
     except Exception as e:
         return _err(e)
 
