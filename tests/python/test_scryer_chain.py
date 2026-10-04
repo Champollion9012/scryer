@@ -702,3 +702,15 @@ def test_reserves_history_large_range_samples(monkeypatch) -> None:
     out = asyncio.run(cm.reserves_history(56, PAIR, from_block=0, to_block=10000, points=5))
     assert out["source"] == "sampled_getReserves" and "note" in out
     assert out["max_drop"]["reserve"] == "reserve1" and out["max_drop"]["to"] == 10
+
+
+def test_dead_key_ttl_controls_reinclusion(monkeypatch) -> None:
+    """A dropped endpoint is excluded only within the cooldown, then retried — so a since-fixed key
+    (e.g. ALCHEMY_KEY_2 after BNB is enabled) self-recovers without a process restart."""
+    cm._dead_urls.clear()
+    cm._dead_urls["https://keyA.example/v2/AAA"] = cm.time.monotonic()
+    monkeypatch.setattr(cm, "_dead_ttl", lambda: 600.0)
+    assert cm._is_dead("https://keyA.example/v2/AAA") is True  # within cooldown -> excluded
+    monkeypatch.setattr(cm, "_dead_ttl", lambda: 0.0)
+    assert cm._is_dead("https://keyA.example/v2/AAA") is False  # cooldown elapsed -> retried
+    cm._dead_urls.clear()

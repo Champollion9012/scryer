@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import re
+import time
 from collections.abc import Sequence
 from typing import Any
 
@@ -95,10 +96,22 @@ class RpcError(Exception):
 
 class _EndpointError(Exception):
     """This endpoint/key is unusable (HTTP 401/403 — bad key, or chain not enabled on the app).
-    Not a throttle and not node-independent: rotate to the next key AND drop this one for the run."""
+    Not a throttle and not node-independent: rotate to the next key AND drop this one TEMPORARILY."""
 
 
-_dead_urls: set[str] = set()  # endpoints that auth-failed this process — excluded from rotation
+# Endpoints that auth-failed → {url: monotonic drop time}. Excluded from rotation only until the
+# cooldown elapses, then retried: a key that gets fixed (chain enabled) or flapped recovers on its
+# own without a process restart.
+_dead_urls: dict[str, float] = {}
+
+
+def _dead_ttl() -> float:
+    return float(scryer_config.get_int("SCRYER_DEAD_KEY_TTL", 600) or 600)
+
+
+def _is_dead(url: str) -> bool:
+    dropped = _dead_urls.get(url)
+    return dropped is not None and (time.monotonic() - dropped) < _dead_ttl()
 
 
 def _rpc_url(chain_id: int) -> str:
@@ -139,7 +152,7 @@ def _rpc_urls(chain_id: int, *, alchemy_only: bool = False) -> list[str]:
     if not urls:
         one = _rpc_url(chain_id)
         urls = [one] if one else []
-    urls = [u for u in urls if u not in _dead_urls]  # drop endpoints that auth-failed this run
+    urls = [u for u in urls if not _is_dead(u)]  # drop endpoints auth-failing within the cooldown
     if alchemy_only:
         alc = [u for u in urls if "alchemy" in u.lower()]
         return alc or urls
@@ -161,11 +174,11 @@ async def _rpc_rotating(
     Starts at ``urls[start % n]`` (so concurrent callers spread across keys) and falls back to the
     next URL/key when THIS key can't serve the request: a throttle (``RateLimited``) or an auth/
     not-enabled failure (``_EndpointError`` — HTTP 401/403; the bad key is also dropped from the pool
-    for the rest of the run so it isn't retried). A plain ``RpcError`` (e.g. a getLogs range error)
-    propagates immediately: it is node-independent, so another key would not help and the caller needs
-    to see it (to halve the window). Raises only when EVERY key failed that way.
+    for a cooldown, then retried, so a since-fixed key self-recovers). A plain ``RpcError`` (e.g. a
+    getLogs range error) propagates immediately: it is node-independent, so another key would not help
+    and the caller needs to see it (to halve the window). Raises only when EVERY key failed that way.
     """
-    pool = [u for u in urls if u not in _dead_urls] or list(urls)
+    pool = [u for u in urls if not _is_dead(u)] or list(urls)
     if not pool:
         raise RpcError(f"{method}: no RPC url configured")
     n = len(pool)
@@ -177,9 +190,9 @@ async def _rpc_rotating(
         except RateLimited as e:
             last_exc = e  # this key is throttled — try the next one
         except _EndpointError as e:
-            if u not in _dead_urls:
-                _dead_urls.add(u)  # bad key / chain-not-enabled — stop using it this run
-                _log.warning("RPC endpoint dropped (auth/not-enabled), falling back: %s", e)
+            if not _is_dead(u):
+                _log.warning("RPC endpoint dropped for %ss (auth/not-enabled), falling back: %s", int(_dead_ttl()), e)
+            _dead_urls[u] = time.monotonic()  # bad key / chain-not-enabled — skip it for the cooldown
             last_exc = e
     assert last_exc is not None  # the loop ran at least once
     raise last_exc
