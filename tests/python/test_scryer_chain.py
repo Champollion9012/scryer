@@ -79,6 +79,7 @@ def _err(req: dict, message: str, code: int = -32000) -> dict:
 
 def _patch(monkeypatch, handler, url: str = URL) -> FakeClient:
     cm._dead_urls.clear()
+    cm._token_meta_cache.clear()
     client = FakeClient(handler)
     monkeypatch.setattr(cm, "async_client", lambda **k: client)
     monkeypatch.setattr(cm.scryer_config, "get_rpc_url", lambda cid: url)
@@ -511,6 +512,7 @@ POOL = ["https://keyA.example/v2/AAA", "https://keyB.example/v2/BBB"]
 
 def _patch_pool(monkeypatch, handler):
     cm._dead_urls.clear()
+    cm._token_meta_cache.clear()
     client = FakeClient(handler)
     monkeypatch.setattr(cm, "async_client", lambda **k: client)
     monkeypatch.setattr(cm.scryer_config, "get_rpc_url", lambda cid: POOL[0])
@@ -583,3 +585,120 @@ def test_auth_error_drops_key_and_falls_back(monkeypatch) -> None:
     assert out.get("status") == 1 and "error" not in out  # succeeded via keyB
     assert any("keyA" in u for u in cm._dead_urls)  # keyA dropped from rotation
     cm._dead_urls.clear()
+
+
+# --------------------------------------------------------------------------- #
+# Follow-up pass: entity labels, human amounts, victim/beneficiary, reserves extras
+# --------------------------------------------------------------------------- #
+FIXEDFLOAT = "0x4727250679294802377dd6ca6541b8e459077c95"
+
+
+def abi_encode_str(s: str) -> str:
+    from eth_abi import encode as _enc
+
+    return _enc(["string"], [s]).hex()
+
+
+def test_labels_known_and_unknown() -> None:
+    import scryer_labels
+
+    assert scryer_labels.label_for(FIXEDFLOAT)["category"] == "cex-no-kyc"
+    assert scryer_labels.label_for(FIXEDFLOAT.upper())["name"] == "FixedFloat"  # case-insensitive
+    assert scryer_labels.label_for("0x" + "ab" * 20) is None
+    assert scryer_labels.label_for(None) is None
+
+
+def test_get_tx_enrichment_human_victim_beneficiary_labels(monkeypatch) -> None:
+    tok = "0x" + "aa" * 20
+    victim = "0x" + "11" * 20
+    ff = FIXEDFLOAT  # a labeled beneficiary
+    transfer = _log(
+        100,
+        0,
+        "0xtx",
+        topics=[cm.TRANSFER_TOPIC, "0x" + "00" * 12 + victim[2:], "0x" + "00" * 12 + ff[2:]],
+        data="0x" + (5 * 10**18).to_bytes(32, "big").hex(),
+        address=tok,
+    )
+
+    def handler(req, url):
+        m = req["method"]
+        if m == "eth_getTransactionByHash":
+            return _ok(req, {"from": victim, "to": ff, "input": "0xdeadbeef", "value": "0x0", "blockNumber": "0x64"})
+        if m == "eth_getTransactionReceipt":
+            return _ok(req, {"status": "0x1", "gasUsed": "0x1", "logs": [transfer]})
+        if m == "eth_call":
+            data = req["params"][0]["data"]
+            if data == cm._SYM_SEL:  # symbol() -> "AAA"
+                return _ok(req, "0x" + abi_encode_str("AAA"))
+            if data == cm._DEC_SEL:  # decimals() -> 18
+                return _ok(req, "0x" + (18).to_bytes(32, "big").hex())
+        raise AssertionError(m)
+
+    _patch(monkeypatch, handler)
+    out = asyncio.run(cm.get_tx(56, "0xtx"))
+    assert out["token_meta"][tok]["symbol"] == "AAA" and out["token_meta"][tok]["decimals"] == 18
+    assert out["net_flows_human"][tok][ff] == 5.0 and out["net_flows_human"][tok][victim] == -5.0
+    fs = out["flow_summary"][0]
+    assert fs["beneficiary"]["address"] == ff and fs["beneficiary"]["amount"] == 5.0
+    assert fs["beneficiary"]["label"]["name"] == "FixedFloat"
+    assert fs["victim"]["address"] == victim and fs["victim"]["amount"] == -5.0
+    assert out["labels"][ff]["category"] == "cex-no-kyc"
+
+
+def test_asset_transfers_labels_first_funder_distinct(monkeypatch) -> None:
+    def handler(req, url):
+        assert req["method"] == "alchemy_getAssetTransfers"
+        return _ok(
+            req,
+            {
+                "transfers": [
+                    {"from": FIXEDFLOAT, "value": 5.0, "asset": "BNB", "blockNum": "0x5"},
+                    {"from": "0x" + "cc" * 20, "value": 1.0, "asset": "BNB", "blockNum": "0x9"},
+                ]
+            },
+        )
+
+    _patch(monkeypatch, handler)
+    out = asyncio.run(cm.asset_transfers(56, VICTIM, direction="in"))
+    assert out["distinct_counterparties"] == 2
+    assert out["first_funder"]["address"] == FIXEDFLOAT and out["first_funder"]["block"] == 5
+    by = {c["address"]: c for c in out["counterparties"]}
+    assert by[FIXEDFLOAT]["label"]["name"] == "FixedFloat"
+    assert "likely_service_hub" not in out  # only 2 counterparties
+
+
+def test_asset_transfers_hub_flag(monkeypatch) -> None:
+    many = [{"from": "0x" + f"{i:040x}", "value": 1.0, "asset": "BNB", "blockNum": hex(i + 1)} for i in range(45)]
+
+    def handler(req, url):
+        return _ok(req, {"transfers": many})
+
+    _patch(monkeypatch, handler)
+    out = asyncio.run(cm.asset_transfers(56, VICTIM, direction="in"))
+    assert out["distinct_counterparties"] == 45 and out["likely_service_hub"] is True
+
+
+def test_max_single_step_drop() -> None:
+    series = [
+        {"block": 1, "reserve0": 100, "reserve1": 1000},
+        {"block": 2, "reserve0": 100, "reserve1": 1000},
+        {"block": 3, "reserve0": 100, "reserve1": 10},
+    ]  # reserve1 collapses 1000->10 at block 3
+    md = cm._max_single_step_drop(series)
+    assert md["reserve"] == "reserve1" and md["from_block"] == 2 and md["to_block"] == 3 and md["drop_pct"] == 0.99
+    assert cm._max_single_step_drop([{"block": 1, "reserve0": 1, "reserve1": 1}]) is None  # single point
+
+
+def test_reserves_history_large_range_samples(monkeypatch) -> None:
+    def handler(req, url):
+        if req["method"] == "eth_call":
+            blk = int(req["params"][1], 16)
+            r1 = 1000 if blk < 5000 else 10  # drain at 5000
+            return _ok(req, _enc_words(100, r1, 0))
+        raise AssertionError(req["method"])  # must NOT call eth_getLogs for a large range
+
+    _patch(monkeypatch, handler)
+    out = asyncio.run(cm.reserves_history(56, PAIR, from_block=0, to_block=10000, points=5))
+    assert out["source"] == "sampled_getReserves" and "note" in out
+    assert out["max_drop"]["reserve"] == "reserve1" and out["max_drop"]["to"] == 10

@@ -38,6 +38,7 @@ from web3 import Web3
 
 import onchain_state as oc
 import scryer_config
+import scryer_labels
 from scryer_http import (
     RateLimited,
     async_client,
@@ -56,6 +57,12 @@ _log = get_logger(__name__)
 # --------------------------------------------------------------------------- #
 def _concurrency() -> int:
     return scryer_config.get_int("SCRYER_RPC_CONCURRENCY", 8) or 8
+
+
+def _hub_threshold() -> int:
+    # An address transacting with more than this many distinct counterparties is likely a
+    # service/hub (exchange, router, bridge) rather than a private wallet.
+    return scryer_config.get_int("SCRYER_HUB_MIN_COUNTERPARTIES", 40) or 40
 
 
 def _logs_chunk() -> int:
@@ -345,6 +352,115 @@ def _net_flows(events: list[dict]) -> dict[str, dict[str, int]]:
 
 
 # --------------------------------------------------------------------------- #
+# Token symbol/decimals (for human amounts) — cached per (chain, token)
+# --------------------------------------------------------------------------- #
+_SYM_SEL = "0x95d89b41"  # symbol()
+_DEC_SEL = "0x313ce567"  # decimals()
+_token_meta_cache: dict[tuple[int, str], dict] = {}
+
+
+def _decode_string(raw: str | None) -> str | None:
+    """Decode an ABI string (or legacy bytes32) return value; None if undecodable/empty."""
+    if not raw or raw == "0x":
+        return None
+    b = bytes.fromhex(raw[2:] if raw.startswith("0x") else raw)
+    try:
+        s = abi_decode(["string"], b)[0]
+        return s or None
+    except Exception:
+        pass
+    try:  # legacy bytes32 symbol (e.g. MKR)
+        return b.rstrip(b"\x00").decode("utf-8", "replace").strip() or None
+    except Exception:
+        return None
+
+
+async def _token_meta(client: httpx.AsyncClient, urls: Sequence[str], chain_id: int, token: str) -> dict:
+    """``{"symbol", "decimals"}`` for an ERC20, cached. decimals defaults to 18, symbol to None."""
+    key = (chain_id, token.lower())
+    if key in _token_meta_cache:
+        return _token_meta_cache[key]
+    checks = Web3.to_checksum_address(token)
+    start = next(_rr_counter)
+    meta: dict = {"symbol": None, "decimals": 18}
+    try:
+        res: Any = await asyncio.gather(
+            _rpc_rotating(client, urls, "eth_call", [{"to": checks, "data": _SYM_SEL}, "latest"], start=start),
+            _rpc_rotating(client, urls, "eth_call", [{"to": checks, "data": _DEC_SEL}, "latest"], start=start + 1),
+            return_exceptions=True,
+        )
+        sym_raw, dec_raw = res[0], res[1]
+        if isinstance(sym_raw, str):
+            meta["symbol"] = _decode_string(sym_raw)
+        if isinstance(dec_raw, str) and dec_raw not in ("", "0x"):
+            d = int(dec_raw, 16)
+            if 0 < d <= 36:
+                meta["decimals"] = d
+    except Exception:  # noqa: BLE001 - metadata is best-effort
+        pass
+    _token_meta_cache[key] = meta
+    return meta
+
+
+def _human(raw: int, decimals: int) -> float:
+    return raw / (10**decimals)
+
+
+async def _enrich_get_tx(client: httpx.AsyncClient, urls: Sequence[str], chain_id: int, out: dict) -> None:
+    """Add forensic readability to a get_tx result (in place): per-token symbol/decimals, human
+    net-flow amounts, a per-token biggest-gainer/biggest-loser (victim/beneficiary) summary, and
+    known-entity labels for every address that moved. Best-effort — never raises."""
+    net = out.get("net_flows") or {}
+    tokens = list(net.keys())
+    metas = await asyncio.gather(*(_token_meta(client, urls, chain_id, t) for t in tokens)) if tokens else []
+    token_meta = dict(zip(tokens, metas, strict=True))
+
+    labels: dict[str, dict] = {}
+
+    def _lab(addr: str) -> None:
+        lab = scryer_labels.label_for(addr)
+        if lab:
+            labels[addr] = lab
+
+    net_human: dict[str, dict] = {}
+    flow_summary: list[dict] = []
+    for tok, moves in net.items():
+        dec = token_meta.get(tok, {}).get("decimals", 18)
+        sym = token_meta.get(tok, {}).get("symbol")
+        net_human[tok] = {a: _human(v, dec) for a, v in moves.items()}
+        for a in moves:
+            _lab(a)
+        _lab(tok)
+        gain_a = max(moves, key=lambda a: moves[a])
+        loss_a = min(moves, key=lambda a: moves[a])
+        flow_summary.append(
+            {
+                "token": tok,
+                "symbol": sym,
+                "beneficiary": {
+                    "address": gain_a,
+                    "amount": _human(moves[gain_a], dec),
+                    "label": scryer_labels.label_for(gain_a),
+                },
+                "victim": {
+                    "address": loss_a,
+                    "amount": _human(moves[loss_a], dec),
+                    "label": scryer_labels.label_for(loss_a),
+                },
+            }
+        )
+    for a in (out.get("from"), out.get("to")):
+        if a:
+            _lab(a)
+
+    out["token_meta"] = token_meta
+    out["net_flows_human"] = net_human
+    out["flow_summary"] = flow_summary
+    if labels:
+        out["labels"] = labels
+
+
+# --------------------------------------------------------------------------- #
 # P0: logs (auto-chunked)
 # --------------------------------------------------------------------------- #
 async def get_logs(
@@ -490,7 +606,7 @@ async def get_tx(chain_id: int, tx_hash: str) -> dict:
     inp = tx.get("input") or "0x"
     status_raw = (receipt or {}).get("status")
     to = tx.get("to")
-    return {
+    out = {
         "chain_id": chain_id,
         "tx_hash": tx_hash,
         "from": (tx.get("from") or "").lower() or None,
@@ -508,6 +624,12 @@ async def get_tx(chain_id: int, tx_hash: str) -> dict:
         "net_flows": _net_flows(events),
         "rpc_url": redact_rpc_url(url),
     }
+    try:  # best-effort enrichment: symbol/decimals, human amounts, victim/beneficiary, labels
+        async with async_client() as client:
+            await _enrich_get_tx(client, urls, chain_id, out)
+    except Exception as e:  # noqa: BLE001
+        out["enrich_error"] = f"{type(e).__name__}: {e}"
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -617,10 +739,23 @@ async def asset_transfers(
             earliest = bn if earliest is None else min(earliest, bn)
 
     cps = [
-        {"address": a, "count": c["count"], "value": round(c["value"], 8), "assets": sorted(c["assets"])}
+        {
+            "address": a,
+            "count": c["count"],
+            "value": round(c["value"], 8),
+            "assets": sorted(c["assets"]),
+            "label": scryer_labels.label_for(a),  # known-entity annotation (CEX/mixer/router/…)
+        }
         for a, c in counterparties.items()
     ]
     cps.sort(key=lambda x: (-x["count"], x["address"]))
+    # earliest-seen counterparty = the FIRST funder (attribution start point)
+    first_funder = None
+    if transfers:
+        first_t = min(transfers, key=lambda t: _int(t.get("blockNum")) if t.get("blockNum") else 1 << 62)
+        fa = ((first_t.get("from") if first_t.get("_direction") == "in" else first_t.get("to")) or "").lower() or None
+        if fa:
+            first_funder = {"address": fa, "label": scryer_labels.label_for(fa), "block": earliest}
 
     out: dict = {
         "chain_id": chain_id,
@@ -628,10 +763,16 @@ async def asset_transfers(
         "direction": direction,
         "category": category,
         "count": len(transfers),
+        "distinct_counterparties": len(cps),
+        "first_funder": first_funder,
         "counterparties": cps,
         "earliest_block": earliest,
         "rpc_url": redact_rpc_url(url),
     }
+    # Cheap hub heuristic: an address with many distinct counterparties is likely a service/hub
+    # (exchange/router/bridge), not a private wallet — flag it so it isn't read as the attacker.
+    if len(cps) >= _hub_threshold():
+        out["likely_service_hub"] = True
     if truncated:
         out["truncated"] = True
         out["note"] = f"stopped at max_pages={max_pages}; MORE transfers exist (raise max_pages)."
@@ -707,10 +848,13 @@ async def deployer(chain_id: int, address: str) -> dict:
     if tx:
         to = tx.get("to")
         to_l = (to or "").lower() or None
+        frm = (tx.get("from") or "").lower() or None
         out["creation_tx"] = creation
-        out["deployer"] = (tx.get("from") or "").lower() or None
+        out["deployer"] = frm
         out["factory"] = to_l
         out["via"] = "factory" if to_l else "direct_create"
+        out["deployer_label"] = scryer_labels.label_for(frm)  # e.g. a CEX-funded deployer
+        out["factory_label"] = scryer_labels.label_for(to_l)
     else:
         out["note"] = "deploy block located, but no mint/log at that block to reverse the creation tx from"
     return out
@@ -962,37 +1106,94 @@ def _downsample(series: list[dict], n: int) -> list[dict]:
     return [series[i] for i in idxs]
 
 
+def _max_single_step_drop(series: list[dict]) -> dict | None:
+    """The largest single-step reserve DROP between consecutive points — the drain moment. Scans
+    both reserve sides and returns the biggest fractional decrease, or None if reserves only grew."""
+    worst: dict | None = None
+    for a, b in zip(series, series[1:], strict=False):
+        for side in ("reserve0", "reserve1"):
+            pa, pb = a.get(side), b.get(side)
+            if pa and pb is not None and pb < pa:
+                pct = (pa - pb) / pa
+                if worst is None or pct > worst["drop_pct"]:
+                    worst = {
+                        "from_block": a["block"],
+                        "to_block": b["block"],
+                        "reserve": side,
+                        "from": pa,
+                        "to": pb,
+                        "drop_pct": round(pct, 6),
+                    }
+    return worst
+
+
+def _reserves_max_scan() -> int:
+    # Above this block span, scanning Sync logs (10-block windows) is too many requests — sample
+    # getReserves across the range instead (points calls, archive).
+    return scryer_config.get_int("SCRYER_RESERVES_MAX_SCAN", 5000) or 5000
+
+
 async def reserves_history(
     chain_id: int, pair: str, *, from_block: Any = 0, to_block: Any = "latest", points: int = 50
 ) -> dict:
     """Reserve trajectory of a UniV2-style pair over a block range — the most-repeated forensic read.
 
-    Derived from the pair's own ``Sync`` logs (exact reserves at each change) via get_logs; if no
-    Sync logs are found (or logs are unavailable) it falls back to sampling ``getReserves()`` at
-    ``points`` evenly-spaced blocks. The result is downsampled to ``points`` and carries
-    ``source`` so the caller knows which path produced it.
+    For a SMALL range it reads the pair's own ``Sync`` logs (exact reserves at each change). For a
+    LARGE range (> SCRYER_RESERVES_MAX_SCAN blocks, default 5000) a Sync scan would be thousands of
+    10-block getLogs windows, so it SAMPLES ``getReserves()`` at ``points`` evenly-spaced blocks
+    instead (also the fallback when a small range has no Sync logs). ``source`` says which path ran,
+    and ``max_drop`` flags the biggest single-step reserve collapse (the drain block).
     """
-    logs_out = await get_logs(chain_id, pair, topics=[SYNC_TOPIC], from_block=from_block, to_block=to_block)
-    if logs_out.get("error"):
-        return logs_out
-    series: list[dict] = [
-        {"block": ev["block_number"], "reserve0": ev["reserve0"], "reserve1": ev["reserve1"]}
-        for ev in _decode_events(logs_out.get("logs", []))
-        if ev.get("type") == "Sync"
-    ]
-    source = "sync_logs"
-    lo, hi = logs_out.get("from_block", 0), logs_out.get("to_block", 0)
-    if not series:
+    url = _rpc_url(chain_id)
+    if not url:
+        return {"chain_id": chain_id, "pair": pair.lower(), "error": f"no native RPC configured for chain {chain_id}"}
+    async with async_client() as client:
+        try:
+            lo = await _resolve_block(client, url, from_block)
+            hi = await _resolve_block(client, url, to_block)
+        except RateLimited as e:
+            return _rl_out({"chain_id": chain_id, "pair": pair.lower()}, e)
+        except Exception as e:  # noqa: BLE001
+            return {
+                "chain_id": chain_id,
+                "pair": pair.lower(),
+                "error": f"block resolve failed: {type(e).__name__}: {e}",
+            }
+    if hi < lo:
+        return {"chain_id": chain_id, "pair": pair.lower(), "error": f"to_block ({hi}) < from_block ({lo})"}
+
+    large = (hi - lo) > _reserves_max_scan()
+    series: list[dict] = []
+    source = ""
+    extra: dict = {}
+
+    if not large:
+        logs_out = await get_logs(chain_id, pair, topics=[SYNC_TOPIC], from_block=lo, to_block=hi)
+        if logs_out.get("error"):
+            return logs_out
+        series = [
+            {"block": ev["block_number"], "reserve0": ev["reserve0"], "reserve1": ev["reserve1"]}
+            for ev in _decode_events(logs_out.get("logs", []))
+            if ev.get("type") == "Sync"
+        ]
+        source = "sync_logs"
+        for k in ("partial", "rate_limited", "retry_after"):
+            if k in logs_out:
+                extra[k] = logs_out[k]
+
+    if large or not series:
         cv = await call_view_many(
             chain_id, pair, "getReserves()", returns="uint112,uint112,uint32", blocks=_spread(lo, hi, points)
         )
-        for r in cv.get("results", []):
-            dec = r.get("decoded")
-            if dec and len(dec) >= 2:
-                series.append({"block": r["block"], "reserve0": dec[0], "reserve1": dec[1]})
+        series = [
+            {"block": r["block"], "reserve0": r["decoded"][0], "reserve1": r["decoded"][1]}
+            for r in cv.get("results", [])
+            if r.get("decoded") and len(r["decoded"]) >= 2
+        ]
         source = "sampled_getReserves"
         if cv.get("rate_limited"):
-            logs_out["rate_limited"] = True
+            extra["rate_limited"] = True
+
     sampled = _downsample(series, points)
     out: dict = {
         "chain_id": chain_id,
@@ -1002,8 +1203,13 @@ async def reserves_history(
         "points": len(sampled),
         "source": source,
         "series": sampled,
+        "max_drop": _max_single_step_drop(sampled),
     }
-    for k in ("partial", "rate_limited", "retry_after"):
-        if k in logs_out:
-            out[k] = logs_out[k]
+    out.update(extra)
+    if large:
+        out["note"] = (
+            f"range {hi - lo} blocks > {_reserves_max_scan()}: sampled getReserves at {points} points "
+            f"(a Sync-log scan would be ~{(hi - lo) // max(1, _logs_chunk())} getLogs windows). "
+            "max_drop locates the drain between samples; narrow the range for exact Sync-log reserves."
+        )
     return out

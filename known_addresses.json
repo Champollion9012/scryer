@@ -1,0 +1,13 @@
+{
+  "_comment": "Seed address-label map for forensic attribution (extensible). Keys are lowercase addresses; values {name, category}. Categories: cex, cex-no-kyc, mixer, bridge, router, factory, zero, burn. These are mostly chain-agnostic service addresses (same address across EVM chains). Add rows freely; a wrong label is worse than none, so keep entries high-confidence.",
+  "0x4727250679294802377dd6ca6541b8e459077c95": {"name": "FixedFloat", "category": "cex-no-kyc"},
+  "0x0000000000000000000000000000000000000000": {"name": "Zero (mint/burn)", "category": "zero"},
+  "0x000000000000000000000000000000000000dead": {"name": "Dead (burn)", "category": "burn"},
+  "0x10ed43c718714eb63d5aa57b78b54704e256024e": {"name": "PancakeSwap V2 Router", "category": "router"},
+  "0xca143ce32fe78f1f7019d7d551a6402fc5350c73": {"name": "PancakeSwap V2 Factory", "category": "factory"},
+  "0x13f4ea83d0bd40e75c8222255bc855a974568dd4": {"name": "PancakeSwap V3 Router", "category": "router"},
+  "0xf977814e90da44bfa03b6295a0616a897441acec": {"name": "Binance 8", "category": "cex"},
+  "0x8894e0a0c962cb723c1976a4421c95949be2d4e3": {"name": "Binance Hot (BSC)", "category": "cex"},
+  "0x7a250d5630b4cf539739df2c5dacb4c659f2488d": {"name": "Uniswap V2 Router", "category": "router"},
+  "0x5c69bee701ef814a2b6a3edd4b1652cb9cc5aa6f": {"name": "Uniswap V2 Factory", "category": "factory"}
+}

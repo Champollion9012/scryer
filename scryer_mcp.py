@@ -606,8 +606,11 @@ async def get_tx(tx_hash: str, chain: str = "", chain_id: int = 0) -> dict:
     """Decode a transaction's token movements — from/to/selector/status/gas + events + net flows.
 
     Fetches the tx + receipt and decodes ERC20 Transfer, UniswapV2 Swap/Sync, and WETH/WBNB
-    Deposit/Withdrawal logs. `net_flows` is a per-token {address: net} summary (received - sent) —
-    the fast read on "what moved and to whom" without hand-parsing receipts. Native RPC only.
+    Deposit/Withdrawal logs. `net_flows` is a per-token {address: net raw-wei} summary (received -
+    sent) — the fast read on "what moved and to whom". Enriched: `token_meta` (symbol/decimals),
+    `net_flows_human` (decimal amounts), `flow_summary` (per-token victim/beneficiary = biggest
+    loser/gainer, with entity labels), and `labels` (known-entity map: CEX/mixer/router/burn…).
+    Native RPC only.
     """
     try:
         return await cm.get_tx(_resolve_chain(chain, chain_id), tx_hash)
@@ -623,9 +626,11 @@ async def asset_transfers(address: str, direction: str = "in", category: list[st
 
     `direction`: "in" (received — the "who funded X" primitive), "out" (sent), or "both".
     `category`: Alchemy categories, default ["external","erc20"] (native + token). Paginates the
-    provider's pageKey automatically and returns counterparties (count/value/assets) + the earliest
-    block seen. `truncated:true` means more pages exist beyond `max_pages`. Needs an Alchemy-family
-    native RPC for the chain.
+    provider's pageKey automatically and returns counterparties (count/value/assets + a known-entity
+    `label` so a CEX/mixer isn't mistaken for a private wallet), `distinct_counterparties`,
+    `first_funder`, and the earliest block seen. `likely_service_hub:true` flags an address with many
+    counterparties (exchange/router, not a private wallet). `truncated:true` means more pages exist
+    beyond `max_pages`. Needs an Alchemy-family native RPC for the chain.
     """
     try:
         return await cm.asset_transfers(
@@ -679,8 +684,9 @@ async def reserves_history(pair: str, from_block: str = "0", to_block: str = "la
     """Reserve trajectory of a UniswapV2-style pair over a block range (reserve0/reserve1 per point).
 
     The single most-repeated forensic pattern (did reserves get drained / manipulated, and when).
-    Derived from the pair's own Sync logs (exact), falling back to sampled getReserves() if none are
-    found; downsampled to `points`. `source` says which path produced it. Native RPC only.
+    Small range: exact from the pair's Sync logs. LARGE range (>5000 blocks): samples getReserves()
+    at `points` blocks (a Sync scan would be thousands of getLogs windows) — `source` says which ran.
+    `max_drop` flags the biggest single-step reserve collapse (the drain block). Native RPC only.
     """
     try:
         return await cm.reserves_history(
