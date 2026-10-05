@@ -602,7 +602,7 @@ async def get_logs(address: str = "", topics: list[str] | None = None, from_bloc
 
 
 @mcp.tool()
-async def get_tx(tx_hash: str, chain: str = "", chain_id: int = 0) -> dict:
+async def get_tx(tx_hash: str, chain: str = "", chain_id: int = 0, net_flows_only: bool = False) -> dict:
     """Decode a transaction's token movements — from/to/selector/status/gas + events + net flows.
 
     Fetches the tx + receipt and decodes ERC20 Transfer, UniswapV2 Swap/Sync, and WETH/WBNB
@@ -610,10 +610,12 @@ async def get_tx(tx_hash: str, chain: str = "", chain_id: int = 0) -> dict:
     sent) — the fast read on "what moved and to whom". Enriched: `token_meta` (symbol/decimals),
     `net_flows_human` (decimal amounts), `flow_summary` (per-token victim/beneficiary = biggest
     loser/gainer, with entity labels), and `labels` (known-entity map: CEX/mixer/router/burn…).
-    Native RPC only.
+    The raw `events` list is capped (a loop-heavy tx emits thousands); `net_flows_only=True` drops it
+    entirely (net_flows/flow_summary stay) — use it when a tx overflows. `event_count` is always the
+    true total; `events_truncated`/`events_omitted` flag what was dropped. Native RPC only.
     """
     try:
-        return await cm.get_tx(_resolve_chain(chain, chain_id), tx_hash)
+        return await cm.get_tx(_resolve_chain(chain, chain_id), tx_hash, net_flows_only=net_flows_only)
     except Exception as e:
         return _err(e)
 
@@ -621,7 +623,7 @@ async def get_tx(tx_hash: str, chain: str = "", chain_id: int = 0) -> dict:
 @mcp.tool()
 async def asset_transfers(address: str, direction: str = "in", category: list[str] | None = None,
                           from_block: str = "0", to_block: str = "latest",
-                          chain: str = "", chain_id: int = 0, max_pages: int = 20) -> dict:
+                          chain: str = "", chain_id: int = 0, max_pages: int = 20, top: int = 100) -> dict:
     """Trace an address's fund flow (who funded it / where value went) via Alchemy asset transfers.
 
     `direction`: "in" (received — the "who funded X" primitive), "out" (sent), or "both".
@@ -630,12 +632,15 @@ async def asset_transfers(address: str, direction: str = "in", category: list[st
     `label` so a CEX/mixer isn't mistaken for a private wallet), `distinct_counterparties`,
     `first_funder`, and the earliest block seen. `likely_service_hub:true` flags an address with many
     counterparties (exchange/router, not a private wallet). `truncated:true` means more pages exist
-    beyond `max_pages`. Needs an Alchemy-family native RPC for the chain.
+    beyond `max_pages`. The per-counterparty LIST is capped to the top-`top` by count (default 100;
+    pass 0 for all) so a pool/hub with tens of thousands doesn't overflow — `distinct_counterparties`
+    stays the true total and `counterparties_omitted` flags the drop; query the EOA (not a pool/hub).
+    Needs an Alchemy-family native RPC for the chain.
     """
     try:
         return await cm.asset_transfers(
             _resolve_chain(chain, chain_id), address, direction=direction, category=category,
-            from_block=from_block, to_block=to_block, max_pages=max_pages,
+            from_block=from_block, to_block=to_block, max_pages=max_pages, top=top,
         )
     except Exception as e:
         return _err(e)
@@ -653,6 +658,24 @@ async def deployer(address: str, chain: str = "", chain_id: int = 0) -> dict:
     """
     try:
         return await cm.deployer(_resolve_chain(chain, chain_id), address)
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def deployed_by(address: str, chain: str = "", chain_id: int = 0, max_nonce: int = 500) -> dict:
+    """List every contract an EOA deployed — the repeat-offender / operator-footprint primitive.
+
+    Enumerates deployments by deriving each CREATE address keccak256(rlp([eoa, nonce]))[12:] for
+    nonce 0..N-1 and reading eth_getCode (every one with code is a contract the EOA created). Unlike
+    registry_clones, it is NOT defeated by bespoke attack contracts that hardcode per-victim constants
+    (so byte-matching is empty) — it enumerates what was ACTUALLY deployed. Deterministic, no
+    Etherscan, no archive RPC (code read at head). Returns `deployed:[{nonce,address,code_size}]`,
+    `deployed_count`, the EOA `nonce`, and `truncated` if the range exceeds `max_nonce`. Then classify
+    each (bytecode_abi) and check if it executed (asset_transfers, with a positive control). Native RPC only.
+    """
+    try:
+        return await cm.deployed_by(_resolve_chain(chain, chain_id), address, max_nonce=max_nonce)
     except Exception as e:
         return _err(e)
 

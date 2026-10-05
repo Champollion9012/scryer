@@ -356,6 +356,117 @@ def test_deployer_no_code_at_head(monkeypatch) -> None:
     assert "note" in out and "no code at head" in out["note"]
 
 
+def test_deployer_logless_fallback_to_block_scan(monkeypatch) -> None:
+    """A non-token contract emits NO log at deploy — fall back to scanning the block's CREATE txs."""
+    deploy_block = 7
+
+    def handler(req: dict) -> dict:
+        m = req["method"]
+        if m == "eth_blockNumber":
+            return _ok(req, "0x14")  # 20
+        if m == "eth_getCode":
+            return _ok(req, "0x6080" if int(req["params"][1], 16) >= deploy_block else "0x")
+        if m == "eth_getLogs":
+            return _ok(req, [])  # no deploy-block log (not a token)
+        if m == "eth_getBlockByNumber":
+            assert int(req["params"][0], 16) == deploy_block and req["params"][1] is True
+            return _ok(
+                req,
+                {
+                    "transactions": [
+                        {"hash": "0xcall", "to": "0xsomecontract"},  # a plain call (to != null) -> skipped
+                        {"hash": "0xcreatetx", "to": None},  # a direct CREATE
+                    ]
+                },
+            )
+        if m == "eth_getTransactionReceipt":
+            # only the CREATE tx's receipt carries contractAddress == the target
+            return _ok(req, {"contractAddress": CONTRACT if req["params"][0] == "0xcreatetx" else None})
+        if m == "eth_getTransactionByHash":
+            assert req["params"][0] == "0xcreatetx"
+            return _ok(req, {"from": "0xdeployereoa", "to": None})
+        raise AssertionError(m)
+
+    _patch(monkeypatch, handler)
+    out = asyncio.run(cm.deployer(56, CONTRACT))
+    assert out["deploy_block"] == deploy_block
+    assert out["creation_tx"] == "0xcreatetx"
+    assert out["deployer"] == "0xdeployereoa"
+    assert out["via"] == "direct_create" and out["factory"] is None
+
+
+def test_deployed_by_enumerates_creates(monkeypatch) -> None:
+    """Enumerate an EOA's deployments by CREATE-address derivation + eth_getCode (no Etherscan)."""
+    eoa = "0x" + "ab" * 20
+    want = {cm._rlp_create_address(eoa, 0), cm._rlp_create_address(eoa, 2)}  # "deployed" at nonce 0 and 2
+
+    def handler(req: dict) -> dict:
+        m = req["method"]
+        if m == "eth_getTransactionCount":
+            return _ok(req, "0x5")  # nonce 5 -> scan nonces 0..4
+        if m == "eth_getCode":
+            return _ok(req, "0x6080" if req["params"][0] in want else "0x")  # params[0]=addr, [1]="latest"
+        raise AssertionError(m)
+
+    _patch(monkeypatch, handler)
+    out = asyncio.run(cm.deployed_by(56, eoa))
+    assert out["nonce"] == 5 and out["scanned_nonces"] == 5
+    assert out["deployed_count"] == 2
+    assert {d["nonce"] for d in out["deployed"]} == {0, 2}
+    assert "truncated" not in out
+
+
+def test_asset_transfers_caps_counterparties_top(monkeypatch) -> None:
+    """A pool/hub with many counterparties is capped to top-N; the summary stays exact."""
+
+    def handler(req: dict) -> dict:
+        return _ok(
+            req,
+            {
+                "transfers": [
+                    {"from": f"0xf{i}", "value": float(i + 1), "asset": "USDT", "blockNum": hex(i + 1)}
+                    for i in range(5)
+                ]
+            },
+        )
+
+    _patch(monkeypatch, handler)
+    out = asyncio.run(cm.asset_transfers(56, VICTIM, direction="in", top=2))
+    assert out["distinct_counterparties"] == 5  # true total (NOT the truncated list length)
+    assert len(out["counterparties"]) == 2
+    assert out["counterparties_omitted"] == 3
+
+
+def test_get_tx_net_flows_only_drops_events(monkeypatch) -> None:
+    """net_flows_only drops the raw event list but keeps net_flows + the true event_count."""
+    tx = "0xabc"
+    transfer_log = _log(
+        10,
+        0,
+        tx,
+        topics=[cm.TRANSFER_TOPIC, "0x" + "00" * 12 + "aa" * 20, "0x" + "00" * 12 + "bb" * 20],
+        data="0x" + "00" * 31 + "64",
+        address=TOKEN,  # value 100
+    )
+
+    def handler(req: dict) -> dict:
+        m = req["method"]
+        if m == "eth_getTransactionByHash":
+            return _ok(
+                req, {"from": "0xsender", "to": "0xtarget", "input": "0xdeadbeef", "value": "0x0", "blockNumber": "0xa"}
+            )
+        if m == "eth_getTransactionReceipt":
+            return _ok(req, {"status": "0x1", "logs": [transfer_log], "gasUsed": "0x1"})
+        return _ok(req, "0x")  # enrichment best-effort calls -> no-op
+
+    _patch(monkeypatch, handler)
+    out = asyncio.run(cm.get_tx(56, tx, net_flows_only=True))
+    assert out["event_count"] == 1
+    assert out["events"] == []
+    assert out["events_omitted"] == 1
+    assert out["net_flows"]  # net flows still computed from the full event list
+
+
 # --------------------------------------------------------------------------- #
 # Rate-limit surfacing (never a silent empty)
 # --------------------------------------------------------------------------- #

@@ -590,7 +590,7 @@ async def get_logs(
 # --------------------------------------------------------------------------- #
 # P0: transaction decode
 # --------------------------------------------------------------------------- #
-async def get_tx(chain_id: int, tx_hash: str) -> dict:
+async def get_tx(chain_id: int, tx_hash: str, *, net_flows_only: bool = False) -> dict:
     """Fetch a transaction + receipt and decode its token movements.
 
     Returns from/to/selector/status/gas plus the decoded event list (ERC20 Transfer, UniV2
@@ -616,6 +616,11 @@ async def get_tx(chain_id: int, tx_hash: str) -> dict:
         return {"chain_id": chain_id, "tx_hash": tx_hash, "error": "transaction not found"}
     logs = (receipt or {}).get("logs", []) or []
     events = _decode_events(logs)
+    # Bounded output: a loop-heavy tx can emit thousands of events. net_flows (the useful
+    # distillation) is ALWAYS computed from the full list, but the raw event list is capped — or
+    # dropped entirely with net_flows_only — so the result stays agent-readable, not a firehose.
+    event_cap = 500
+    shown_events = [] if net_flows_only else events[:event_cap]
     inp = tx.get("input") or "0x"
     status_raw = (receipt or {}).get("status")
     to = tx.get("to")
@@ -633,10 +638,14 @@ async def get_tx(chain_id: int, tx_hash: str) -> dict:
             _int(receipt.get("effectiveGasPrice")) if receipt and receipt.get("effectiveGasPrice") is not None else None
         ),
         "event_count": len(events),
-        "events": events,
+        "events": shown_events,
         "net_flows": _net_flows(events),
         "rpc_url": redact_rpc_url(url),
     }
+    if net_flows_only and events:
+        out["events_omitted"] = len(events)
+    elif len(shown_events) < len(events):
+        out["events_truncated"] = len(events) - len(shown_events)
     try:  # best-effort enrichment: symbol/decimals, human amounts, victim/beneficiary, labels
         async with async_client() as client:
             await _enrich_get_tx(client, urls, chain_id, out)
@@ -668,6 +677,7 @@ async def asset_transfers(
     from_block: Any = 0,
     to_block: Any = "latest",
     max_pages: int = 20,
+    top: int = 100,
 ) -> dict:
     """Trace an address's value flow via ``alchemy_getAssetTransfers`` (pageKey-paginated).
 
@@ -762,6 +772,14 @@ async def asset_transfers(
         for a, c in counterparties.items()
     ]
     cps.sort(key=lambda x: (-x["count"], x["address"]))
+    # Bounded output: a pool/hub can have tens of thousands of counterparties. Keep the summary
+    # fields (count / distinct / first_funder / likely_service_hub) exact, but cap the per-counterparty
+    # LIST to the top-N by count so the result never overflows the caller — flag how many were dropped.
+    total_cps = len(cps)
+    counterparties_omitted = 0
+    if top and top > 0 and total_cps > top:
+        counterparties_omitted = total_cps - top
+        cps = cps[:top]
     # earliest-seen counterparty = the FIRST funder (attribution start point)
     first_funder = None
     if transfers:
@@ -776,15 +794,17 @@ async def asset_transfers(
         "direction": direction,
         "category": category,
         "count": len(transfers),
-        "distinct_counterparties": len(cps),
+        "distinct_counterparties": total_cps,
         "first_funder": first_funder,
         "counterparties": cps,
         "earliest_block": earliest,
         "rpc_url": redact_rpc_url(url),
     }
+    if counterparties_omitted:
+        out["counterparties_omitted"] = counterparties_omitted
     # Cheap hub heuristic: an address with many distinct counterparties is likely a service/hub
     # (exchange/router/bridge), not a private wallet — flag it so it isn't read as the attacker.
-    if len(cps) >= _hub_threshold():
+    if total_cps >= _hub_threshold():
         out["likely_service_hub"] = True
     if truncated:
         out["truncated"] = True
@@ -809,6 +829,24 @@ async def _first_log_tx_at(
         return None
     logs.sort(key=lambda lg: _int(lg.get("logIndex")))
     return logs[0].get("transactionHash")
+
+
+async def _creation_tx_in_block(
+    client: httpx.AsyncClient, urls: Sequence[str], checks: str, block: int, *, start: int = 0
+) -> str | None:
+    """Fallback when the contract emitted NO log at deploy (any non-token contract): scan the deploy
+    block's direct-CREATE txs (``to == null``) for the one whose receipt.contractAddress == target."""
+    blk = await _rpc_rotating(client, urls, "eth_getBlockByNumber", [hex(block), True], start=start) or {}
+    target = checks.lower()
+    creates = [t for t in (blk.get("transactions") or []) if isinstance(t, dict) and not t.get("to")]
+    for i, t in enumerate(creates):
+        h = t.get("hash")
+        if not h:
+            continue
+        rc = await _rpc_rotating(client, urls, "eth_getTransactionReceipt", [h], start=start + i)
+        if rc and (rc.get("contractAddress") or "").lower() == target:
+            return h
+    return None
 
 
 async def deployer(chain_id: int, address: str) -> dict:
@@ -848,6 +886,8 @@ async def deployer(chain_id: int, address: str) -> dict:
                     lo = mid + 1
             out["deploy_block"] = lo
             creation = await _first_log_tx_at(client, urls, checks, lo, start=base_rr)
+            if not creation:  # non-token contracts emit no log at deploy — scan the block's CREATE txs
+                creation = await _creation_tx_in_block(client, urls, checks, lo, start=base_rr)
             tx = (
                 await _rpc_rotating(client, urls, "eth_getTransactionByHash", [creation], start=base_rr)
                 if creation
@@ -869,7 +909,82 @@ async def deployer(chain_id: int, address: str) -> dict:
         out["deployer_label"] = scryer_labels.label_for(frm)  # e.g. a CEX-funded deployer
         out["factory_label"] = scryer_labels.label_for(to_l)
     else:
-        out["note"] = "deploy block located, but no mint/log at that block to reverse the creation tx from"
+        out["note"] = (
+            "deploy block located, but could not reverse the creation tx — no deploy-block log and no "
+            "matching direct-CREATE tx (likely a factory / internal CREATE)"
+        )
+    return out
+
+
+def _rlp_create_address(sender: str, nonce: int) -> str:
+    """The CREATE address for (sender EOA, nonce): keccak256(rlp([sender_bytes, nonce]))[12:].
+
+    Lets us enumerate what an EOA deployed without an explorer — the contract at nonce ``n`` exists
+    on-chain iff ``eth_getCode`` of this address is non-empty.
+    """
+    sb = bytes.fromhex(sender[2:] if sender.startswith("0x") else sender)
+    if nonce == 0:
+        enc_nonce = bytes([0x80])  # RLP of the empty byte string
+    else:
+        nb = nonce.to_bytes((nonce.bit_length() + 7) // 8, "big")
+        enc_nonce = nb if (len(nb) == 1 and nb[0] < 0x80) else bytes([0x80 + len(nb)]) + nb
+    payload = bytes([0x94]) + sb + enc_nonce  # 0x94 = 0x80+20 (20-byte address string)
+    rlp = bytes([0xC0 + len(payload)]) + payload  # payload is always < 56 bytes (21 + <=9)
+    return "0x" + Web3.keccak(rlp)[12:].hex()
+
+
+async def deployed_by(chain_id: int, address: str, *, max_nonce: int = 500) -> dict:
+    """Enumerate the contracts an EOA deployed, via CREATE-address derivation + ``eth_getCode``.
+
+    For nonce ``0..N-1`` compute ``keccak256(rlp([eoa, nonce]))[12:]`` and ``eth_getCode`` each; every
+    one with code is a contract the EOA created (a plain call leaves no code at that address). This is
+    deterministic and needs no Etherscan (``getcontractcreation`` is paywalled on BSC) — the
+    repeat-offender / operator-footprint primitive: "did this attacker deploy OTHER attack contracts".
+    Code is read at head, so no archive RPC is required; the EOA's current nonce bounds the scan.
+    """
+    url = _rpc_url(chain_id)
+    if not url:
+        return {
+            "chain_id": chain_id,
+            "address": address.lower(),
+            "error": f"no native RPC configured for chain {chain_id}",
+        }
+    urls = _rpc_urls(chain_id)
+    base_rr = next(_rr_counter)
+    checks = Web3.to_checksum_address(address)
+    out: dict = {"chain_id": chain_id, "address": address.lower(), "rpc_url": redact_rpc_url(url)}
+    async with async_client() as client:
+        try:
+            nonce = _int(
+                await _rpc_rotating(client, urls, "eth_getTransactionCount", [checks, "latest"], start=base_rr)
+            )
+            scan = min(nonce, max(0, max_nonce))
+            sem = asyncio.Semaphore(10)  # bounded concurrency — never unbounded (AGENTS.md)
+
+            async def _code_at(n: int) -> tuple[int, str, str]:
+                addr = _rlp_create_address(checks, n)
+                async with sem:
+                    code = await _rpc_rotating(client, urls, "eth_getCode", [addr, "latest"], start=base_rr + n)
+                return n, addr, (code or "0x")
+
+            results = await asyncio.gather(*[_code_at(n) for n in range(scan)])
+        except RateLimited as e:
+            return _rl_out(out, e)
+        except Exception as e:  # noqa: BLE001
+            out["error"] = f"{type(e).__name__}: {e}"
+            return out
+    # gather() preserves awaitable order, so results (and thus `deployed`) are already in ascending
+    # nonce order — no re-sort needed.
+    deployed = [
+        {"nonce": n, "address": a.lower(), "code_size": len(c) // 2 - 1} for n, a, c in results if c and c != "0x"
+    ]
+    out["nonce"] = nonce
+    out["scanned_nonces"] = scan
+    out["deployed_count"] = len(deployed)
+    out["deployed"] = deployed
+    if nonce > scan:
+        out["truncated"] = True
+        out["note"] = f"scanned the first {scan} of {nonce} nonces; raise max_nonce for the rest."
     return out
 
 
