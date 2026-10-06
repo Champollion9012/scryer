@@ -46,8 +46,10 @@ _FORBIDDEN = [
     # The real in-test escape is vm.ffi (arbitrary host shell) — block it first. Whitespace is
     # allowed around the `.` because Solidity is not whitespace-sensitive (`vm . ffi(` is valid).
     (r"\bvm\s*\.\s*ffi\s*\(", "vm.ffi (arbitrary host-shell execution — never allowed)"),
-    (r"\bvm\s*\.\s*(?:writeFile|writeLine|readFile|removeFile|createDir|closeFile)\s*\(",
-     "vm filesystem cheatcode (host FS access — not needed for a fork test)"),
+    (
+        r"\bvm\s*\.\s*(?:writeFile|writeLine|readFile|removeFile|createDir|closeFile)\s*\(",
+        "vm filesystem cheatcode (host FS access — not needed for a fork test)",
+    ),
     (r"\bvm\s*\.\s*(?:setEnv)\s*\(", "vm.setEnv (mutates host env)"),
     (r"\bvm\s*\.\s*(?:start)?[Bb]roadcast\b", "vm.broadcast/startBroadcast (real-tx cheatcode — use a pure fork test)"),
     (r"--broadcast\b", "--broadcast flag"),
@@ -136,13 +138,7 @@ def _ensure_sandbox(timeout: int = 180) -> tuple[str | None, str | None]:
 # The sandbox's compiler/test config. ffi disabled and NO fs_permissions / rpc_endpoints: a fork
 # test needs none of them, so this removes every host-side side-effect channel from `forge test`.
 _HARDENED_TOML = (
-    "[profile.default]\n"
-    "src = 'src'\n"
-    "out = 'out'\n"
-    "libs = ['lib']\n"
-    "test = 'test'\n"
-    "ffi = false\n"
-    "fs_permissions = []\n"
+    "[profile.default]\nsrc = 'src'\nout = 'out'\nlibs = ['lib']\ntest = 'test'\nffi = false\nfs_permissions = []\n"
 )
 
 
@@ -257,9 +253,7 @@ def main() -> int:
     if not Path(args.test).is_file():
         print(json.dumps({"status": "error", "reason": f"no such test file: {args.test}"}))
         return 1
-    result = run_fork_poc(
-        args.test, args.chain, fork_block=args.fork_block, rpc=args.rpc, timeout=args.timeout
-    )
+    result = run_fork_poc(args.test, args.chain, fork_block=args.fork_block, rpc=args.rpc, timeout=args.timeout)
     print(json.dumps(result, indent=2))
     return 0 if result.get("confirmed") else 1
 

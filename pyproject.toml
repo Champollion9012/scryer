@@ -30,6 +30,7 @@ dependencies = [
     "eth-abi>=5.1",
     "python-dotenv>=1.0",
     "flask>=3.0",
+    "mcp>=1.2",
 ]
 
 [project.optional-dependencies]

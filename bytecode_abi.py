@@ -281,7 +281,10 @@ def params_of(signature: str) -> str | None:
 
 
 def resolve_signatures(
-    selectors: list[str], *, tally: RateLimitTally | None = None, use_fourbyte: bool = True,
+    selectors: list[str],
+    *,
+    tally: RateLimitTally | None = None,
+    use_fourbyte: bool = True,
     throttled: set[str] | None = None,
 ) -> dict[str, list[str]]:
     """Map selector -> ALL candidate signature strings (best-ranked first).
@@ -366,9 +369,7 @@ def resolve_signatures(
 # --------------------------------------------------------------------------- #
 # Orchestrator: fetch code -> analyze -> resolve
 # --------------------------------------------------------------------------- #
-def analyze_contract(
-    chain_id: int, address: str, block: object = "latest", *, resolve: bool = True
-) -> dict:
+def analyze_contract(chain_id: int, address: str, block: object = "latest", *, resolve: bool = True) -> dict:
     """Recover the callable surface + shape of a (possibly unverified) contract."""
     from etherscan_proxy_provider import make_web3
     from onchain_state import _parse_block

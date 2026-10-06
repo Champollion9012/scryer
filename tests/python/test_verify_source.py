@@ -51,35 +51,51 @@ def test_verify_no_target_compile_all_recovers_match(tmp_path: Path, monkeypatch
     monkeypatch.setattr(vs, "fetch_runtime_bytecode", lambda rpc, addr: "6080deadbeef")  # == Bar
 
     r = vs._verify_contract_uncached(
-        chain_id=1, address_lower="0x" + "11" * 20, meta_bytes=_no_target_meta("Bar"),
-        sources_dir=tmp_path, rpc_url="http://x", solc_path=Path("solc"),
+        chain_id=1,
+        address_lower="0x" + "11" * 20,
+        meta_bytes=_no_target_meta("Bar"),
+        sources_dir=tmp_path,
+        rpc_url="http://x",
+        solc_path=Path("solc"),
     )
     assert r.verdict == "full_match"
     assert any("Bar" in n and "recovered" in n for n in r.notes)
 
 
-def test_verify_no_target_recovers_by_bytecode_even_if_hint_absent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_verify_no_target_recovers_by_bytecode_even_if_hint_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     foo = vs.CompiledArtifact(bytecode_hex="60800bad", immutable_ranges=[])
     bar = vs.CompiledArtifact(bytecode_hex="6080deadbeef", immutable_ranges=[])
     monkeypatch.setattr(vs, "compile_all_runtime_bytecode", lambda *a, **k: {"Flat.sol:Foo": foo, "Flat.sol:Bar": bar})
     monkeypatch.setattr(vs, "fetch_runtime_bytecode", lambda rpc, addr: "60800bad")  # == Foo (not the hint "Bar")
 
     r = vs._verify_contract_uncached(
-        chain_id=1, address_lower="0x" + "11" * 20, meta_bytes=_no_target_meta("Bar"),
-        sources_dir=tmp_path, rpc_url="http://x", solc_path=Path("solc"),
+        chain_id=1,
+        address_lower="0x" + "11" * 20,
+        meta_bytes=_no_target_meta("Bar"),
+        sources_dir=tmp_path,
+        rpc_url="http://x",
+        solc_path=Path("solc"),
     )
     assert r.verdict == "full_match" and any("Foo" in n for n in r.notes)  # matched by bytecode, not the hint
 
 
-def test_verify_no_target_none_match_is_indeterminate_not_mismatch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_verify_no_target_none_match_is_indeterminate_not_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     foo = vs.CompiledArtifact(bytecode_hex="60800bad", immutable_ranges=[])
     bar = vs.CompiledArtifact(bytecode_hex="6080deadbeef", immutable_ranges=[])
     monkeypatch.setattr(vs, "compile_all_runtime_bytecode", lambda *a, **k: {"Flat.sol:Foo": foo, "Flat.sol:Bar": bar})
     monkeypatch.setattr(vs, "fetch_runtime_bytecode", lambda rpc, addr: "6080ffffffff")  # matches neither
 
     r = vs._verify_contract_uncached(
-        chain_id=1, address_lower="0x" + "11" * 20, meta_bytes=_no_target_meta(),
-        sources_dir=tmp_path, rpc_url="http://x", solc_path=Path("solc"),
+        chain_id=1,
+        address_lower="0x" + "11" * 20,
+        meta_bytes=_no_target_meta(),
+        sources_dir=tmp_path,
+        rpc_url="http://x",
+        solc_path=Path("solc"),
     )
     assert r.verdict == "indeterminate"  # NOT mismatch — we were guessing the target
     assert any("none matched" in n for n in r.notes)

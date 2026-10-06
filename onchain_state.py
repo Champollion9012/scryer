@@ -239,7 +239,13 @@ def get_state(chain_id: int, address: str, block: object = "latest") -> dict:
     blk, berr = _parse_block(block)
     if berr:
         return {"chain_id": chain_id, "address": address.lower(), "error": berr}
-    out: dict = {"chain_id": chain_id, "address": address.lower(), "rpc_url": redact_rpc_url(url), "block": blk, "state": {}}
+    out: dict = {
+        "chain_id": chain_id,
+        "address": address.lower(),
+        "rpc_url": redact_rpc_url(url),
+        "block": blk,
+        "state": {},
+    }
     tally = RateLimitTally()
     try:
         _code = w3.eth.get_code(Web3.to_checksum_address(address), block_identifier=blk)
@@ -581,8 +587,10 @@ def _lp_price_usd(
     if p_usd is not None:
         candidates.append((depth_usd, p_usd, "lp:token/usd"))  # USD depth ~ quote reserve in USD
 
-    weth_usd, _wd = (1.0, 0.0) if weth_addr == usd_addr else _price_via_pair(
-        w3, cfg, weth_addr, weth_dec, usd_addr, usd_dec, block, tally
+    weth_usd, _wd = (
+        (1.0, 0.0)
+        if weth_addr == usd_addr
+        else _price_via_pair(w3, cfg, weth_addr, weth_dec, usd_addr, usd_dec, block, tally)
     )
     if token == weth_addr:
         return (weth_usd, "lp:weth/usd") if weth_usd is not None else (None, None)

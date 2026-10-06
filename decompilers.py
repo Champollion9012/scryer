@@ -98,11 +98,15 @@ def decompile_with_heimdall_detailed(bytecode: str, timeout: int = 180) -> dict:
             # hard-coded "C:" would mis-map a temp file on any other drive to a bogus path.
             p = str(Path(temp_path).resolve())
             target = (f"/mnt/{p[0].lower()}{p[2:]}" if len(p) >= 2 and p[1] == ":" else p).replace("\\", "/")
-            cmd = ["wsl.exe", "--", "bash", "-lc",
-                   f"{HEIMDALL_PATH} decompile {shlex.quote(target)} --output print --include-sol"]
+            cmd = [
+                "wsl.exe",
+                "--",
+                "bash",
+                "-lc",
+                f"{HEIMDALL_PATH} decompile {shlex.quote(target)} --output print --include-sol",
+            ]
         else:
-            cmd = ["bash", "-lc",
-                   f"{HEIMDALL_PATH} decompile {shlex.quote(temp_path)} --output print --include-sol"]
+            cmd = ["bash", "-lc", f"{HEIMDALL_PATH} decompile {shlex.quote(temp_path)} --output print --include-sol"]
 
         result = subprocess.run(
             cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout

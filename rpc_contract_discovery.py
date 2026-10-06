@@ -19,7 +19,6 @@ import httpx
 
 import scryer_config
 import scryer_http
-from scryer_http import RateLimited, rate_limit_reason, rpc_rate_limit_reason, retry_after_seconds
 from contract_crawler import (
     CHAINS,
     AsyncRateLimiter,
@@ -31,6 +30,7 @@ from contract_crawler import (
 )
 from contract_registry import ContractRegistry
 from decompilers import decompile_bytecode
+from scryer_http import RateLimited, rate_limit_reason, retry_after_seconds, rpc_rate_limit_reason
 from scryer_logging import get_logger
 
 scryer_config.load()
@@ -189,7 +189,9 @@ class BlockScanner:
                         # path (the socks branches below both `continue`, so this must come first)
                         # so callers don't read the resulting None as "empty block" and record the
                         # range as scanned, silently dropping the throttled blocks' contracts.
-                        raise RateLimited(provider=f"rpc:{url}", retry_after=retry_after_seconds(resp), detail="HTTP 429")
+                        raise RateLimited(
+                            provider=f"rpc:{url}", retry_after=retry_after_seconds(resp), detail="HTTP 429"
+                        )
 
                     if socks_proxy:
                         if not using_proxy:
@@ -368,7 +370,6 @@ class BlockScanner:
                     raise
                 except Exception:
                     # Error is already logged in _make_request usually, but catch top level here
-                    # print(f"  Error scanning block {block_num}: {e}")
                     blocks_processed += 1
                     return []
 
@@ -403,7 +404,9 @@ class BlockScanner:
         if reason:
             # Don't let a throttle collapse to '0x'/'' (which reads as an EOA / no-code and
             # drives decompile+register of a throttled contract).
-            raise RateLimited(provider=f"rpc:{self.get_rpc_url()}", retry_after=retry_after_seconds(resp), detail=reason)
+            raise RateLimited(
+                provider=f"rpc:{self.get_rpc_url()}", retry_after=retry_after_seconds(resp), detail=reason
+            )
         body = resp.json()
         err = body.get("error")
         if err is not None:
@@ -551,7 +554,9 @@ class ContractDiscovery:
                 # scanning and leave the range for a later run.
                 _log.warning(
                     "  RPC rate-limited scanning %s-%s (%s); leaving range unscanned for a later run",
-                    f"{range_from:,}", f"{range_to:,}", e.reason,
+                    f"{range_from:,}",
+                    f"{range_to:,}",
+                    e.reason,
                 )
                 self.stats["rate_limited"] += 1
                 break

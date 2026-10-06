@@ -25,6 +25,7 @@ Caveats:
 from __future__ import annotations
 
 import atexit
+import contextlib
 import itertools
 import threading
 import time
@@ -215,10 +216,8 @@ def make_web3(chain_id: int, rpc_url: str = "") -> tuple[Web3, str]:
         provider = EtherscanProxyProvider(chain_id, key)
         label = f"etherscan-v2-proxy:{chain_id}"
     w3 = Web3(provider)
-    try:
+    with contextlib.suppress(Exception):
         w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
-    except Exception:
-        pass
     return w3, label
 
 

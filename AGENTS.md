@@ -6,11 +6,13 @@ Conventions for AI coding agents (and humans) working on Scryer.
 
 Flat module layout at the repo root — **do not** restructure into a `scryer/` package without a coordinated migration; many CLI scripts import siblings directly (`from contract_registry import …`).
 
-Reusable infrastructure modules are prefixed `scryer_`:
+Infrastructure and server modules are prefixed `scryer_`:
 
 - `scryer_config` — env / dotenv loading, single source of truth for runtime settings.
 - `scryer_logging` — structured logger; preferred over `print()` in new code.
 - `scryer_http` — shared `httpx` client factory (timeouts, retries, SOCKS proxy fallback).
+- `scryer_mcp` — MCP server exposing fetch / verify / on-chain-state / forensics as tools for a connecting AI agent (the primary interface).
+- `scryer_chain` — multi-chain JSON-RPC forensics layer (logs, tx, asset transfers, reserves history) behind the MCP.
 
 Domain modules (no prefix) are the user-visible CLI entry points:
 
@@ -22,12 +24,8 @@ Domain modules (no prefix) are the user-visible CLI entry points:
 | `contract_registry` | SQLite registry indexed by source hash. |
 | `data_sources` | Blockscout / on-chain / BigQuery integrations. |
 | `decompilers` | Heimdall (via WSL on Windows) + Panoramix fallback. |
-| `bounty_pipeline` | Download + audit driver for a JSON target list. |
-| `audit_contracts` | LLM audit pipeline with map-reduce for large codebases. |
-| `llm_providers` | OpenAI / Claude / Gemini abstraction. |
 | `scanners` | Regex (SWC-aligned) + Slither vulnerability scanner. |
 | `similarity` / `similarity_cli` | GraphCodeBERT + ChromaDB clone search. |
-| `report_renderer` | Markdown / HTML report rendering. |
 | `cache` | Generic on-disk cache helper. |
 | `web` | Flask read-only dashboard over the registry. |
 

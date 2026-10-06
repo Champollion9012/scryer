@@ -17,8 +17,8 @@ from pathlib import Path
 import httpx
 
 import scryer_http
-from scryer_http import RateLimited, rate_limit_reason, retry_after_seconds
 from contract_registry import ContractRegistry
+from scryer_http import RateLimited, rate_limit_reason, retry_after_seconds
 from scryer_logging import get_logger
 
 _log = get_logger(__name__)
@@ -432,7 +432,11 @@ class ContractCrawler:
         except RateLimited as e:
             # Listing was throttled -> the set is incomplete. Skip this chain for THIS run (don't
             # crawl a truncated list as if complete); a later run resumes. Not a poison, a deferral.
-            _log.warning("  Sourcify listing rate-limited for %s (%s); skipping chain this run, retry later", chain.name, e.reason)
+            _log.warning(
+                "  Sourcify listing rate-limited for %s (%s); skipping chain this run, retry later",
+                chain.name,
+                e.reason,
+            )
             self.stats["rate_limited"] = self.stats.get("rate_limited", 0) + 1
             return 0
         _log.info("Found %d verified contracts on Sourcify", len(addresses))

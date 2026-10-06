@@ -22,7 +22,9 @@ from scryer_http import RateLimited, RateLimitTally
 
 
 class _Resp:
-    def __init__(self, *, status_code: int = 200, text: str = "", headers: dict | None = None, body: dict | None = None):
+    def __init__(
+        self, *, status_code: int = 200, text: str = "", headers: dict | None = None, body: dict | None = None
+    ):
         self.status_code = status_code
         self.text = text if text or body is None else json.dumps(body)
         self.headers = headers or {}
@@ -201,7 +203,11 @@ def test_fetch_bytecode_http_429_raises_ratelimited(monkeypatch: pytest.MonkeyPa
 def test_fetch_bytecode_jsonrpc_capacity_body_raises_ratelimited(monkeypatch: pytest.MonkeyPatch) -> None:
     # HTTP 200 + a JSON-RPC rate-limit error member (result is absent) — the dangerous
     # path that used to return '' and become a confident "EOA/selfdestructed" verdict.
-    body = {"jsonrpc": "2.0", "id": 1, "error": {"code": -32005, "message": "exceeded compute units per second capacity"}}
+    body = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "error": {"code": -32005, "message": "exceeded compute units per second capacity"},
+    }
     _patch_client(monkeypatch, _Resp(status_code=200, body=body))
     with pytest.raises(RateLimited):
         vs.fetch_runtime_bytecode("http://rpc", "0x0000000000000000000000000000000000000001")

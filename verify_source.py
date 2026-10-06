@@ -720,7 +720,8 @@ def _verify_contract_uncached(
         )
     if not sources:
         return _result(
-            "indeterminate", ["no source files found (neither inline nor on disk) — verification skipped, not a mismatch"]
+            "indeterminate",
+            ["no source files found (neither inline nor on disk) — verification skipped, not a mismatch"],
         )
 
     if solc_path is None:
@@ -773,7 +774,9 @@ def _verify_contract_uncached(
     except Exception as e:
         return _result("indeterminate", [f"compile failed: {e} — verification could not complete, not a mismatch"])
     if not candidates:
-        return _result("indeterminate", ["no contracts produced deployable bytecode — verification skipped, not a mismatch"])
+        return _result(
+            "indeterminate", ["no contracts produced deployable bytecode — verification skipped, not a mismatch"]
+        )
 
     # Try the metadata-named contract first; prefer a full match, remember the best partial.
     ordered = sorted(candidates.items(), key=lambda kv: 0 if kv[0].rsplit(":", 1)[-1] == contract_hint else 1)

@@ -680,7 +680,9 @@ def run_once(config: Config) -> dict[int, TickStats]:
         if stats.rate_limited:
             _log.warning(
                 "[chain %d] RATE-LIMITED: %s (retry_after=%s) — cursor held, range retried next tick",
-                chain_id, stats.error, stats.retry_after,
+                chain_id,
+                stats.error,
+                stats.retry_after,
             )
         elif stats.error:
             _log.warning("[chain %d] error: %s", chain_id, stats.error)

@@ -71,35 +71,67 @@ def _err(e: Exception) -> dict:
 
 # One chain convention for every tool: alias OR numeric id, default BSC.
 _CHAIN_ALIASES = {
-    "eth": 1, "ethereum": 1, "mainnet": 1,
-    "bsc": 56, "bnb": 56, "binance": 56,
-    "polygon": 137, "matic": 137, "pol": 137,
-    "arb": 42161, "arbitrum": 42161,
-    "op": 10, "optimism": 10,
+    "eth": 1,
+    "ethereum": 1,
+    "mainnet": 1,
+    "bsc": 56,
+    "bnb": 56,
+    "binance": 56,
+    "polygon": 137,
+    "matic": 137,
+    "pol": 137,
+    "arb": 42161,
+    "arbitrum": 42161,
+    "op": 10,
+    "optimism": 10,
     "base": 8453,
-    "avax": 43114, "avalanche": 43114,
-    "ftm": 250, "fantom": 250,
+    "avax": 43114,
+    "avalanche": 43114,
+    "ftm": 250,
+    "fantom": 250,
     "linea": 59144,
     "scroll": 534352,
     "blast": 81457,
-    "mantle": 5000, "mnt": 5000,
-    "gnosis": 100, "xdai": 100,
-    "zksync": 324, "era": 324,
-    "zkevm": 1101, "polygonzkevm": 1101, "polygon_zkevm": 1101,
+    "mantle": 5000,
+    "mnt": 5000,
+    "gnosis": 100,
+    "xdai": 100,
+    "zksync": 324,
+    "era": 324,
+    "zkevm": 1101,
+    "polygonzkevm": 1101,
+    "polygon_zkevm": 1101,
     "opbnb": 204,
     "celo": 42220,
-    "cronos": 25, "cro": 25,
-    "moonbeam": 1284, "glmr": 1284,
+    "cronos": 25,
+    "cro": 25,
+    "moonbeam": 1284,
+    "glmr": 1284,
     "metis": 1088,
 }
 
 # Display names for the supported chains (surfaced by health so callers know what's queryable).
 _CHAIN_NAMES = {
-    1: "Ethereum", 10: "Optimism", 56: "BSC", 137: "Polygon", 250: "Fantom",
-    8453: "Base", 42161: "Arbitrum", 43114: "Avalanche",
-    59144: "Linea", 534352: "Scroll", 81457: "Blast", 5000: "Mantle", 100: "Gnosis",
-    324: "zkSync Era", 1101: "Polygon zkEVM", 204: "opBNB", 42220: "Celo", 25: "Cronos",
-    1284: "Moonbeam", 1088: "Metis",
+    1: "Ethereum",
+    10: "Optimism",
+    56: "BSC",
+    137: "Polygon",
+    250: "Fantom",
+    8453: "Base",
+    42161: "Arbitrum",
+    43114: "Avalanche",
+    59144: "Linea",
+    534352: "Scroll",
+    81457: "Blast",
+    5000: "Mantle",
+    100: "Gnosis",
+    324: "zkSync Era",
+    1101: "Polygon zkEVM",
+    204: "opBNB",
+    42220: "Celo",
+    25: "Cronos",
+    1284: "Moonbeam",
+    1088: "Metis",
 }
 
 
@@ -191,7 +223,9 @@ def health() -> dict:
     # endpoints on every health call). Best-effort + concurrent; a down/missing node maps to null.
     chain_heads: dict[int, int | None] = {}
     try:
-        configured = [cid for cid in _CHAIN_NAMES if any(scryer_config.get(n) for n in scryer_config.rpc_env_names(cid))]
+        configured = [
+            cid for cid in _CHAIN_NAMES if any(scryer_config.get(n) for n in scryer_config.rpc_env_names(cid))
+        ]
         if configured:
             chain_heads = cm.run(cm.chain_heads(configured))
     except Exception:
@@ -316,7 +350,9 @@ def _proxy_block(chain_id: int, meta_path: str | None, requested: bool) -> dict:
         # found:true for a proxy whose implementation is only decompiler output (invented names).
         impl_pseudo = bool(impl_meta and (impl_meta.get("decompiled") or impl_meta.get("bytecode_only")))
         verified_impl_files = impl_files and not impl_pseudo
-        block["implementation_files"] = [{"path": str(f), "name": f.name, "bytes": f.stat().st_size} for f in impl_files]
+        block["implementation_files"] = [
+            {"path": str(f), "name": f.name, "bytes": f.stat().st_size} for f in impl_files
+        ]
         block["implementation_source_fetched"] = bool(verified_impl_files)
         block["implementation_pseudo_source"] = impl_pseudo
         block["implementation_source_hash"] = (
@@ -360,7 +396,9 @@ def _register_from_disk(chain_id: int, address: str) -> str | None:
 
 
 @mcp.tool()
-def download_contract(address: str, chain: str = "", chain_id: int = 0, follow_proxy: bool = True, refresh: bool = False) -> dict:
+def download_contract(
+    address: str, chain: str = "", chain_id: int = 0, follow_proxy: bool = True, refresh: bool = False
+) -> dict:
     """Fetch verified source for a contract (Sourcify -> Blockscout -> explorer -> IPFS metadata).
 
     chain/chain_id: pass either (alias like "bsc" or the int; default BSC). Resolves
@@ -447,7 +485,9 @@ def download_contract(address: str, chain: str = "", chain_id: int = 0, follow_p
             # rate_limited/retry_after, which would wrongly tell the agent to retry a success.
             # (Proxy-resolution throttles are signalled separately via out["proxy"]["rate_limited"].)
             out["warnings"] = list(tally.reasons)
-            out.setdefault("note", "Source obtained (complete); an earlier provider was throttled - see warnings, no retry needed.")
+            out.setdefault(
+                "note", "Source obtained (complete); an earlier provider was throttled - see warnings, no retry needed."
+            )
         return out
     except Exception as e:
         return _err(e)
@@ -513,8 +553,15 @@ def get_state(address: str, chain: str = "", chain_id: int = 0, block: str = "la
 
 
 @mcp.tool()
-def call_view(address: str, signature: str, args: list | None = None, returns: str = "",
-              chain: str = "", chain_id: int = 0, block: str = "latest") -> dict:
+def call_view(
+    address: str,
+    signature: str,
+    args: list | None = None,
+    returns: str = "",
+    chain: str = "",
+    chain_id: int = 0,
+    block: str = "latest",
+) -> dict:
     """Call any view/pure function and decode the return - no manual slot math.
 
     signature: e.g. "token0()", "getReserves()", "balanceOf(address)".
@@ -530,7 +577,9 @@ def call_view(address: str, signature: str, args: list | None = None, returns: s
 
 
 @mcp.tool()
-def read_storage(address: str, slot: str, chain: str = "", chain_id: int = 0, decode_as: str = "", block: str = "latest") -> dict:
+def read_storage(
+    address: str, slot: str, chain: str = "", chain_id: int = 0, decode_as: str = "", block: str = "latest"
+) -> dict:
     """Read a raw storage slot (eth_getStorageAt) and decode it.
 
     For values no getter exposes: custom/legacy proxy slots, packed flags, a role
@@ -579,8 +628,15 @@ def price_token(token: str, chain: str = "", chain_id: int = 0, block: str = "la
 # Chain activity: transactions, logs, fund flow, deployer (native RPC only)
 # --------------------------------------------------------------------------- #
 @mcp.tool()
-async def get_logs(address: str = "", topics: list[str] | None = None, from_block: str = "0",
-                   to_block: str = "latest", chain: str = "", chain_id: int = 0, chunk: int = 0) -> dict:
+async def get_logs(
+    address: str = "",
+    topics: list[str] | None = None,
+    from_block: str = "0",
+    to_block: str = "latest",
+    chain: str = "",
+    chain_id: int = 0,
+    chunk: int = 0,
+) -> dict:
     """eth_getLogs over ANY block range — auto-chunked past the provider's max-range cap.
 
     No manual chunking: the range is split into windows (default 10 blocks, the Alchemy free-tier
@@ -594,8 +650,12 @@ async def get_logs(address: str = "", topics: list[str] | None = None, from_bloc
     """
     try:
         return await cm.get_logs(
-            _resolve_chain(chain, chain_id), address, topics=topics,
-            from_block=from_block, to_block=to_block, chunk=(chunk or None),
+            _resolve_chain(chain, chain_id),
+            address,
+            topics=topics,
+            from_block=from_block,
+            to_block=to_block,
+            chunk=(chunk or None),
         )
     except Exception as e:
         return _err(e)
@@ -621,9 +681,17 @@ async def get_tx(tx_hash: str, chain: str = "", chain_id: int = 0, net_flows_onl
 
 
 @mcp.tool()
-async def asset_transfers(address: str, direction: str = "in", category: list[str] | None = None,
-                          from_block: str = "0", to_block: str = "latest",
-                          chain: str = "", chain_id: int = 0, max_pages: int = 20, top: int = 100) -> dict:
+async def asset_transfers(
+    address: str,
+    direction: str = "in",
+    category: list[str] | None = None,
+    from_block: str = "0",
+    to_block: str = "latest",
+    chain: str = "",
+    chain_id: int = 0,
+    max_pages: int = 20,
+    top: int = 100,
+) -> dict:
     """Trace an address's fund flow (who funded it / where value went) via Alchemy asset transfers.
 
     `direction`: "in" (received — the "who funded X" primitive), "out" (sent), or "both".
@@ -639,8 +707,14 @@ async def asset_transfers(address: str, direction: str = "in", category: list[st
     """
     try:
         return await cm.asset_transfers(
-            _resolve_chain(chain, chain_id), address, direction=direction, category=category,
-            from_block=from_block, to_block=to_block, max_pages=max_pages, top=top,
+            _resolve_chain(chain, chain_id),
+            address,
+            direction=direction,
+            category=category,
+            from_block=from_block,
+            to_block=to_block,
+            max_pages=max_pages,
+            top=top,
         )
     except Exception as e:
         return _err(e)
@@ -681,8 +755,15 @@ async def deployed_by(address: str, chain: str = "", chain_id: int = 0, max_nonc
 
 
 @mcp.tool()
-async def call_view_many(address: str, signatures: list[str], args: list | None = None, returns: str = "",
-                         blocks: list | None = None, chain: str = "", chain_id: int = 0) -> dict:
+async def call_view_many(
+    address: str,
+    signatures: list[str],
+    args: list | None = None,
+    returns: str = "",
+    blocks: list | None = None,
+    chain: str = "",
+    chain_id: int = 0,
+) -> dict:
     """Batch view calls: one/many signatures across one/many blocks, run concurrently.
 
     The fast path for the forensic reads call_view does one at a time — e.g. getReserves() across
@@ -694,16 +775,21 @@ async def call_view_many(address: str, signatures: list[str], args: list | None 
     """
     try:
         return await cm.call_view_many(
-            _resolve_chain(chain, chain_id), address, signatures,
-            args=args, returns=returns, blocks=blocks,
+            _resolve_chain(chain, chain_id),
+            address,
+            signatures,
+            args=args,
+            returns=returns,
+            blocks=blocks,
         )
     except Exception as e:
         return _err(e)
 
 
 @mcp.tool()
-async def reserves_history(pair: str, from_block: str = "0", to_block: str = "latest",
-                           points: int = 50, chain: str = "", chain_id: int = 0) -> dict:
+async def reserves_history(
+    pair: str, from_block: str = "0", to_block: str = "latest", points: int = 50, chain: str = "", chain_id: int = 0
+) -> dict:
     """Reserve trajectory of a UniswapV2-style pair over a block range (reserve0/reserve1 per point).
 
     The single most-repeated forensic pattern (did reserves get drained / manipulated, and when).
@@ -713,7 +799,11 @@ async def reserves_history(pair: str, from_block: str = "0", to_block: str = "la
     """
     try:
         return await cm.reserves_history(
-            _resolve_chain(chain, chain_id), pair, from_block=from_block, to_block=to_block, points=points,
+            _resolve_chain(chain, chain_id),
+            pair,
+            from_block=from_block,
+            to_block=to_block,
+            points=points,
         )
     except Exception as e:
         return _err(e)
@@ -910,7 +1000,6 @@ def _bytecode_twins(chain_id: int, address: str) -> dict:
     return twins
 
 
-
 @mcp.tool()
 def registry_clones(
     address: str = "", chain: str = "", chain_id: int = 0, source_hash: str = "", bytecode: bool = True
@@ -953,9 +1042,17 @@ def registry_clones(
 
 
 @mcp.tool()
-def registry_tag_vulnerability(tag: str, source_hash: str = "", address: str = "", chain: str = "",
-                               chain_id: int = 0, severity: str = "", description: str = "",
-                               enqueue_siblings: bool = False, sibling_addresses: list[str] | None = None) -> dict:
+def registry_tag_vulnerability(
+    tag: str,
+    source_hash: str = "",
+    address: str = "",
+    chain: str = "",
+    chain_id: int = 0,
+    severity: str = "",
+    description: str = "",
+    enqueue_siblings: bool = False,
+    sibling_addresses: list[str] | None = None,
+) -> dict:
     """Record a confirmed vuln so every clone of that code auto-flags later.
 
     Key it by `source_hash`, or by `address` (+ chain/chain_id). For a VERIFIED contract the
@@ -985,8 +1082,13 @@ def registry_tag_vulnerability(tag: str, source_hash: str = "", address: str = "
 
         if source_hash:
             reg.tag_vulnerability(source_hash, tag, severity=sev, description=desc)
-            out = {"ok": True, "source_hash": source_hash, "tag": tag, "keyed_by": "source_hash",
-                   "stored": {"severity": sev, "description": desc}}
+            out = {
+                "ok": True,
+                "source_hash": source_hash,
+                "tag": tag,
+                "keyed_by": "source_hash",
+                "stored": {"severity": sev, "description": desc},
+            }
             if (enqueue_siblings or sibling_addresses) and address:
                 _maybe_enqueue(_resolve_chain(chain, chain_id), out)
             return out
@@ -996,17 +1098,27 @@ def registry_tag_vulnerability(tag: str, source_hash: str = "", address: str = "
         sh = reg.get_hash_by_address(cid, address)
         if sh:  # verified contract we have source for -> tag by source
             reg.tag_vulnerability(sh, tag, severity=sev, description=desc)
-            return _maybe_enqueue(cid, {
-                "ok": True, "source_hash": sh, "tag": tag,
-                "keyed_by": f"source_hash (resolved from {address.lower()} @ chain {cid})",
-                "stored": {"severity": sev, "description": desc}})
+            return _maybe_enqueue(
+                cid,
+                {
+                    "ok": True,
+                    "source_hash": sh,
+                    "tag": tag,
+                    "keyed_by": f"source_hash (resolved from {address.lower()} @ chain {cid})",
+                    "stored": {"severity": sev, "description": desc},
+                },
+            )
         # Unverified / not in registry -> tag by bytecode.
         runtime_hex, err, rl = _live_runtime_hex(cid, address)
         if err:
             out = {"error": f"{address.lower()} @ chain {cid}: {err} — cannot tag"}
             if rl:
-                _rl_fields(out, rl, "RPC was RATE-LIMITED — the tag was NOT stored; this is not a "
-                                    "permanent failure, retry (see retry_after).")
+                _rl_fields(
+                    out,
+                    rl,
+                    "RPC was RATE-LIMITED — the tag was NOT stored; this is not a "
+                    "permanent failure, retry (see retry_after).",
+                )
             return out
         fp = ba.code_fingerprints(runtime_hex)
         norm = fp.get("runtime_norm_hash")
@@ -1014,13 +1126,18 @@ def registry_tag_vulnerability(tag: str, source_hash: str = "", address: str = "
             return {"error": "could not fingerprint bytecode; nothing to tag"}
         ba.record_fingerprints(cid, address, runtime_hex)  # index it so it appears in registry_vulnerable
         affected = reg.tag_vulnerability_by_code(norm, tag, severity=sev, description=desc)
-        return _maybe_enqueue(cid, {
-            "ok": True, "runtime_norm_hash": norm, "tag": tag,
-            "keyed_by": f"bytecode (unverified {address.lower()} @ chain {cid})",
-            "stored": {"severity": sev, "description": desc},
-            "affected_known_contracts": affected,
-            "note": "tagged by BYTECODE — byte-identical clones (same normalized runtime) inherit this tag.",
-        })
+        return _maybe_enqueue(
+            cid,
+            {
+                "ok": True,
+                "runtime_norm_hash": norm,
+                "tag": tag,
+                "keyed_by": f"bytecode (unverified {address.lower()} @ chain {cid})",
+                "stored": {"severity": sev, "description": desc},
+                "affected_known_contracts": affected,
+                "note": "tagged by BYTECODE — byte-identical clones (same normalized runtime) inherit this tag.",
+            },
+        )
     except Exception as e:
         return _err(e)
 

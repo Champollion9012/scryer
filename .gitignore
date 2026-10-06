@@ -50,3 +50,6 @@ Thumbs.db
 
 # selector -> signature lookup cache (advisory, rebuildable)
 .selector_cache.json
+
+# Local-only PoC — kept on disk, intentionally not published
+tests/TxSimulation.t.sol

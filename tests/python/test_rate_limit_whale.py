@@ -30,7 +30,9 @@ class _Client:
 
 
 def test_rpcclient_http_429_raises_ratelimited() -> None:
-    c = ww.RpcClient("http://rpc", client=_Client(_Resp(status_code=429, text="rate limited", headers={"Retry-After": "4"})))
+    c = ww.RpcClient(
+        "http://rpc", client=_Client(_Resp(status_code=429, text="rate limited", headers={"Retry-After": "4"}))
+    )
     with pytest.raises(ww.RateLimitedRpcError) as ei:
         c.call("eth_blockNumber", [])
     assert ei.value.retry_after == 4
@@ -38,7 +40,11 @@ def test_rpcclient_http_429_raises_ratelimited() -> None:
 
 
 def test_rpcclient_jsonrpc_capacity_raises_ratelimited() -> None:
-    body = {"jsonrpc": "2.0", "id": 1, "error": {"code": -32005, "message": "exceeded compute units per second capacity"}}
+    body = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "error": {"code": -32005, "message": "exceeded compute units per second capacity"},
+    }
     c = ww.RpcClient("http://rpc", client=_Client(_Resp(body=body)))
     with pytest.raises(ww.RateLimitedRpcError):
         c.call("eth_getLogs", [{}])

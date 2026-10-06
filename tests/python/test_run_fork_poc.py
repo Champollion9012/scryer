@@ -58,8 +58,8 @@ def test_run_rejects_before_touching_wsl(tmp_path: Path, monkeypatch: pytest.Mon
 # Path + RPC plumbing
 # --------------------------------------------------------------------------- #
 def test_wslify_maps_drives() -> None:
-    assert rp._wslify(r"C:\Users\J\x.sol") == "/mnt/c/Users/J/x.sol"
-    assert rp._wslify(r"D:\antigravity-proj\scryer\t.sol") == "/mnt/d/antigravity-proj/scryer/t.sol"
+    assert rp._wslify(r"C:\Users\dev\x.sol") == "/mnt/c/Users/dev/x.sol"
+    assert rp._wslify(r"D:\proj\scryer\t.sol") == "/mnt/d/proj/scryer/t.sol"
 
 
 def test_no_forkable_rpc_is_reported(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -92,7 +92,8 @@ def _run_with_forge_output(tmp_path, monkeypatch, forge_stdout: str) -> dict:
 
 def test_pass_maps_to_confirmed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     out = _run_with_forge_output(
-        tmp_path, monkeypatch,
+        tmp_path,
+        monkeypatch,
         "[PASS] test_x() (gas: 123)\nSuite result: ok. 1 passed; 0 failed; 0 skipped",
     )
     assert out["status"] == "pass" and out["confirmed"] is True and out["passed"] == 1
@@ -100,7 +101,8 @@ def test_pass_maps_to_confirmed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
 
 def test_fail_is_not_confirmed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     out = _run_with_forge_output(
-        tmp_path, monkeypatch,
+        tmp_path,
+        monkeypatch,
         "[FAIL: no profit => not exploitable] test_x() (gas: 99)\nSuite result: FAILED. 0 passed; 1 failed",
     )
     assert out["status"] == "fail" and out["confirmed"] is False and out["failed"] == 1

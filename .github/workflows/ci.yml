@@ -51,7 +51,7 @@ jobs:
           # Install runtime deps without the heavy similarity stack.
           pip install httpx "httpx-socks[asyncio]" orjson web3 cbor2 eth-abi python-dotenv flask
       - name: mypy
-        run: mypy scryer_config.py scryer_logging.py scryer_http.py cache.py scanners.py report_renderer.py bounty_pipeline.py
+        run: mypy scryer_config.py scryer_logging.py scryer_http.py cache.py scanners.py
 
   test:
     name: Test (Python ${{ matrix.python-version }})
@@ -75,7 +75,7 @@ jobs:
           pip install --upgrade pip
           # Install only the lightweight runtime deps so torch/chromadb
           # don't dominate CI time. Tests must not import them.
-          pip install httpx "httpx-socks[asyncio]" orjson web3 cbor2 eth-abi python-dotenv flask
+          pip install httpx "httpx-socks[asyncio]" orjson web3 cbor2 eth-abi python-dotenv flask mcp
           pip install pytest pytest-asyncio pytest-cov
       - name: Run pytest
         run: pytest -ra --tb=short -m "not network and not slow"

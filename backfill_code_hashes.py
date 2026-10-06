@@ -95,8 +95,13 @@ def backfill(
 
             done = stats["fingerprinted"] + stats["no_code"] + stats["failed"]
             if done % 100 == 0:
-                _log.info("… %d processed (%d fingerprinted, %d no-code, %d failed)",
-                          done, stats["fingerprinted"], stats["no_code"], stats["failed"])
+                _log.info(
+                    "… %d processed (%d fingerprinted, %d no-code, %d failed)",
+                    done,
+                    stats["fingerprinted"],
+                    stats["no_code"],
+                    stats["failed"],
+                )
             if sleep_s:
                 time.sleep(sleep_s)
 
@@ -116,9 +121,7 @@ def main() -> int:
     p.add_argument("--db", default=".contract_registry.db")
     args = p.parse_args()
 
-    stats = backfill(
-        chain_id=args.chain, limit=args.limit, batch=args.batch, sleep_s=args.sleep, db_path=args.db
-    )
+    stats = backfill(chain_id=args.chain, limit=args.limit, batch=args.batch, sleep_s=args.sleep, db_path=args.db)
     print(
         f"fingerprinted={stats['fingerprinted']} no_code={stats['no_code']} "
         f"failed={stats['failed']} rate_limited={stats['rate_limited']} "
