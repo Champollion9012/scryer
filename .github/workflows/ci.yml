@@ -75,7 +75,7 @@ jobs:
           pip install --upgrade pip
           # Install only the lightweight runtime deps so torch/chromadb
           # don't dominate CI time. Tests must not import them.
-          pip install httpx "httpx-socks[asyncio]" orjson web3 cbor2 eth-abi python-dotenv flask mcp
+          pip install httpx "httpx-socks[asyncio]" orjson web3 cbor2 eth-abi python-dotenv flask "mcp<2"
           pip install pytest pytest-asyncio pytest-cov
       - name: Run pytest
         run: pytest -ra --tb=short -m "not network and not slow"
