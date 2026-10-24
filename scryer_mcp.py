@@ -44,6 +44,7 @@ import download_contract as dc  # noqa: E402
 import onchain_state as oc  # noqa: E402
 import scryer_chain as cm  # noqa: E402
 import scryer_config  # noqa: E402
+import scryer_tron  # noqa: E402
 import verify_source as vs  # noqa: E402
 from contract_registry import ContractRegistry  # noqa: E402
 from scryer_http import RateLimited, RateLimitTally, rpc_rate_limit_reason  # noqa: E402
@@ -108,6 +109,8 @@ _CHAIN_ALIASES = {
     "moonbeam": 1284,
     "glmr": 1284,
     "metis": 1088,
+    "tron": 728126428,
+    "trx": 728126428,
 }
 
 # Display names for the supported chains (surfaced by health so callers know what's queryable).
@@ -132,7 +135,54 @@ _CHAIN_NAMES = {
     25: "Cronos",
     1284: "Moonbeam",
     1088: "Metis",
+    728126428: "Tron",
 }
+
+
+def _addr(cid: int, address):
+    """An address argument for chain ``cid``. On Tron a T… address becomes the 20-byte hex the
+    JSON-RPC speaks. On any other chain a T… address is refused: its 20 bytes would silently resolve
+    to an unrelated account (and the default chain is BSC), so a confident wrong answer would follow."""
+    if scryer_tron.is_tron(cid):
+        return scryer_tron.normalize_address(address)
+    if scryer_tron.is_tron_address(address):
+        raise ValueError(f"{address!r} is a Tron T… address but chain is {cid}; pass chain='tron'")
+    return address
+
+
+def _call_args(cid: int, signature: str, args: list) -> list:
+    """Call args for chain ``cid``: on Tron, T… is converted only at address-typed parameters (a
+    string/bytes arg that looks like an address is left alone); other chains are unchanged."""
+    if not scryer_tron.is_tron(cid) or not args:
+        return args
+    types = oc._sig_input_types(signature)
+    return [scryer_tron.normalize_typed(t, v) for t, v in zip(types, args, strict=False)] + list(args[len(types) :])
+
+
+def _tron_out(cid: int, result: dict) -> dict:
+    """On Tron, render result addresses as T… (the form TronScan and Tron tooling use); other
+    chains are returned unchanged."""
+    return scryer_tron.tronify(result) if scryer_tron.is_tron(cid) else result
+
+
+def _tron_call_out(cid: int, result: dict, returns: str) -> dict:
+    """``_tron_out`` for call_view results: ABI-decoded values are rendered by their declared return
+    type, so only ``address`` outputs become T… (a bytes20 / uint160 return is left as is)."""
+    if not scryer_tron.is_tron(cid):
+        return result
+    types = [t for t in (p.strip() for p in returns.split(",")) if t] if returns else []
+
+    def one(r: dict) -> dict:
+        out = scryer_tron.tronify(r, skip_keys=("decoded", "results"))
+        if isinstance(r.get("decoded"), list):
+            out["decoded"] = [
+                scryer_tron.render_typed(t, v) for t, v in zip(types, r["decoded"], strict=False)
+            ] + r["decoded"][len(types) :]
+        if isinstance(r.get("results"), list):
+            out["results"] = [one(x) if isinstance(x, dict) else x for x in r["results"]]
+        return out
+
+    return one(result)
 
 
 def _supported_chains() -> list[dict]:
@@ -212,6 +262,10 @@ def health() -> dict:
     chains list) or `chain_id` (int), plus `block` (number/tag; historical needs an archive
     RPC). The `chains` list is the chains with a native RPC, BUT the live-state tools also
     reach any other Etherscan-V2 chain via a proxy fallback (see `state_rpc_fallback`).
+    Tron (`chain: "tron"`) runs over its EVM-compatible JSON-RPC (TRON_URL, default TronGrid):
+    with chain="tron" pass T… addresses and results come back in T… form (a T… address on any
+    other chain is refused — its 20 bytes would hit an unrelated account). Tron serves state reads at
+    `latest` only, so historical `block` reads error out.
     Analysis is the agent's job.
     """
     try:
@@ -421,6 +475,7 @@ def download_contract(
     """
     try:
         cid = _resolve_chain(chain, chain_id)
+        address = _addr(cid, address)
         # On-disk cache: verified source is immutable, so if we already have it (files +
         # meta) we skip the network fetch and return instantly. refresh=True forces a
         # re-fetch (e.g. an upgradeable proxy whose implementation address may have changed).
@@ -509,7 +564,7 @@ def verify_source(address: str, chain: str = "", chain_id: int = 0) -> dict:
     """
     try:
         cid = _resolve_chain(chain, chain_id)
-        r = vs.verify_contract(cid, address, cache=vs.VerifyCache())
+        r = vs.verify_contract(cid, _addr(cid, address), cache=vs.VerifyCache())
         out = {
             "verdict": r.verdict,
             "chain_id": r.chain_id,
@@ -547,7 +602,8 @@ def get_state(address: str, chain: str = "", chain_id: int = 0, block: str = "la
     For anything not covered, use call_view.
     """
     try:
-        return oc.get_state(_resolve_chain(chain, chain_id), address, block=block)
+        cid = _resolve_chain(chain, chain_id)
+        return _tron_out(cid, oc.get_state(cid, _addr(cid, address), block=block))
     except Exception as e:
         return _err(e)
 
@@ -571,7 +627,14 @@ def call_view(
     This replaces hand-reading storage slots for anything exposed as a getter.
     """
     try:
-        return oc.call_view(_resolve_chain(chain, chain_id), address, signature, args or [], returns, block=block)
+        cid = _resolve_chain(chain, chain_id)
+        return _tron_call_out(
+            cid,
+            oc.call_view(
+                cid, _addr(cid, address), signature, _call_args(cid, signature, args or []), returns, block=block
+            ),
+            returns,
+        )
     except Exception as e:
         return _err(e)
 
@@ -590,7 +653,10 @@ def read_storage(
     Prefer call_view when a getter exists.
     """
     try:
-        return oc.read_storage(_resolve_chain(chain, chain_id), address, slot, decode_as=decode_as, block=block)
+        cid = _resolve_chain(chain, chain_id)
+        return _tron_out(
+            cid, oc.read_storage(cid, _addr(cid, address), slot, decode_as=decode_as, block=block)
+        )
     except Exception as e:
         return _err(e)
 
@@ -604,7 +670,8 @@ def token_exposure(address: str, chain: str = "", chain_id: int = 0, block: str 
     Turns a theoretical bug into "N dollars at risk". Empty holdings don't prove safety.
     """
     try:
-        return oc.token_exposure(_resolve_chain(chain, chain_id), address, block=block)
+        cid = _resolve_chain(chain, chain_id)
+        return _tron_out(cid, oc.token_exposure(cid, _addr(cid, address), block=block))
     except Exception as e:
         return _err(e)
 
@@ -619,7 +686,8 @@ def price_token(token: str, chain: str = "", chain_id: int = 0, block: str = "la
     historical point. The LP route needs a known DEX for the chain (currently ETH, BSC).
     """
     try:
-        return oc.price_token(_resolve_chain(chain, chain_id), token, block=block)
+        cid = _resolve_chain(chain, chain_id)
+        return _tron_out(cid, oc.price_token(cid, _addr(cid, token), block=block))
     except Exception as e:
         return _err(e)
 
@@ -646,16 +714,21 @@ async def get_logs(
     accept a number, 0x-hex, or a tag. Results are merged + de-duplicated; `count` is the total and
     `partial:true` (+ `errors`/`rate_limited`) flags any window that could not be fully read — it
     NEVER silently truncates. Uses the chain's native RPC (logs are paywalled on Etherscan's free
-    tier for non-ETH chains), so the chain needs a *_URL in .env.
+    tier for non-ETH chains), so the chain needs a *_URL in .env. On Tron the default window is 4800
+    blocks (TronGrid's cap is 5000) and `address` may be a T… address.
     """
     try:
-        return await cm.get_logs(
-            _resolve_chain(chain, chain_id),
-            address,
-            topics=topics,
-            from_block=from_block,
-            to_block=to_block,
-            chunk=(chunk or None),
+        cid = _resolve_chain(chain, chain_id)
+        return _tron_out(
+            cid,
+            await cm.get_logs(
+                cid,
+                _addr(cid, address),
+                topics=topics,
+                from_block=from_block,
+                to_block=to_block,
+                chunk=(chunk or None),
+            ),
         )
     except Exception as e:
         return _err(e)
@@ -675,7 +748,8 @@ async def get_tx(tx_hash: str, chain: str = "", chain_id: int = 0, net_flows_onl
     true total; `events_truncated`/`events_omitted` flag what was dropped. Native RPC only.
     """
     try:
-        return await cm.get_tx(_resolve_chain(chain, chain_id), tx_hash, net_flows_only=net_flows_only)
+        cid = _resolve_chain(chain, chain_id)
+        return _tron_out(cid, await cm.get_tx(cid, tx_hash, net_flows_only=net_flows_only))
     except Exception as e:
         return _err(e)
 
@@ -703,18 +777,25 @@ async def asset_transfers(
     beyond `max_pages`. The per-counterparty LIST is capped to the top-`top` by count (default 100;
     pass 0 for all) so a pool/hub with tens of thousands doesn't overflow — `distinct_counterparties`
     stays the true total and `counterparties_omitted` flags the drop; query the EOA (not a pool/hub).
-    Needs an Alchemy-family native RPC for the chain.
+    Needs an Alchemy-family native RPC for the chain. On Tron without an Alchemy endpoint it is
+    rebuilt from TRC20 Transfer logs (`source: trc20_transfer_logs`; native TRX not covered; per-token
+    amounts in `by_asset`; an open-ended from_block is capped to recent blocks and flagged
+    `range_capped`).
     """
     try:
-        return await cm.asset_transfers(
-            _resolve_chain(chain, chain_id),
-            address,
-            direction=direction,
-            category=category,
-            from_block=from_block,
-            to_block=to_block,
-            max_pages=max_pages,
-            top=top,
+        cid = _resolve_chain(chain, chain_id)
+        return _tron_out(
+            cid,
+            await cm.asset_transfers(
+                cid,
+                _addr(cid, address),
+                direction=direction,
+                category=category,
+                from_block=from_block,
+                to_block=to_block,
+                max_pages=max_pages,
+                top=top,
+            ),
         )
     except Exception as e:
         return _err(e)
@@ -731,7 +812,8 @@ async def deployer(address: str, chain: str = "", chain_id: int = 0) -> dict:
     needs an archive RPC.
     """
     try:
-        return await cm.deployer(_resolve_chain(chain, chain_id), address)
+        cid = _resolve_chain(chain, chain_id)
+        return _tron_out(cid, await cm.deployer(cid, _addr(cid, address)))
     except Exception as e:
         return _err(e)
 
@@ -749,7 +831,8 @@ async def deployed_by(address: str, chain: str = "", chain_id: int = 0, max_nonc
     each (bytecode_abi) and check if it executed (asset_transfers, with a positive control). Native RPC only.
     """
     try:
-        return await cm.deployed_by(_resolve_chain(chain, chain_id), address, max_nonce=max_nonce)
+        cid = _resolve_chain(chain, chain_id)
+        return _tron_out(cid, await cm.deployed_by(cid, _addr(cid, address), max_nonce=max_nonce))
     except Exception as e:
         return _err(e)
 
@@ -774,13 +857,18 @@ async def call_view_many(
     sinks the batch. Native RPC only.
     """
     try:
-        return await cm.call_view_many(
-            _resolve_chain(chain, chain_id),
-            address,
-            signatures,
-            args=args,
-            returns=returns,
-            blocks=blocks,
+        cid = _resolve_chain(chain, chain_id)
+        if scryer_tron.is_tron(cid) and args:
+            # T… -> hex per signature, at address-typed parameters only (see _call_args)
+            if len(signatures) == 1:
+                args = _call_args(cid, signatures[0], cm._args_for(args, 0, 1))
+            else:
+                n = len(signatures)
+                args = [_call_args(cid, sig, cm._args_for(args, i, n)) for i, sig in enumerate(signatures)]
+        return _tron_call_out(
+            cid,
+            await cm.call_view_many(cid, _addr(cid, address), signatures, args=args, returns=returns, blocks=blocks),
+            returns,
         )
     except Exception as e:
         return _err(e)
@@ -798,12 +886,16 @@ async def reserves_history(
     `max_drop` flags the biggest single-step reserve collapse (the drain block). Native RPC only.
     """
     try:
-        return await cm.reserves_history(
-            _resolve_chain(chain, chain_id),
-            pair,
-            from_block=from_block,
-            to_block=to_block,
-            points=points,
+        cid = _resolve_chain(chain, chain_id)
+        return _tron_out(
+            cid,
+            await cm.reserves_history(
+                cid,
+                _addr(cid, pair),
+                from_block=from_block,
+                to_block=to_block,
+                points=points,
+            ),
         )
     except Exception as e:
         return _err(e)
@@ -855,7 +947,10 @@ def bytecode_abi(address: str, chain: str = "", chain_id: int = 0, block: str = 
     candidate's types and keep the one that decodes sensibly before trusting a name.
     """
     try:
-        return ba.analyze_contract(_resolve_chain(chain, chain_id), address, block=block, resolve=resolve)
+        cid = _resolve_chain(chain, chain_id)
+        return _tron_out(
+            cid, ba.analyze_contract(cid, _addr(cid, address), block=block, resolve=resolve)
+        )
     except Exception as e:
         return _err(e)
 
@@ -889,6 +984,7 @@ def decompile(address: str, chain: str = "", chain_id: int = 0, block: str = "la
         from etherscan_proxy_provider import make_web3
 
         cid = _resolve_chain(chain, chain_id)
+        address = _addr(cid, address)
         blk, berr = oc._parse_block(block)
         if berr:
             return {"error": berr}
@@ -1030,13 +1126,14 @@ def registry_clones(
         if not address:
             return {"error": "provide either source_hash, or address (+ chain/chain_id)"}
         cid = _resolve_chain(chain, chain_id)
+        address = _addr(cid, address)
         out = {
             "query": {"chain_id": cid, "address": address.lower()},
             "related": reg.find_related_contracts(cid, address),
         }
         if bytecode:
             out.update(_bytecode_twins(cid, address))
-        return out
+        return _tron_out(cid, out)
     except Exception as e:
         return _err(e)
 
@@ -1071,6 +1168,10 @@ def registry_tag_vulnerability(
         reg = ContractRegistry()
         sev = severity or "Unknown"
         desc = description or ""
+        if scryer_tron.is_tron_address(address) or any(scryer_tron.is_tron_address(a) for a in sibling_addresses or []):
+            tcid = _resolve_chain(chain, chain_id)  # T… is valid on Tron only (see _addr)
+            address = _addr(tcid, address)
+            sibling_addresses = [_addr(tcid, a) for a in sibling_addresses] if sibling_addresses else sibling_addresses
 
         def _maybe_enqueue(cid: int, out: dict) -> dict:
             if enqueue_siblings or sibling_addresses:

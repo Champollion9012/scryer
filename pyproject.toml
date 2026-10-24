@@ -79,6 +79,7 @@ py-modules = [
     "scryer_config",
     "scryer_http",
     "scryer_logging",
+    "scryer_tron",
     "similarity",
     "similarity_cli",
     "web",

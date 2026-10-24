@@ -40,6 +40,7 @@ from web3 import Web3
 import onchain_state as oc
 import scryer_config
 import scryer_labels
+import scryer_tron
 from scryer_http import (
     RateLimited,
     async_client,
@@ -56,7 +57,10 @@ _log = get_logger(__name__)
 # --------------------------------------------------------------------------- #
 # Tunables (env-overridable)
 # --------------------------------------------------------------------------- #
-def _concurrency() -> int:
+def _concurrency(chain_id: int | None = None) -> int:
+    if chain_id is not None and scryer_tron.is_tron(chain_id):
+        # Public TronGrid answers HTTP 429 as soon as two requests are in flight: scan serially.
+        return scryer_config.get_int("SCRYER_TRON_CONCURRENCY", 1) or 1
     return scryer_config.get_int("SCRYER_RPC_CONCURRENCY", 8) or 8
 
 
@@ -66,10 +70,21 @@ def _hub_threshold() -> int:
     return scryer_config.get_int("SCRYER_HUB_MIN_COUNTERPARTIES", 40) or 40
 
 
-def _logs_chunk() -> int:
+def _logs_chunk(chain_id: int | None = None) -> int:
     # Alchemy's free tier serves at most 10 blocks per eth_getLogs; default to that so the common
-    # endpoint works out of the box. A permissive node can raise it via SCRYER_LOGS_CHUNK.
-    return scryer_config.get_int("SCRYER_LOGS_CHUNK", 10) or 10
+    # endpoint works out of the box. A permissive node can raise it via SCRYER_LOGS_CHUNK. TronGrid
+    # serves up to 5000 blocks (~4 h of 3-s blocks), so Tron defaults to 4800 — 10-block windows
+    # would be ~2,900 getLogs calls per day of Tron history.
+    configured = scryer_config.get_int("SCRYER_LOGS_CHUNK", 0)
+    if configured:
+        return configured
+    return 4800 if chain_id is not None and scryer_tron.is_tron(chain_id) else 10
+
+
+def _tron_default_window() -> int:
+    # Tron history is ~87M blocks: a from_block=0 TRC20 log scan would be ~18k getLogs windows, so
+    # asset_transfers on Tron caps an open-ended range to the most recent N blocks (default ~7 days).
+    return scryer_config.get_int("SCRYER_TRON_DEFAULT_BLOCKS", 201_600) or 201_600
 
 
 # --------------------------------------------------------------------------- #
@@ -246,6 +261,12 @@ def _is_range_error(exc: Exception) -> bool:
     return bool(_RANGE_ERR_RE.search(str(exc)))
 
 
+# TronGrid (and Infura) answer an over-full getLogs window with JSON-RPC -32005 "query returned more
+# than 10000 results"; -32005 classifies as a throttle, but the fix is a smaller window, not a retry.
+_TOO_MANY_RESULTS_RE = re.compile(r"returned more than \d+ results", re.IGNORECASE)
+_TRON_RETRIES = 3  # backoff retries per getLogs window on a Tron throttle
+
+
 def _int(h: Any, default: int = 0) -> int:
     if h is None:
         return default
@@ -393,9 +414,12 @@ async def _token_meta(client: httpx.AsyncClient, urls: Sequence[str], chain_id: 
     key = (chain_id, token.lower())
     if key in _token_meta_cache:
         return _token_meta_cache[key]
+    if scryer_tron.is_tron(chain_id) and token.lower() in _TRON_CANONICAL_META:
+        return dict(_TRON_CANONICAL_META[token.lower()])  # known stablecoins: no RPC, no guess
     checks = Web3.to_checksum_address(token)
     start = next(_rr_counter)
     meta: dict = {"symbol": None, "decimals": 18}
+    failed = False
     try:
         res: Any = await asyncio.gather(
             _rpc_rotating(client, urls, "eth_call", [{"to": checks, "data": _SYM_SEL}, "latest"], start=start),
@@ -403,6 +427,7 @@ async def _token_meta(client: httpx.AsyncClient, urls: Sequence[str], chain_id: 
             return_exceptions=True,
         )
         sym_raw, dec_raw = res[0], res[1]
+        failed = any(isinstance(x, BaseException) for x in res)
         if isinstance(sym_raw, str):
             meta["symbol"] = _decode_string(sym_raw)
         if isinstance(dec_raw, str) and dec_raw not in ("", "0x"):
@@ -410,8 +435,9 @@ async def _token_meta(client: httpx.AsyncClient, urls: Sequence[str], chain_id: 
             if 0 < d <= 36:
                 meta["decimals"] = d
     except Exception:  # noqa: BLE001 - metadata is best-effort
-        pass
-    _token_meta_cache[key] = meta
+        failed = True
+    if not failed:  # a throttled/failed lookup must not pin the 18-decimals default for the process
+        _token_meta_cache[key] = meta
     return meta
 
 
@@ -494,6 +520,9 @@ async def get_logs(
     The result never silently truncates: ``count`` is the total, and ``partial:true`` with
     ``errors``/``rate_limited`` is set if any window could not be fully read.
     """
+    tron = scryer_tron.is_tron(chain_id)
+    if tron:
+        address = scryer_tron.normalize_address(address)
     url = _rpc_url(chain_id)
     if not url:
         return {
@@ -502,10 +531,10 @@ async def get_logs(
             "(Etherscan logs are paywalled on non-ETH chains). Set the chain's *_URL in .env.",
         }
     urls = _rpc_urls(chain_id)  # spread the concurrent windows across the key pool
-    chunk = int(chunk or _logs_chunk())
+    chunk = int(chunk or _logs_chunk(chain_id))
     if chunk < 1:
         chunk = 1
-    sem = asyncio.Semaphore(int(concurrency or _concurrency()))
+    sem = asyncio.Semaphore(int(concurrency or _concurrency(chain_id if tron else None)))
     base: dict[str, Any] = {}
     if address:
         base["address"] = Web3.to_checksum_address(address)
@@ -526,28 +555,40 @@ async def get_logs(
         if hi < lo:
             return {"chain_id": chain_id, "error": f"to_block ({hi}) < from_block ({lo})"}
 
+        async def split(a: int, b: int, start: int) -> list[dict] | None:
+            mid = (a + b) // 2
+            left = await fetch(a, mid, start)
+            right = await fetch(mid + 1, b, start + 1)
+            if left is None or right is None:
+                return None
+            return left + right
+
         async def fetch(a: int, b: int, start: int) -> list[dict] | None:
             flt = {**base, "fromBlock": hex(a), "toBlock": hex(b)}
-            try:
-                async with sem:
-                    res = await _rpc_rotating(client, urls, "eth_getLogs", [flt], start=start)
-                return list(res or [])
-            except RateLimited as e:
-                # every key in the pool throttled — retryable; do NOT recurse (not a range problem)
-                rl["hit"] = True
-                rl["retry_after"] = e.retry_after
-                rl["reason"] = e.reason
-                return None
-            except Exception as e:  # noqa: BLE001
-                if _is_range_error(e) and b > a:
-                    mid = (a + b) // 2
-                    left = await fetch(a, mid, start)
-                    right = await fetch(mid + 1, b, start + 1)
-                    if left is None or right is None:
-                        return None
-                    return left + right
-                errors.append({"from": a, "to": b, "error": str(e)[:200]})
-                return []
+            # Public TronGrid throttles at 2 in-flight requests: on Tron back off and retry a few
+            # times before giving the window up as rate-limited.
+            for attempt in range(_TRON_RETRIES + 1 if tron else 1):
+                try:
+                    async with sem:
+                        res = await _rpc_rotating(client, urls, "eth_getLogs", [flt], start=start)
+                    return list(res or [])
+                except RateLimited as e:
+                    if b > a and _TOO_MANY_RESULTS_RE.search(e.reason):
+                        return await split(a, b, start)  # a window-size problem dressed as -32005
+                    if tron and attempt < _TRON_RETRIES:
+                        await asyncio.sleep(min(30, e.retry_after or 2 ** (attempt + 1)))
+                        continue
+                    # every key in the pool throttled — retryable; do NOT recurse (not a range problem)
+                    rl["hit"] = True
+                    rl["retry_after"] = e.retry_after
+                    rl["reason"] = e.reason
+                    return None
+                except Exception as e:  # noqa: BLE001
+                    if _is_range_error(e) and b > a:
+                        return await split(a, b, start)
+                    errors.append({"from": a, "to": b, "error": str(e)[:200]})
+                    return []
+            return None
 
         base_rr = next(_rr_counter)
         windows = [(s, min(s + chunk - 1, hi)) for s in range(lo, hi + 1, chunk)]
@@ -642,6 +683,10 @@ async def get_tx(chain_id: int, tx_hash: str, *, net_flows_only: bool = False) -
         "net_flows": _net_flows(events),
         "rpc_url": redact_rpc_url(url),
     }
+    if scryer_tron.is_tron(chain_id):  # TRX value is in sun (6 decimals), not wei
+        sun = out.pop("value_wei")
+        out["value_sun"] = sun
+        out["value_trx"] = sun / 10**scryer_tron.TRON_NATIVE_DECIMALS
     if net_flows_only and events:
         out["events_omitted"] = len(events)
     elif len(shown_events) < len(events):
@@ -685,6 +730,8 @@ async def asset_transfers(
     ``category``: Alchemy categories, default ["external","erc20"]. Returns counterparties with
     per-counterparty count/value/assets and the earliest block seen. Needs an Alchemy-family RPC.
     """
+    if scryer_tron.is_tron(chain_id):
+        address = scryer_tron.normalize_address(address)
     url = _rpc_url(chain_id)
     if not url:
         return {
@@ -692,11 +739,17 @@ async def asset_transfers(
             "address": address.lower(),
             "error": f"no native RPC configured for chain {chain_id}",
         }
-    category = category or ["external", "erc20"]
-    checks = Web3.to_checksum_address(address)
     # One Alchemy endpoint per invocation, round-robin across the key pool — spreads load across
     # calls while keeping a single key for the whole pageKey sequence (pageKeys are provider-scoped).
     alc = _rpc_urls(chain_id, alchemy_only=True)
+    if scryer_tron.is_tron(chain_id) and not any("alchemy" in u.lower() for u in alc):
+        # TronGrid (the default Tron RPC) has no alchemy_getAssetTransfers — rebuild the flow from
+        # TRC20 Transfer logs instead of failing.
+        return await _tron_trc20_transfers(
+            chain_id, address, direction=direction, from_block=from_block, to_block=to_block, top=top
+        )
+    category = category or ["external", "erc20"]
+    checks = Web3.to_checksum_address(address)
     url_pick = alc[next(_rr_counter) % len(alc)] if alc else url
     base = {
         "fromBlock": _block_tag(from_block),
@@ -780,13 +833,16 @@ async def asset_transfers(
     if top and top > 0 and total_cps > top:
         counterparties_omitted = total_cps - top
         cps = cps[:top]
-    # earliest-seen counterparty = the FIRST funder (attribution start point)
+    # earliest-seen counterparty = the FIRST funder (attribution start point). With direction="both"
+    # only inbound transfers count: an earlier OUTGOING transfer's recipient is not a funder.
     first_funder = None
-    if transfers:
-        first_t = min(transfers, key=lambda t: _int(t.get("blockNum")) if t.get("blockNum") else 1 << 62)
+    funding = [t for t in transfers if t.get("_direction") == "in"] if direction == "both" else transfers
+    if funding:
+        first_t = min(funding, key=lambda t: _int(t.get("blockNum")) if t.get("blockNum") else 1 << 62)
         fa = ((first_t.get("from") if first_t.get("_direction") == "in" else first_t.get("to")) or "").lower() or None
         if fa:
-            first_funder = {"address": fa, "label": scryer_labels.label_for(fa), "block": earliest}
+            fb = _int(first_t.get("blockNum")) if first_t.get("blockNum") else None
+            first_funder = {"address": fa, "label": scryer_labels.label_for(fa), "block": fb}
 
     out: dict = {
         "chain_id": chain_id,
@@ -809,6 +865,230 @@ async def asset_transfers(
     if truncated:
         out["truncated"] = True
         out["note"] = f"stopped at max_pages={max_pages}; MORE transfers exist (raise max_pages)."
+    return out
+
+
+# Canonical Tron stablecoins are named by symbol; every other TRC20 is named "SYMBOL@T…" because
+# address-poisoning campaigns mint look-alike "USDT" tokens on Tron.
+_TRON_CANONICAL = {
+    scryer_tron.to_hex(a): s
+    for a, s in (("TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t", "USDT"), ("TEkxiTehnzSmSe2XqrBj4w32RUN966rdz8", "USDC"))
+}
+_TRON_CANONICAL_META = {tk: {"symbol": s, "decimals": 6} for tk, s in _TRON_CANONICAL.items()}
+_TRON_META_MAX_TOKENS = 50  # symbol/decimals lookups per call (spam-token-heavy addresses)
+
+
+async def _tron_rpc(client: httpx.AsyncClient, urls: Sequence[str], method: str, params: Sequence[Any]) -> Any:
+    """``_rpc_rotating`` with the Tron throttle backoff (public TronGrid 429s at 2 in-flight)."""
+    for attempt in range(_TRON_RETRIES + 1):
+        try:
+            return await _rpc_rotating(client, urls, method, params, start=next(_rr_counter))
+        except RateLimited as e:
+            if attempt == _TRON_RETRIES:
+                raise
+            await asyncio.sleep(min(30, e.retry_after or 2 ** (attempt + 1)))
+    return None
+
+
+async def _tron_token_meta(
+    client: httpx.AsyncClient, urls: Sequence[str], chain_id: int, token: str
+) -> tuple[dict | None, bool]:
+    """``(meta, throttled)`` for a TRC20. ``meta`` is None when decimals could not be read, so the
+    caller reports the amount as unknown instead of guessing 18 decimals; only successes are cached."""
+    tk = token.lower()
+    if tk in _TRON_CANONICAL_META:
+        return dict(_TRON_CANONICAL_META[tk]), False
+    if (chain_id, tk) in _token_meta_cache:
+        return _token_meta_cache[(chain_id, tk)], False
+    checks = Web3.to_checksum_address(tk)
+    raws: dict[str, Any] = {}
+    for name, sel in (("symbol", _SYM_SEL), ("decimals", _DEC_SEL)):
+        try:
+            raws[name] = await _tron_rpc(client, urls, "eth_call", [{"to": checks, "data": sel}, "latest"])
+        except RateLimited:
+            return None, True
+        except Exception:  # noqa: BLE001 - a missing/reverting getter is not fatal for symbol
+            raws[name] = None
+    dec_raw = raws.get("decimals")
+    try:
+        dec = int(dec_raw, 16) if isinstance(dec_raw, str) and dec_raw not in ("", "0x") else 0
+    except ValueError:
+        dec = 0
+    if not 0 < dec <= 36:
+        return None, False
+    sym_raw = raws.get("symbol")
+    meta = {"symbol": _decode_string(sym_raw) if isinstance(sym_raw, str) else None, "decimals": dec}
+    _token_meta_cache[(chain_id, tk)] = meta
+    return meta, False
+
+
+async def _tron_trc20_transfers(
+    chain_id: int, address: str, *, direction: str, from_block: Any, to_block: Any, top: int
+) -> dict:
+    """``asset_transfers`` for Tron, rebuilt from TRC20 ``Transfer`` logs (topic-filtered on the
+    address, any token contract) because TronGrid serves no ``alchemy_getAssetTransfers``.
+
+    Covers TRC20 only — native TRX transfers are not logs. Zero-value transfers (address-poisoning
+    spam) are dropped. An open-ended ``from_block`` (0/earliest) is capped to the most recent
+    ``SCRYER_TRON_DEFAULT_BLOCKS`` blocks and flagged ``range_capped`` rather than claiming full
+    history. Tokens other than the canonical stablecoins are named ``SYMBOL@T…`` so a look-alike
+    "USDT" can't pass for the real one.
+    """
+    base_out: dict[str, Any] = {"chain_id": chain_id, "address": address.lower(), "direction": direction}
+    if direction not in ("in", "out", "both"):
+        return {**base_out, "error": f"invalid direction {direction!r} (in|out|both)"}
+    url = _rpc_url(chain_id)
+    capped = False
+    async with async_client() as client:
+        try:
+            hi = await _resolve_block(client, url, to_block)
+            lo = await _resolve_block(client, url, from_block)
+            if lo == 0:  # open-ended (0 / "0" / "0x0" / "earliest") -> recent window, never full history
+                lo = max(0, hi - _tron_default_window() + 1)
+                capped = True
+        except RateLimited as e:
+            return _rl_out(base_out, e)
+        except Exception as e:  # noqa: BLE001
+            return {**base_out, "error": f"block resolve failed: {type(e).__name__}: {e}"}
+    if hi < lo:
+        return {**base_out, "error": f"to_block ({hi}) < from_block ({lo})"}
+
+    addr_topic = "0x" + "0" * 24 + address.lower()[2:]
+    queries: list[tuple[str, list[Any]]] = []
+    if direction in ("in", "both"):
+        queries.append(("in", [TRANSFER_TOPIC, None, addr_topic]))
+    if direction in ("out", "both"):
+        queries.append(("out", [TRANSFER_TOPIC, addr_topic]))
+
+    transfers: list[dict] = []
+    flags: dict[str, Any] = {}
+    for dname, topics in queries:
+        res = await get_logs(chain_id, "", topics=topics, from_block=lo, to_block=hi)
+        if "logs" not in res:  # hard failure (no native RPC / block resolve / throttle before the scan)
+            keep = ("error", "rate_limited", "retry_after", "warnings")
+            return {**base_out, **{k: v for k, v in res.items() if k in keep}}
+        # accumulate across the in/out scans — the second must not overwrite the first's failures
+        if res.get("errors"):
+            flags.setdefault("errors", []).extend({**e, "direction": dname} for e in res["errors"])
+        for k in ("partial", "rate_limited"):
+            if res.get(k):
+                flags[k] = True
+        if res.get("retry_after") is not None:
+            flags["retry_after"] = max(flags.get("retry_after") or 0, res["retry_after"])
+        for lg in res["logs"]:
+            tps = lg.get("topics") or []
+            if len(tps) != 3:  # ERC721-style Transfer (tokenId indexed) or malformed
+                continue
+            amount = _data_word(lg.get("data") or "0x", 0)
+            if amount == 0:
+                continue
+            transfers.append(
+                {
+                    "_direction": dname,
+                    "from": _topic_addr(tps[1]).lower(),
+                    "to": _topic_addr(tps[2]).lower(),
+                    "token": (lg.get("address") or "").lower(),
+                    "raw": amount,
+                    "blockNum": _int(lg.get("blockNumber")),
+                }
+            )
+
+    by_count: dict[str, int] = {}
+    for t in transfers:
+        by_count[t["token"]] = by_count.get(t["token"], 0) + 1
+    tokens = sorted(by_count, key=lambda tk: (-by_count[tk], tk))
+    meta_tokens = tokens[:_TRON_META_MAX_TOKENS]
+    meta: dict[str, dict] = {}
+    meta_failed = 0
+    if meta_tokens:
+        async with async_client() as client:
+            urls = _rpc_urls(chain_id)
+            for tk in meta_tokens:  # serial on purpose: public TronGrid 429s at 2 in-flight requests
+                m, throttled = await _tron_token_meta(client, urls, chain_id, tk)
+                if m is None:
+                    meta_failed += 1
+                    if throttled:
+                        flags["rate_limited"] = True
+                else:
+                    meta[tk] = m
+
+    def _asset(tk: str) -> str:
+        if tk in _TRON_CANONICAL:
+            return _TRON_CANONICAL[tk]
+        sym = (meta.get(tk) or {}).get("symbol") or "TRC20"
+        return f"{sym}@{scryer_tron.to_base58(tk)}"
+
+    counterparties: dict[str, dict] = {}
+    earliest: int | None = None
+    for t in transfers:
+        cp = t["from"] if t["_direction"] == "in" else t["to"]
+        c = counterparties.setdefault(cp, {"count": 0, "value": 0.0, "by_asset": {}})
+        c["count"] += 1
+        if t["token"] in meta:
+            v = _human(t["raw"], meta[t["token"]].get("decimals", 18))
+            c["value"] += v
+            asset = _asset(t["token"])
+            c["by_asset"][asset] = c["by_asset"].get(asset, 0.0) + v
+        else:
+            asset = _asset(t["token"])
+            c["by_asset"].setdefault(asset, None)  # decimals unknown (beyond the metadata cap)
+        earliest = t["blockNum"] if earliest is None else min(earliest, t["blockNum"])
+
+    cps = [
+        {
+            "address": a,
+            "count": c["count"],
+            "value": round(c["value"], 8),
+            "assets": sorted(c["by_asset"]),
+            "by_asset": {k: (round(v, 8) if v is not None else None) for k, v in sorted(c["by_asset"].items())},
+            "label": scryer_labels.label_for(a),
+        }
+        for a, c in counterparties.items()
+    ]
+    cps.sort(key=lambda x: (-x["count"], x["address"]))
+    total_cps = len(cps)
+    counterparties_omitted = 0
+    if top and top > 0 and total_cps > top:
+        counterparties_omitted = total_cps - top
+        cps = cps[:top]
+    first_funder = None  # with direction="both", only inbound transfers can be the first funder
+    funding = [t for t in transfers if t["_direction"] == "in"] if direction == "both" else transfers
+    if funding:
+        first_t = min(funding, key=lambda t: t["blockNum"])
+        fa = first_t["from"] if first_t["_direction"] == "in" else first_t["to"]
+        first_funder = {"address": fa, "label": scryer_labels.label_for(fa), "block": first_t["blockNum"]}
+
+    out: dict = {
+        **base_out,
+        "category": ["trc20"],
+        "source": "trc20_transfer_logs",
+        "from_block": lo,
+        "to_block": hi,
+        "count": len(transfers),
+        "distinct_counterparties": total_cps,
+        "first_funder": first_funder,
+        "counterparties": cps,
+        "earliest_block": earliest,
+        "rpc_url": redact_rpc_url(url),
+        "note": "Tron: rebuilt from TRC20 Transfer logs (native TRX transfers are not logs); zero-value "
+        "transfers dropped; `value` sums every asset — read `by_asset` per token.",
+    }
+    if capped:
+        out["range_capped"] = True
+        out["note"] += (
+            f" Open-ended from_block capped to the last {hi - lo + 1} blocks (SCRYER_TRON_DEFAULT_BLOCKS);"
+            " pass from_block to scan further back."
+        )
+    if counterparties_omitted:
+        out["counterparties_omitted"] = counterparties_omitted
+    if len(tokens) > len(meta_tokens):
+        out["token_meta_omitted"] = len(tokens) - len(meta_tokens)
+    if meta_failed:
+        out["token_meta_failed"] = meta_failed
+        out["note"] += f" {meta_failed} token(s) had unreadable decimals: by_asset is null (unknown, not zero)."
+    if total_cps >= _hub_threshold():
+        out["likely_service_hub"] = True
+    out.update(flags)
     return out
 
 
@@ -857,6 +1137,13 @@ async def deployer(chain_id: int, address: str) -> dict:
     block, then read that tx's from (deployer EOA) and to (``null`` => direct CREATE; an address =>
     the factory that created it).
     """
+    if scryer_tron.is_tron(chain_id):
+        return {
+            "chain_id": chain_id,
+            "address": address.lower(),
+            "error": "deployer is not supported on Tron: TronGrid serves eth_getCode at 'latest' only, so the "
+            "deploy-block binary search cannot run.",
+        }
     url = _rpc_url(chain_id)
     if not url:
         return {
@@ -942,6 +1229,15 @@ async def deployed_by(chain_id: int, address: str, *, max_nonce: int = 500) -> d
     repeat-offender / operator-footprint primitive: "did this attacker deploy OTHER attack contracts".
     Code is read at head, so no archive RPC is required; the EOA's current nonce bounds the scan.
     """
+    if scryer_tron.is_tron(chain_id):
+        # Tron derives contract addresses from the deploying tx, not keccak(rlp([sender, nonce])):
+        # the EVM enumeration would report a clean "deployed nothing" that is simply wrong.
+        return {
+            "chain_id": chain_id,
+            "address": address.lower(),
+            "error": "deployed_by is not supported on Tron: contract addresses are not derived from "
+            "(sender, nonce) there, so CREATE-address enumeration cannot find them.",
+        }
     url = _rpc_url(chain_id)
     if not url:
         return {
@@ -1291,6 +1587,17 @@ async def reserves_history(
         return {"chain_id": chain_id, "pair": pair.lower(), "error": f"to_block ({hi}) < from_block ({lo})"}
 
     large = (hi - lo) > _reserves_max_scan()
+    if large and scryer_tron.is_tron(chain_id):
+        # Sampling getReserves() needs historical eth_call, which TronGrid rejects (latest only):
+        # every sample would fail and the series would come back silently empty.
+        return {
+            "chain_id": chain_id,
+            "pair": pair.lower(),
+            "from_block": lo,
+            "to_block": hi,
+            "error": f"range {hi - lo} blocks > {_reserves_max_scan()}: sampled getReserves needs historical "
+            "eth_call, which Tron RPC does not serve — narrow the range to read the pair's Sync logs instead.",
+        }
     series: list[dict] = []
     source = ""
     extra: dict = {}
@@ -1309,7 +1616,13 @@ async def reserves_history(
             if k in logs_out:
                 extra[k] = logs_out[k]
 
-    if large or not series:
+    if not series and scryer_tron.is_tron(chain_id):
+        extra["note"] = (
+            "Sync-log scan was PARTIAL/rate-limited — retry; "
+            if extra.get("partial") or extra.get("rate_limited")
+            else "no Sync logs in this range; "
+        ) + "sampled getReserves is unavailable on Tron (eth_call serves 'latest' only)."
+    elif large or not series:
         cv = await call_view_many(
             chain_id, pair, "getReserves()", returns="uint112,uint112,uint32", blocks=_spread(lo, hi, points)
         )
@@ -1337,7 +1650,7 @@ async def reserves_history(
     if large:
         out["note"] = (
             f"range {hi - lo} blocks > {_reserves_max_scan()}: sampled getReserves at {points} points "
-            f"(a Sync-log scan would be ~{(hi - lo) // max(1, _logs_chunk())} getLogs windows). "
+            f"(a Sync-log scan would be ~{(hi - lo) // max(1, _logs_chunk(chain_id))} getLogs windows). "
             "max_drop locates the drain between samples; narrow the range for exact Sync-log reserves."
         )
     return out

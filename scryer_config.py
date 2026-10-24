@@ -186,6 +186,8 @@ _RPC_ENV_NAMES: dict[int, list[str]] = {
     25: ["CRONOS_URL", "CRONOS_RPC_URL"],
     1284: ["MOONBEAM_URL", "MOONBEAM_RPC_URL"],
     1088: ["METIS_URL", "METIS_RPC_URL"],
+    # Tron: EVM-compatible JSON-RPC (TronGrid /jsonrpc or any Tron JSON-RPC provider)
+    728126428: ["TRON_URL", "TRON_RPC_URL"],
 }
 
 _PUBLIC_RPC: dict[int, str] = {
@@ -209,6 +211,7 @@ _PUBLIC_RPC: dict[int, str] = {
     25: "https://evm.cronos.org",
     1284: "https://rpc.api.moonbeam.network",
     1088: "https://andromeda.metis.io/?owner=1088",
+    728126428: "https://api.trongrid.io/jsonrpc",
 }
 
 _RPC_SPLIT = re.compile(r"[,\s]+")
