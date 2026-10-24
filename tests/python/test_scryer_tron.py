@@ -401,8 +401,14 @@ def test_get_logs_splits_a_window_that_returned_too_many_results(monkeypatch, ch
         if hi - lo + 1 > 50:
             return _rpc_error(-32005, "query returned more than 10000 results")
         return [
-            {"address": USDT_HEX, "topics": [], "data": "0x", "blockNumber": hex(b), "logIndex": "0x0",
-             "transactionHash": "0x" + f"{b:064x}"}
+            {
+                "address": USDT_HEX,
+                "topics": [],
+                "data": "0x",
+                "blockNumber": hex(b),
+                "logIndex": "0x0",
+                "transactionHash": "0x" + f"{b:064x}",
+            }
             for b in range(lo, hi + 1)
             if b % 10 == 0
         ]
@@ -507,8 +513,16 @@ def test_tron_both_first_funder_ignores_earlier_outgoing(monkeypatch) -> None:
         if not lo <= blk <= hi:
             return []
         frm, to = (funder, WALLET_HEX) if incoming else (WALLET_HEX, recipient)
-        return [{"address": USDT_HEX, "topics": [cm.TRANSFER_TOPIC, _topic(frm), _topic(to)], "data": _word(10**6),
-                 "blockNumber": hex(blk), "logIndex": "0x1", "transactionHash": TX_HASH}]
+        return [
+            {
+                "address": USDT_HEX,
+                "topics": [cm.TRANSFER_TOPIC, _topic(frm), _topic(to)],
+                "data": _word(10**6),
+                "blockNumber": hex(blk),
+                "logIndex": "0x1",
+                "transactionHash": TX_HASH,
+            }
+        ]
 
     _patch_handler(monkeypatch, handler)
     out = asyncio.run(cm.asset_transfers(TRON, WALLET_HEX, direction="both", from_block=LOG_BLOCK - 10))

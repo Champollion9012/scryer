@@ -174,10 +174,10 @@ def _tron_call_out(cid: int, result: dict, returns: str) -> dict:
 
     def one(r: dict) -> dict:
         out = scryer_tron.tronify(r, skip_keys=("decoded", "results"))
-        if isinstance(r.get("decoded"), list):
-            out["decoded"] = [
-                scryer_tron.render_typed(t, v) for t, v in zip(types, r["decoded"], strict=False)
-            ] + r["decoded"][len(types) :]
+        decoded = r.get("decoded")
+        if isinstance(decoded, list):
+            typed = [scryer_tron.render_typed(t, v) for t, v in zip(types, decoded, strict=False)]
+            out["decoded"] = typed + decoded[len(types) :]
         if isinstance(r.get("results"), list):
             out["results"] = [one(x) if isinstance(x, dict) else x for x in r["results"]]
         return out
@@ -654,9 +654,7 @@ def read_storage(
     """
     try:
         cid = _resolve_chain(chain, chain_id)
-        return _tron_out(
-            cid, oc.read_storage(cid, _addr(cid, address), slot, decode_as=decode_as, block=block)
-        )
+        return _tron_out(cid, oc.read_storage(cid, _addr(cid, address), slot, decode_as=decode_as, block=block))
     except Exception as e:
         return _err(e)
 
@@ -948,9 +946,7 @@ def bytecode_abi(address: str, chain: str = "", chain_id: int = 0, block: str = 
     """
     try:
         cid = _resolve_chain(chain, chain_id)
-        return _tron_out(
-            cid, ba.analyze_contract(cid, _addr(cid, address), block=block, resolve=resolve)
-        )
+        return _tron_out(cid, ba.analyze_contract(cid, _addr(cid, address), block=block, resolve=resolve))
     except Exception as e:
         return _err(e)
 
