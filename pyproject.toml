@@ -30,7 +30,7 @@ dependencies = [
     "eth-abi>=5.1",
     "python-dotenv>=1.0",
     "flask>=3.0",
-    "mcp>=1.2",
+    "mcp>=1.2,<2",  # FastMCP v1 API (mcp 2.x renamed it to MCPServer); keep pinned <2
 ]
 
 [project.optional-dependencies]
@@ -79,6 +79,7 @@ py-modules = [
     "scryer_config",
     "scryer_http",
     "scryer_logging",
+    "scryer_tron",
     "similarity",
     "similarity_cli",
     "web",

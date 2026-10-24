@@ -8,6 +8,7 @@ cbor2>=5.6
 eth-abi>=5.1
 python-dotenv>=1.0
 flask>=3.0
+mcp>=1.2,<2  # FastMCP v1 API; mcp 2.x renamed FastMCP->MCPServer (keep <2)
 
 # Optional: similarity search (large download — torch wheels)
 sentence-transformers>=3.0

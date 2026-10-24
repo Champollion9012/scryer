@@ -6,6 +6,7 @@ runs, and anything that could send a real transaction is refused before WSL is t
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -57,6 +58,12 @@ def test_run_rejects_before_touching_wsl(tmp_path: Path, monkeypatch: pytest.Mon
 # --------------------------------------------------------------------------- #
 # Path + RPC plumbing
 # --------------------------------------------------------------------------- #
+@pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="_wslify maps Windows drive paths for the WSL decompile/forge host; "
+    "its Path.resolve() semantics are Windows-only (on POSIX a backslash path is "
+    "treated as one relative name and resolved against CWD).",
+)
 def test_wslify_maps_drives() -> None:
     assert rp._wslify(r"C:\Users\dev\x.sol") == "/mnt/c/Users/dev/x.sol"
     assert rp._wslify(r"D:\proj\scryer\t.sol") == "/mnt/d/proj/scryer/t.sol"

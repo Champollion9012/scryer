@@ -825,3 +825,17 @@ def test_dead_key_ttl_controls_reinclusion(monkeypatch) -> None:
     monkeypatch.setattr(cm, "_dead_ttl", lambda: 0.0)
     assert cm._is_dead("https://keyA.example/v2/AAA") is False  # cooldown elapsed -> retried
     cm._dead_urls.clear()
+
+
+def test_asset_transfers_both_first_funder_ignores_earlier_outgoing(monkeypatch) -> None:
+    # direction="both": an earlier OUTGOING transfer's recipient must not be reported as the funder.
+    def handler(req: dict) -> dict:
+        p = req["params"][0]
+        if "toAddress" in p:  # inbound
+            return _ok(req, {"transfers": [{"from": "0xfunder", "value": 9.0, "asset": "USDT", "blockNum": "0x9"}]})
+        return _ok(req, {"transfers": [{"to": "0xrecipient", "value": 3.0, "asset": "USDT", "blockNum": "0x5"}]})
+
+    _patch(monkeypatch, handler)
+    out = asyncio.run(cm.asset_transfers(56, VICTIM, direction="both"))
+    assert out["first_funder"]["address"] == "0xfunder" and out["first_funder"]["block"] == 9
+    assert out["earliest_block"] == 5  # earliest activity is still reported separately

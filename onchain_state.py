@@ -20,6 +20,7 @@ from eth_abi import decode as abi_decode
 from eth_abi import encode as abi_encode
 from web3 import Web3
 
+import scryer_tron
 from scryer_http import RateLimitTally, rate_limit_reason, redact_rpc_url, retry_after_seconds, rpc_rate_limit_reason
 
 # No-argument view selectors worth probing on an unknown contract.
@@ -61,6 +62,7 @@ _NATIVE = {
     25: "CRO",
     1284: "GLMR",
     1088: "METIS",
+    728126428: "TRX",
 }
 
 # DeFiLlama (free, no API key) price API: per-chain prefix for tokens, and the
@@ -86,6 +88,7 @@ _DL_CHAIN = {
     25: "cronos",
     1284: "moonbeam",
     1088: "metis",
+    728126428: "tron",  # DeFiLlama keys Tron tokens by base58 ("tron:T…"), see token_exposure
 }
 _DL_NATIVE_CGID = {
     1: "ethereum",
@@ -108,6 +111,7 @@ _DL_NATIVE_CGID = {
     25: "crypto-com-chain",
     1284: "moonbeam",
     1088: "metis-token",
+    728126428: "tron",
 }
 
 # Major tokens per chain: (symbol, address, decimals, is_stable). Stablecoin
@@ -132,6 +136,11 @@ _TOKENS: dict[int, list[tuple[str, str, int, bool]]] = {
     42161: [
         ("USDT", "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9", 6, True),
         ("USDC", "0xaf88d065e77c8cC2239327C5EDb3A432268e5831", 6, True),
+    ],
+    # Tron TRC20 (the JSON-RPC speaks the 20-byte hex form of the T… address)
+    728126428: [
+        ("USDT", scryer_tron.to_hex("TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"), 6, True),
+        ("USDC", scryer_tron.to_hex("TEkxiTehnzSmSe2XqrBj4w32RUN966rdz8"), 6, True),
     ],
 }
 
@@ -634,8 +643,9 @@ def price_token(chain_id: int, token: str, block: object = "latest") -> dict:
         except Exception:
             ts = None
     if dl_chain:
-        dl = _defillama_prices([f"{dl_chain}:{taddr}"], timestamp=ts, tally=tally)
-        p = dl.get(f"{dl_chain}:{taddr}")
+        dl_key = f"{dl_chain}:{scryer_tron.to_base58(taddr) if scryer_tron.is_tron(chain_id) else taddr}"
+        dl = _defillama_prices([dl_key], timestamp=ts, tally=tally)
+        p = dl.get(dl_key)
         if p:
             out.update(price=p, price_source="defillama")
             return tally.apply(out)
@@ -671,7 +681,8 @@ def token_exposure(chain_id: int, address: str, block: object = "latest") -> dic
         if reason:
             return {**out, "rate_limited": True, "warnings": [f"rpc: {reason}"], "error": f"rpc rate-limited: {reason}"}
         return {**out, "error": f"rpc: {type(e).__name__}: {e} (historical reads need an archive RPC)"}
-    native_amt = native / 1e18
+    tron = scryer_tron.is_tron(chain_id)
+    native_amt = native / 10 ** (scryer_tron.TRON_NATIVE_DECIMALS if tron else 18)  # TRX is in sun, not wei
     suffix = checks[2:].lower().rjust(64, "0")
     holdings: list[dict] = []
     for sym, taddr, dec, stable in _TOKENS.get(chain_id, []):
@@ -699,7 +710,11 @@ def token_exposure(chain_id: int, address: str, block: object = "latest") -> dic
     dl_chain = _DL_CHAIN.get(chain_id)
     cgid = _DL_NATIVE_CGID.get(chain_id)
     native_key = f"coingecko:{cgid}" if cgid else ""
-    token_keys = {h["token"]: f"{dl_chain}:{h['token']}" for h in holdings} if dl_chain else {}
+    token_keys = (
+        {h["token"]: f"{dl_chain}:{scryer_tron.to_base58(h['token']) if tron else h['token']}" for h in holdings}
+        if dl_chain
+        else {}
+    )
     prices = _defillama_prices([native_key, *token_keys.values()], timestamp=ts, tally=tally)
     price_throttled = "defillama" in tally.providers
 
